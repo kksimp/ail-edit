@@ -2396,6 +2396,19 @@ fn fg_at(s Screen, row int, col int) int
     assert_eq(ed.pane_text[ed.pane_text.len() - 1], "line 49")
     assert(ed.pane_text[1].starts_with("... "))
 
+@test fn shift_click_extends_the_selection()
+    mut ws := Workspace.new(typed("abc\ndef\n", []))
+    gw := ws.eds[0].gutter_width()
+    plain := ui.Modifiers(ctrl: false, alt: false, shift: false)
+    shift := ui.Modifiers(ctrl: false, alt: false, shift: true)
+    ws.on_window_event(Mouse(col: gw + 1, row: 1, button: "left", kind: "down"), plain)
+    ws.on_window_event(Mouse(col: gw + 1, row: 1, button: "left", kind: "up"), plain)
+    ws.on_window_event(Mouse(col: gw + 2, row: 2, button: "left", kind: "down"), shift)
+    assert_eq(ws.eds[0].selected_text(), "bc\nde")
+    # A second Shift-click moves the end, keeping the start.
+    ws.on_window_event(Mouse(col: gw + 3, row: 1, button: "left", kind: "down"), shift)
+    assert_eq(ws.eds[0].selected_text(), "bc")
+
 @test fn tabs_and_the_picker()
     mut ws := Workspace.new(typed("x", []))
     ws.eds[0].path = "a.ail"
@@ -2496,6 +2509,18 @@ fn Editor.on_mouse(mut self, c int, r int, button str, kind str)
         return
     if kind == "down"
         click_pane(r - text_rows() - 1)
+
+## Shift-click: select from the caret, or the selection's start, to the
+## place under screen cell (`c`, `r`).
+fn Editor.extend_to(mut self, c int, r int)
+    p := position_at(c, r) else return
+    if not selecting or selection() == none
+        selecting = true
+        anchor_line = line
+        anchor_col = col
+    line = p.line
+    set_col(p.col)
+    scroll()
 
 ## A click on row `i` of the pane: jump to that diagnostic or outline item.
 fn Editor.click_pane(mut self, i int)
@@ -2915,11 +2940,25 @@ fn Workspace.window(mut self) ! ui.UiError
             w.set_title(t)
             title = t
         draw(mut w, render())
-        on_event(w.next_event())
+        on_window_event(w.next_event(), w.modifiers())
         while not quit
             ev := w.poll_event() else break
-            on_event(ev)
+            on_window_event(ev, w.modifiers())
     w.close()
+
+## An event with the modifiers held when it happened (std.ui.14): a
+## Shift-click extends the selection to the clicked place.
+fn Workspace.on_window_event(mut self, ev ui.Event, m ui.Modifiers)
+    shift_click := match ev
+        Mouse(c, r, button, kind) =>
+            if m.shift and not picking and button == "left" and kind == "down" and r > 0
+                eds[active].extend_to(c, r - 1)
+                true
+            else
+                false
+        Key(_, _, _, _) | Resize(_, _) | Close | Scroll(_) => false
+    if not shift_click
+        on_event(ev)
 
 ## Opens the window, or prints one screen when there's no display.
 fn window_main(mut ed Editor, flags List[str])
