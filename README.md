@@ -78,9 +78,12 @@ imports resolve as they will on save.
   save with no errors, and on demand), so names declared since then come
   from the buffer's words without signatures.
 - Speed (Linux x86-64, interpreter): a 100x32 screen of a 1,000-line file
-  renders in about 7 ms; an edit takes about 0.1 ms.
+  renders in about 8 ms; an edit takes about 0.1 ms.
 - Typing `.` after a name opens member completion; typing `(` after a
   known function shows its signature on the status line. `"""` strings are
   highlighted across lines.
+- The word under the cursor is marked wherever else it appears on screen;
+  each line with a diagnostic shows the first message after its text;
+  typing `else` or `elif` lines it up with its `if`.
 - Not yet: types of locals in completion (the API has no local types yet),
   Shift-click selection.
