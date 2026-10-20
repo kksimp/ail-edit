@@ -22,7 +22,7 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 | Arrows, Home, End, PageUp, PageDown | Move. Home goes to the indentation, then column 1 |
 | Ctrl-Left, Ctrl-Right | Move by word |
 | Shift with any move | Select; typing, Backspace or Delete replaces the selection |
-| Ctrl-A, Ctrl-C, Ctrl-X, Ctrl-V | Select all, copy, cut, paste (the editor's own clipboard) |
+| Ctrl-A, Ctrl-C, Ctrl-X, Ctrl-V | Select all, copy, cut, paste (in the window, also the system clipboard) |
 | Ctrl-Home, Ctrl-End | Start, end of the file |
 | Enter | New line, indented like this one, one level deeper after a block opener (`fn`, `if`, `match`, `x => `, `else err`, ...) |
 | Tab | Spaces to the next multiple of 4 (AIL has no tabs, lex.block.1) |
@@ -46,7 +46,12 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 | F1 | Explain the diagnostic under the cursor (`ail explain RULE`) |
 | Ctrl-O | Outline (`ail api --text`); Up/Down select, Enter jumps |
 | Escape | Close the explanation or the outline; stop selecting or finding |
-| Ctrl-Q | Quit; with unsaved changes, press it twice. Closing the window counts as Ctrl-Q |
+| Ctrl-Q | Quit; with unsaved changes in any tab, press it twice. Closing the window counts as Ctrl-Q |
+| F5, F6 | Run the buffer (`ail run`), or its tests (`ail test`); the output fills the pane |
+| Ctrl-P | Open a file: type part of its path (letters in order), Up/Down, Enter |
+| Ctrl-Tab, Ctrl-Shift-Tab | Next, previous tab; a click on a tab selects it |
+| Ctrl-W | Close the tab; with unsaved changes, press it twice |
+| Mouse | Click places the caret, drag selects, the wheel scrolls, a click on a diagnostic jumps to it |
 
 The `ail` it runs is `$AIL`, else `./ail` when started from the repository
 root, else `ail` on `PATH`. A check of unsaved changes writes the buffer to
@@ -55,17 +60,19 @@ imports resolve as they will on save.
 
 ## Status (2026-10-20)
 
-- Works headless, tested (28 `@test`s, run by `./ail selftest`): editing,
+- Works headless, tested (33 `@test`s, run by `./ail selftest`): editing,
   auto-indent, undo and redo, moves, highlighting, scrolling, selection and
-  the clipboard, find and replace, go to line, bracket matching and pairing,
-  comment toggle, duplicate and move lines, diagnostics with fixes, explain,
+  the clipboard, mouse and wheel, tabs and the file picker, run output,
+  find and replace, go to line, bracket matching and pairing, comment
+  toggle, duplicate and move lines, diagnostics with fixes, explain,
   outline, completion, go to definition and hover (from a recorded
   `ail api --symbols` output), quit confirmation.
 - Window front end on `std.ui` (ADR 0177), tested on Linux under Xvfb:
   typing, Ctrl-K, Ctrl-. fixes, Ctrl-S, Ctrl-Space completion with
   signatures, member completion after `.`, F12, Ctrl-Shift-F, Ctrl-/,
-  bracket pairing, Ctrl-Q. Without a display, `edit.ail FILE` prints one
-  screen instead.
+  bracket pairing, drag selection, wheel, Ctrl-C to and from the system
+  clipboard, Ctrl-P opening a second tab, F5 running it (ADR 0241), Ctrl-Q.
+  Without a display, `edit.ail FILE` prints one screen instead.
 - Completion, go to definition and hover use the last `ail api --symbols`
   index taken while the program had no errors (on opening, on Ctrl-K or
   save with no errors, and on demand), so names declared since then come
@@ -75,5 +82,5 @@ imports resolve as they will on save.
 - Typing `.` after a name opens member completion; typing `(` after a
   known function shows its signature on the status line. `"""` strings are
   highlighted across lines.
-- Not yet: types of locals in
-  completion (the API has no local types yet).
+- Not yet: types of locals in completion (the API has no local types yet),
+  Shift-click selection.

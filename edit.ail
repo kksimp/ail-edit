@@ -2209,6 +2209,72 @@ fn fg_at(s Screen, row int, col int) int
     assert_eq(ed.line, 11)
     assert_eq(ed.pane, Diags)
 
+@test fn mouse_clicks_drags_and_scrolls()
+    mut ed := typed("fn main()\n    print(1)\n    print(2)\n", [])
+    gw := ed.gutter_width()
+    ed.on_event(Mouse(col: gw + 4, row: 1, button: "left", kind: "down"))
+    assert_eq([ed.line, ed.col], [1, 4])
+    ed.on_event(Mouse(col: gw + 9, row: 2, button: "left", kind: "drag"))
+    ed.on_event(Mouse(col: gw + 9, row: 2, button: "left", kind: "up"))
+    assert_eq(ed.selected_text(), "print(1)\n    print")
+    # Past the end of a line, a click lands at its end.
+    ed.on_event(Mouse(col: 99, row: 0, button: "left", kind: "down"))
+    assert_eq([ed.line, ed.col], [0, 9])
+    assert(ed.selection() == none)
+    ed.on_event(Scroll(lines: 2))
+    assert_eq(ed.top, 2)
+    ed.on_event(Scroll(lines: -5))
+    assert_eq(ed.top, 0)
+
+@test fn clicking_a_diagnostic_jumps_to_it()
+    mut ed := typed("fn main()\n    prnt(1)\n", [])
+    ed.diags = parse_diags(DIAG_JSON)
+    ed.on_event(Mouse(col: 3, row: ed.text_rows() + 1, button: "left", kind: "down"))
+    assert_eq([ed.line, ed.col], [1, 4])
+
+@test fn run_output_goes_to_the_pane()
+    mut ed := typed("", [])
+    ed.show_output("run", proc.Output(status: 1, out: "a\nb\n", err: "oops\n"))
+    assert_eq(ed.pane, Text)
+    assert_eq(ed.pane_text, ["ail run: exit 1", "a", "b", "oops"])
+    assert_eq(extra_key("f5", false, false, false), RunFile)
+    assert(extra_key("f5", true, false, false) == none)
+
+@test fn tabs_and_the_picker()
+    mut ws := Workspace.new(typed("x", []))
+    ws.eds[0].path = "a.ail"
+    ws.eds.push(typed("y", []))
+    ws.eds[1].path = "dir/b.ail"
+    ws.on_event(Key(key: "tab", ctrl: true, alt: false, shift: false))
+    assert_eq(ws.active, 1)
+    ws.on_event(Key(key: "tab", ctrl: true, alt: false, shift: true))
+    assert_eq(ws.active, 0)
+    s := ws.render()
+    assert_eq(s.text[0], " a.ail   b.ail ")
+    assert_eq(s.text[1].trim(), "1 x")
+    ws.on_event(Mouse(col: 9, row: 0, button: "left", kind: "down"))
+    assert_eq(ws.active, 1)
+    assert(fuzzy("tools/edit/edit.ail", "EdA"))
+    assert(not fuzzy("tools/edit/edit.ail", "zz"))
+    ws.files = ["a.ail", "dir/b.ail", "dir/c.ail"]
+    ws.picking = true
+    ws.on_event(Key(key: "c", ctrl: false, alt: false, shift: false))
+    assert_eq(ws.matches(), ["dir/c.ail"])
+    ws.on_event(Key(key: "escape", ctrl: false, alt: false, shift: false))
+    assert(not ws.picking)
+    # Ctrl-W closes a clean tab; the last one quits.
+    ws.on_event(Key(key: "w", ctrl: true, alt: false, shift: false))
+    assert_eq(ws.eds.len(), 1)
+    ws.on_event(Key(key: "w", ctrl: true, alt: false, shift: false))
+    assert(ws.quit)
+
+@test fn quitting_asks_once_for_unsaved_tabs()
+    mut ws := Workspace.new(typed("", keys("x")))
+    ws.on_event(Close)
+    assert(not ws.quit)
+    ws.on_event(Close)
+    assert(ws.quit)
+
 # ---- Front ends ---------------------------------------------------------
 
 # ---- Window front end (std.ui) -----------------------------------------
@@ -2226,30 +2292,408 @@ fn draw(mut w ui.Window, s Screen)
 fn Editor.on_event(mut self, ev ui.Event)
     match ev
         Key(k, ctrl, alt, shift) =>
-            if cmd := key_command(k, ctrl, alt, shift)
-                run(cmd)
+            if cmd := extra_key(k, ctrl, alt, shift)
+                run_extra(cmd)
+            elif cmd := key_command(k, ctrl, alt, shift)
+                with_system_clipboard(cmd)
         Resize(c, r) => apply(Command.Resize(cols: c, rows: r))
         Close => apply(Quit)
+        Mouse(c, r, button, kind) => on_mouse(c, r, button, kind)
+        Scroll(n) => scroll_by(n)
+
+## Runs `cmd`, with Copy, Cut and Paste going through the system clipboard
+## (std.ui.12) as well as the editor's own.
+fn Editor.with_system_clipboard(mut self, cmd Command)
+    if cmd == Paste
+        if t := ui.clipboard_get()
+            clip = t
+    before := clip
+    run(cmd)
+    if (cmd == Copy or cmd == Cut) and clip != before or cmd == Copy and clip != ""
+        ui.clipboard_set(clip)
+
+# ---- Mouse and wheel ----------------------------------------------------
+
+## The buffer position under screen cell (`c`, `r`), or `none` outside the
+## text rows.
+fn Editor.position_at(self, c int, r int) Range?
+    if r < 0 or r >= text_rows() or lines.len() == 0
+        return none
+    l := (top + r).min(lines.len() - 1)
+    n := lines[l].chars().len()
+    at := (left + c - gutter_width()).max(0).min(n)
+    Range(line: l, col: at, end_line: l, end_col: at)
+
+## A click places the caret and starts a selection that a drag extends. A
+## click in the pane picks a diagnostic or an outline entry.
+fn Editor.on_mouse(mut self, c int, r int, button str, kind str)
+    if button != "left" or kind == "up"
+        return
+    if p := position_at(c, r)
+        if kind == "down"
+            selecting = true
+            anchor_line = p.line
+            anchor_col = p.col
+        line = p.line
+        set_col(p.col)
+        scroll()
+        return
+    if kind == "down"
+        click_pane(r - text_rows() - 1)
+
+## A click on row `i` of the pane: jump to that diagnostic or outline item.
+fn Editor.click_pane(mut self, i int)
+    if i < 0
+        return
+    if pane == Diags and i < diags.len()
+        d := diags[i]
+        line = (d.line - 1).max(0).min(lines.len() - 1)
+        set_col((d.col - 1).max(0).min(cur().len()))
+        selecting = false
+        scroll()
+    elif pane == Outline
+        start := (outline_sel - pane_rows() + 1).max(0)
+        if start + i < outline.len()
+            outline_sel = start + i
+            apply(Newline)
+
+## The wheel moves the view by `n` lines without moving the caret; the next
+## key brings the caret back into view.
+fn Editor.scroll_by(mut self, n int)
+    top = (top + n).min(lines.len() - 1).max(0)
+
+# ---- Running the program and its tests ----------------------------------
+
+## Commands of the window front end that aren't in `key_command`.
+enum Extra
+    RunFile
+    TestFile
+
+fn extra_key(key str, ctrl bool, alt bool, shift bool) Extra?
+    if ctrl or alt
+        return none
+    match key
+        "f5" => RunFile
+        "f6" => TestFile
+        _ => none
+
+## F5 runs the buffer with `ail run`, F6 its tests with `ail test`; the
+## output goes to the pane. Unsaved changes are run as they are.
+fn Editor.run_extra(mut self, x Extra)
+    words := match x
+        RunFile => ["run"]
+        TestFile => ["test"]
+    r := ail_on_buffer(words) else return
+    show_output(words[0], r)
+
+fn Editor.show_output(mut self, what str, r proc.Output)
+    pane_text = ["ail {what}: exit {r.status}"]
+    for l in r.out.lines()
+        pane_text.push(l)
+    for l in r.err.lines()
+        pane_text.push(l)
+    pane = Text
+    message = "{what}: exit {r.status}; Esc closes"
+
+# ---- Tabs ---------------------------------------------------------------
+
+## Several files, one tab each, and the Ctrl-P file picker. The editor in
+## each tab gets every row but the tab bar.
+struct Workspace
+    eds List[Editor]
+    active int
+    cols int
+    rows int
+    picking bool
+    query str
+    files List[str]
+    pick_sel int
+    quit_armed bool
+    quit bool
+    message str
+
+fn Workspace.new(ed Editor) Workspace
+    Workspace(
+        eds: [ed],
+        active: 0,
+        cols: ed.cols,
+        rows: ed.rows + 1,
+        picking: false,
+        query: "",
+        files: [],
+        pick_sel: 0,
+        quit_armed: false,
+        quit: false,
+        message: "",
+    )
+
+## The file name a tab shows: the path after its last `/`.
+fn base_name(path str) str
+    parts := path.split("/")
+    parts[parts.len() - 1]
+
+## Opens `path` in a new tab, or switches to it if it is open.
+fn Workspace.open(mut self, path str)
+    for i in 0..eds.len()
+        if eds[i].path == path
+            active = i
+            return
+    mut text := ""
+    if fs.exists(path)
+        got := fs.read_text(path) else err
+            message = "can't open {err.path}: {err.kind}"
+            return
+        text = got
+    mut ed := Editor.new(path, text, cols, (rows - 1).max(1))
+    ed.index()
+    eds.push(ed)
+    active = eds.len() - 1
+
+## Closes the active tab, asking first if it has unsaved changes. The
+## workspace quits when the last tab closes.
+fn Workspace.close_tab(mut self)
+    eds[active].apply(Quit)
+    if not eds[active].quit
+        return
+    mut rest := List[Editor]()
+    for i in 0..eds.len()
+        if i != active
+            rest.push(eds[i])
+    eds = rest
+    if eds.len() == 0
+        quit = true
+        return
+    active = active.min(eds.len() - 1)
+
+## Ctrl-Q: quit, asking first if any tab has unsaved changes.
+fn Workspace.quit_all(mut self)
+    mut unsaved := 0
+    for ed in eds
+        if ed.dirty
+            unsaved += 1
+    if unsaved > 0 and not quit_armed
+        quit_armed = true
+        message = "{unsaved} unsaved tab(s): Ctrl-Q again quits without saving"
+        return
+    quit = true
+
+fn Workspace.on_event(mut self, ev ui.Event)
+    if picking
+        pick_event(ev)
+        return
+    if ev != Close
+        quit_armed = false
+        message = ""
+    match ev
+        Key(k, ctrl, _, shift) =>
+            if ctrl and k == "tab"
+                n := eds.len()
+                if shift
+                    active = (active + n - 1) % n
+                else
+                    active = (active + 1) % n
+                return
+            if ctrl and (k == "w" or k == "W")
+                close_tab()
+                return
+            if ctrl and (k == "q" or k == "Q")
+                quit_all()
+                return
+            if ctrl and (k == "p" or k == "P")
+                start_picking()
+                return
+            eds[active].on_event(ev)
+        Resize(c, r) =>
+            cols = c
+            rows = r
+            for mut ed in eds
+                ed.apply(Command.Resize(cols: c, rows: (r - 1).max(1)))
+        Close => quit_all()
+        Mouse(c, r, button, kind) =>
+            if r == 0
+                if kind == "down"
+                    click_tab(c)
+                return
+            eds[active].on_event(Mouse(col: c, row: r - 1, button: button, kind: kind))
+        Scroll(_) => eds[active].on_event(ev)
+    if eds[active].quit
+        close_tab()
+
+## The columns each tab's label covers on the tab bar.
+fn Workspace.tab_labels(self) List[str]
+    mut out := List[str]()
+    for ed in eds
+        mut flag := ""
+        if ed.dirty
+            flag = " *"
+        out.push(" {base_name(ed.path)}{flag} ")
+    out
+
+fn Workspace.click_tab(mut self, c int)
+    mut x := 0
+    labels := tab_labels()
+    for i in 0..labels.len()
+        w := labels[i].chars().len()
+        if c >= x and c < x + w
+            active = i
+            return
+        x += w + 1
+
+# ---- The file picker (Ctrl-P) ---------------------------------------------
+
+## The files under `dir`, to `depth` levels, skipping hidden and build
+## directories, at most `limit` of them.
+fn list_files(dir str, depth int, limit int) List[str]
+    mut out := List[str]()
+    names := fs.list_dir(dir) else return out
+    for n in names
+        if out.len() >= limit
+            break
+        if n.starts_with(".") or n == "target"
+            continue
+        mut path := n
+        if dir != "."
+            path = "{dir}/{n}"
+        if sub := fs.list_dir(path)
+            if depth > 0 and sub.len() >= 0
+                for f in list_files(path, depth - 1, limit - out.len())
+                    out.push(f)
+        else
+            out.push(path)
+    out
+
+## Whether the characters of `q` appear in `s` in order, ignoring case.
+fn fuzzy(s str, q str) bool
+    cs := s.chars()
+    mut i := 0
+    for c in q.chars()
+        while i < cs.len() and cs[i].to_lower() != c.to_lower()
+            i += 1
+        if i == cs.len()
+            return false
+        i += 1
+    true
+
+fn Workspace.matches(self) List[str]
+    mut out := List[str]()
+    for f in files
+        if fuzzy(f, query)
+            out.push(f)
+    out
+
+fn Workspace.start_picking(mut self)
+    picking = true
+    query = ""
+    pick_sel = 0
+    files = list_files(".", 4, 2000)
+
+fn Workspace.pick_event(mut self, ev ui.Event)
+    match ev
+        Key(k, ctrl, _, _) =>
+            if ctrl
+                return
+            if k == "escape"
+                picking = false
+            elif k == "enter"
+                found := matches()
+                if pick_sel < found.len()
+                    open(found[pick_sel])
+                picking = false
+            elif k == "up"
+                pick_sel = (pick_sel - 1).max(0)
+            elif k == "down"
+                pick_sel += 1
+            elif k == "backspace"
+                cs := query.chars()
+                if cs.len() > 0
+                    query = cs[..cs.len() - 1].join("")
+                pick_sel = 0
+            elif k.chars().len() == 1
+                query = "{query}{k}"
+                pick_sel = 0
+        Close => quit_all()
+        Resize(_, _) =>
+            picking = false
+            on_event(ev)
+        Mouse(_, _, _, _) | Scroll(_) => return
+    pick_sel = pick_sel.min((matches().len() - 1).max(0))
+
+## The screen: the tab bar, the active editor below it, and the picker over
+## it when open.
+fn Workspace.render(self) Screen
+    mut s := Screen.new(cols, rows)
+    s.band(0, PANE_BG)
+    labels := tab_labels()
+    mut x := 0
+    for i in 0..labels.len()
+        mut bg := PANE_BG
+        mut fg := GUTTER_FG
+        if i == active
+            bg = BG
+            fg = FG
+        s.put(0, x, labels[i], fg, bg)
+        x += labels[i].chars().len() + 1
+    if message != ""
+        s.put(0, x + 1, message, STATUS_FG, PANE_BG)
+    inner := eds[active].render()
+    for sp in inner.spans
+        s.spans.push(Span(row: sp.row + 1, col: sp.col, text: sp.text, fg: sp.fg, bg: sp.bg))
+    for r in 0..inner.text.len()
+        if r + 1 < rows
+            s.text[r + 1] = inner.text[r]
+    s.text[0] = labels.join(" ")
+    if inner.cursor_row >= 0
+        s.cursor_row = inner.cursor_row + 1
+        s.cursor_col = inner.cursor_col
+    if picking
+        render_picker(mut s)
+    s
+
+fn Workspace.render_picker(self, mut s Screen)
+    w := (cols - 4).min(70).max(10)
+    x := (cols - w) / 2
+    found := matches()
+    shown := found.len().min(12)
+    s.put(1, x, " ".repeat(w), FG, SELECT_BG)
+    s.put(1, x, " open: {query}", STATUS_FG, SELECT_BG)
+    for i in 0..shown
+        mut bg := PANE_BG
+        if i == pick_sel
+            bg = LINE_BG
+        s.put(2 + i, x, " ".repeat(w), FG, bg)
+        s.put(2 + i, x + 1, found[i], FG, bg)
+    if found.len() == 0
+        s.put(2, x, " no file matches".pad_right(w, ' '), GUTTER_FG, PANE_BG)
+    s.cursor_row = 1
+    s.cursor_col = x + 7 + query.chars().len()
 
 ## The event loop: wait for an event, apply it and any others already
-## pending, then draw once.
-fn Editor.window(mut self) ! ui.UiError
-    mut w := ui.open("edit {path}", cols, rows)?
+## pending, then draw once. The title shows the file and its unsaved mark.
+fn Workspace.window(mut self) ! ui.UiError
+    mut w := ui.open("edit", cols, rows)?
     size := w.size()
-    apply(Command.Resize(cols: size.cols, rows: size.rows))
-    draw(mut w, render())
+    on_event(Resize(cols: size.cols, rows: size.rows))
+    mut title := ""
     while not quit
+        ed := eds[active]
+        mut t := "{ed.path} - edit"
+        if ed.dirty
+            t = "* {t}"
+        if t != title
+            w.set_title(t)
+            title = t
+        draw(mut w, render())
         on_event(w.next_event())
         while not quit
             ev := w.poll_event() else break
             on_event(ev)
-        draw(mut w, render())
     w.close()
 
 ## Opens the window, or prints one screen when there's no display.
 fn window_main(mut ed Editor, flags List[str])
     ed.index()
-    ed.window() else err
+    mut ws := Workspace.new(ed)
+    ws.window() else err
         print("edit: no window ({err.kind}: {err.message}); printing the screen instead")
         print_screen(mut ed, flags)
 
