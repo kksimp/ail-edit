@@ -57,6 +57,36 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 | Ctrl-+ (or Ctrl-=), Ctrl--, Ctrl-0 | Larger, smaller, default font size (ADR 0243) |
 | Mouse | Click places the caret, drag or Shift-click selects, the wheel scrolls, a click on a diagnostic jumps to it |
 
+## macOS sanity check
+
+About five minutes, from the repository root. On a Mac, Command works as
+Ctrl (ADR 0179), and laptop keyboards may need fn for F1–F12. Don't save
+(Ctrl-S): the steps edit `examples/hello.ail` and quit without saving.
+
+```sh
+./ail run tools/edit/edit.ail examples/hello.ail
+```
+
+| # | Do | Expect |
+|---|---|---|
+| 1 | Look | A window titled `examples/hello.ail - edit`, a tab bar, `fn` in blue, the string in orange, a caret on line 1 |
+| 2 | Click after `print`; type `x` | The caret moves there; `x` appears and the title gains `*` |
+| 3 | Ctrl-Z | `x` is gone |
+| 4 | Shift-Right three times, then Ctrl-C; End, Ctrl-V | The three characters are highlighted, then pasted at the line end; Ctrl-Z undoes |
+| 5 | Drag across a word; Shift-click further right | The selection follows the mouse, then extends to the click |
+| 6 | Ctrl-K | Status line: `0 errors, 0 warnings` |
+| 7 | F5 | The pane shows `Hello, world!`; Esc closes it |
+| 8 | Click on `print`; F2 | A rename prompt on the tab bar names `print` with its count; Esc cancels |
+| 9 | End, Enter, type `pr`, Ctrl-Space | A completion list with `print`; Esc closes, Ctrl-Z undoes |
+| 10 | Ctrl-+ three times, Ctrl-- twice, Ctrl-0 | The text grows, shrinks, and returns to the default size; the window stays the same size |
+| 11 | Ctrl-P, type `ui_hel`, Enter | `examples/ui_hello.ail` opens in a second tab; Ctrl-Tab switches back |
+| 12 | Scroll with the trackpad in the second tab | The text scrolls about three lines per notch |
+| 13 | Ctrl-Q (twice if it asks about unsaved tabs) | The editor quits without saving |
+
+Also try `./ail run tools/edit/edit.ail --font 13 examples/hello.ail`: the
+window opens with small text. Report the step number of anything that
+differs.
+
 The `ail` it runs is `$AIL`, else `./ail` when started from the repository
 root, else `ail` on `PATH`. A check of unsaved changes writes the buffer to
 `FILE.edit-check.ail` beside the file and removes it afterwards, so relative
