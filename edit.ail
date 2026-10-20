@@ -3,12 +3,13 @@
 ## The core is headless: an `Editor` value, `Command`s that change it, and a
 ## pure `render` from the editor to a `Screen` of colored text runs. Front
 ## ends feed commands in and draw the screen: the `@test`s below, `--print`,
-## and the window front end on `std.ui` (window.ail.pending until it lands).
+## and the window front end on `std.ui`.
 
 use std.fs
 use std.env
 use std.proc
 use std.time
+use std.ui
 
 # Colors, 0xRRGGBB.
 BG := 0x1e1e1e
@@ -1021,7 +1022,7 @@ fn Editor.check(mut self)
     r := ail_on_buffer(["check", "--json"]) else return
     diags = parse_diags(r.err)
     pane = Diags
-    message = "checked: {diag_count("error")} errors, {diag_count("warning")} warnings"
+    message = "checked"
 
 fn Editor.save(mut self)
     fs.write_text(path, text()) else err
@@ -1319,6 +1320,27 @@ DIAG_JSON := "\{\"api\":1,\"severity\":\"error\",\"rule\":\"expr.name.1\",\"file
     assert_eq(ed.lines[0], "adef")
     assert(not ed.selecting)
 
+@test fn window_events_drive_the_editor()
+    mut ed := typed("", [])
+    mut evs := List[ui.Event]()
+    evs.push(Key(key: "h", ctrl: false, alt: false, shift: false))
+    evs.push(Key(key: "I", ctrl: false, alt: false, shift: true))
+    evs.push(Key(key: "left", ctrl: false, alt: false, shift: true))
+    evs.push(Key(key: "c", ctrl: true, alt: false, shift: false))
+    evs.push(Key(key: "end", ctrl: false, alt: false, shift: false))
+    evs.push(Key(key: "v", ctrl: true, alt: false, shift: false))
+    evs.push(Resize(cols: 60, rows: 20))
+    evs.push(Close)
+    for ev in evs
+        ed.on_event(ev)
+    assert_eq(ed.lines, ["hII"])
+    assert_eq([ed.cols, ed.rows], [60, 20])
+    assert(ed.quit_armed)
+    ed.on_event(Close)
+    assert(ed.quit)
+    mut w := ui.Window(handle: 0)
+    draw(mut w, ed.render())
+
 @test fn outline_parse_and_jump()
     items := parse_outline("    1  fn main()\n        ## Doc.\n   12      fn Point.x(self) int\n")
     assert_eq(items.len(), 2)
@@ -1336,6 +1358,47 @@ DIAG_JSON := "\{\"api\":1,\"severity\":\"error\",\"rule\":\"expr.name.1\",\"file
     assert_eq(ed.pane, Diags)
 
 # ---- Front ends ---------------------------------------------------------
+
+# ---- Window front end (std.ui) -----------------------------------------
+
+## Draws a screen: the runs in order, then the caret.
+fn draw(mut w ui.Window, s Screen)
+    w.clear(BG)
+    for sp in s.spans
+        w.put(sp.col, sp.row, sp.text, sp.fg, sp.bg)
+    w.cursor(s.cursor_col, s.cursor_row)
+    w.present()
+
+## Applies one window event. Closing the window is Ctrl-Q: with unsaved
+## changes the first close asks and the second quits.
+fn Editor.on_event(mut self, ev ui.Event)
+    match ev
+        Key(k, ctrl, alt, shift) =>
+            if cmd := key_command(k, ctrl, alt, shift)
+                run(cmd)
+        Resize(c, r) => apply(Command.Resize(cols: c, rows: r))
+        Close => apply(Quit)
+
+## The event loop: wait for an event, apply it and any others already
+## pending, then draw once.
+fn Editor.window(mut self) ! ui.UiError
+    mut w := ui.open("edit {path}", cols, rows)?
+    size := w.size()
+    apply(Command.Resize(cols: size.cols, rows: size.rows))
+    draw(mut w, render())
+    while not quit
+        on_event(w.next_event())
+        while not quit
+            ev := w.poll_event() else break
+            on_event(ev)
+        draw(mut w, render())
+    w.close()
+
+## Opens the window, or prints one screen when there's no display.
+fn window_main(mut ed Editor, flags List[str])
+    ed.window() else err
+        print("edit: no window ({err.kind}: {err.message}); printing the screen instead")
+        print_screen(mut ed, flags)
 
 ## `--print`: render one screen to standard output instead of opening a
 ## window, after the commands named by `--check`, `--outline`, `--explain`.
@@ -1383,4 +1446,7 @@ fn main() !
     if flags.contains("--bench")
         bench(mut ed)
         return
-    print_screen(mut ed, flags)
+    if flags.contains("--print")
+        print_screen(mut ed, flags)
+        return
+    window_main(mut ed, flags)

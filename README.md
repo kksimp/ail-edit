@@ -7,7 +7,7 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 ([ADR 0181](../../docs/decisions/0181-editor-screen-as-text-runs.md)).
 
 ```sh
-./ail run tools/edit/edit.ail FILE                     # the editor (see Status)
+./ail run tools/edit/edit.ail FILE                     # the editor, in a window
 ./ail run tools/edit/edit.ail --print FILE             # print one screen as text
 ./ail run tools/edit/edit.ail --print --check FILE     # ...after Ctrl-K
 ./ail run tools/edit/edit.ail --print --outline FILE   # ...with the outline
@@ -47,11 +47,11 @@ imports resolve as they will on save.
 
 - Works headless, tested: editing, auto-indent, undo, moves, highlighting,
   scrolling, diagnostics with fixes, explain, outline parsing, quit
-  confirmation, find, redo, selection and the clipboard (18 `@test`s, run by `./ail selftest`).
-- Window front end: written against the agreed `std.ui` API (lane 11 of
-  the [buildout plan](../../docs/design/ai-first-plan.md)) and kept in
-  `window.ail.pending` until `std.ui` is in the bootstrap; until then
-  `edit.ail FILE` prints one screen.
+  confirmation, find, redo, selection and the clipboard (19 `@test`s, run by `./ail selftest`).
+- Window front end on `std.ui` (ADR 0177): tested on Linux under Xvfb
+  (typing, auto-indent, Ctrl-K marks spans, Ctrl-. fixes, Ctrl-S saves and
+  re-checks, Ctrl-Q quits). Without a display, `edit.ail FILE` prints one
+  screen instead.
 - Outline: needs `ail api --text` (lane 2); without it the status line
   says so.
 - Speed (Linux x86-64, interpreter): a 100x32 screen of a 1,000-line file
