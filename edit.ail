@@ -100,10 +100,27 @@ fn Editor.new(path str, text str, cols int, rows int) Editor
         lines.pop()
     if lines.len() == 0
         lines.push("")
-    Editor(path: path, lines: lines, line: 0, col: 0, goal: 0, top: 0, left: 0,
-        cols: cols, rows: rows, dirty: false, message: "", quit_armed: false,
-        quit: false, undo: [], diags: [], pane: Pane.Diags, pane_text: [],
-        outline: [], outline_sel: 0)
+    Editor(
+        path: path,
+        lines: lines,
+        line: 0,
+        col: 0,
+        goal: 0,
+        top: 0,
+        left: 0,
+        cols: cols,
+        rows: rows,
+        dirty: false,
+        message: "",
+        quit_armed: false,
+        quit: false,
+        undo: [],
+        diags: [],
+        pane: Pane.Diags,
+        pane_text: [],
+        outline: [],
+        outline_sel: 0,
+    )
 
 ## The buffer as file text: lines joined with `\n`, ending with one.
 fn Editor.text(self) str
@@ -122,7 +139,6 @@ fn Editor.snapshot(mut self)
 fn Editor.set_col(mut self, c int)
     col = c
     goal = c
-
 
 ## `xs[..from]`, then `mid`, then `xs[to..]`.
 fn splice(xs List[str], from int, to int, mid List[str]) List[str]
@@ -181,8 +197,7 @@ fn opens_block(s str) bool
         first = words[1]
     if BLOCK_WORDS.split(" ").contains(first) or t.ends_with("=>")
         return true
-    n >= 2 and (words[n - 1] == "else" or words[n - 2] == "else" or words[n - 2] == ":="
-        and (words[n - 1] == "match" or words[n - 1] == "if")) or t.contains(":= if ") or t.contains(":= match ")
+    n >= 2 and (words[n - 1] == "else" or words[n - 2] == "else" or words[n - 2] == ":=" and (words[n - 1] == "match" or words[n - 1] == "if")) or t.contains(":= if ") or t.contains(":= match ")
 
 fn Editor.newline(mut self)
     cs := cur()
@@ -323,10 +338,44 @@ fn Editor.gutter_width(self) int
 
 ## The reserved words of lex.kw.1, plus the literals `true`, `false` and
 ## `none`, which are keywords there too.
-KEYWORDS := {"and", "any", "as", "break", "continue", "defer", "elif", "else", "enum",
-    "error", "extern", "false", "fn", "for", "if", "impl", "in", "match", "move", "mut",
-    "none", "not", "or", "pub", "ref", "return", "self", "spawn", "struct", "todo",
-    "trait", "true", "unique", "unsafe", "use", "while"}
+KEYWORDS := {
+    "and",
+    "any",
+    "as",
+    "break",
+    "continue",
+    "defer",
+    "elif",
+    "else",
+    "enum",
+    "error",
+    "extern",
+    "false",
+    "fn",
+    "for",
+    "if",
+    "impl",
+    "in",
+    "match",
+    "move",
+    "mut",
+    "none",
+    "not",
+    "or",
+    "pub",
+    "ref",
+    "return",
+    "self",
+    "spawn",
+    "struct",
+    "todo",
+    "trait",
+    "true",
+    "unique",
+    "unsafe",
+    "use",
+    "while",
+}
 
 ## The end of a quoted literal that starts at `q` (the opening quote),
 ## just past its closing quote; `raw` literals have no escapes (lex.str).
@@ -519,7 +568,13 @@ fn Editor.render_pane(self, mut s Screen, first int)
     match pane
         Diags =>
             if diags.len() == 0
-                s.put(first, 1, "No diagnostics. Ctrl-K checks, F1 explains, Ctrl-O outline.", GUTTER_FG, PANE_BG)
+                s.put(
+                    first,
+                    1,
+                    "No diagnostics. Ctrl-K checks, F1 explains, Ctrl-O outline.",
+                    GUTTER_FG,
+                    PANE_BG,
+                )
             mut r := first
             for d in diags
                 if r >= first + n
@@ -707,13 +762,25 @@ fn parse_diags(text str) List[Diag]
         if fixes.len() > 0
             title = jstr(fixes[0], "title")
             for e in jarr(fixes[0], "edits")
-                fix.push(TextEdit(line: jint(e, "line"), col: jint(e, "col"),
-                    end_line: jint(e, "end_line"), end_col: jint(e, "end_col"),
-                    text: jstr(e, "text")))
-        out.push(Diag(severity: jstr(j, "severity"), rule: jstr(j, "rule"),
-            line: jint(j, "line"), col: jint(j, "col"), end_line: jint(j, "end_line"),
-            end_col: jint(j, "end_col"), message: jstr(j, "message"), help: jstr(j, "help"),
-            fix_title: title, fix: fix))
+                fix.push(TextEdit(
+                    line: jint(e, "line"),
+                    col: jint(e, "col"),
+                    end_line: jint(e, "end_line"),
+                    end_col: jint(e, "end_col"),
+                    text: jstr(e, "text"),
+                ))
+        out.push(Diag(
+            severity: jstr(j, "severity"),
+            rule: jstr(j, "rule"),
+            line: jint(j, "line"),
+            col: jint(j, "col"),
+            end_line: jint(j, "end_line"),
+            end_col: jint(j, "end_col"),
+            message: jstr(j, "message"),
+            help: jstr(j, "help"),
+            fix_title: title,
+            fix: fix,
+        ))
     out
 
 ## The declarations in `ail api --text` output: `LINE  signature` per line;
@@ -967,7 +1034,10 @@ DIAG_JSON := "\{\"api\":1,\"severity\":\"error\",\"rule\":\"expr.name.1\",\"file
     ed.diags = ds
     ed.cols = 100
     s := ed.render()
-    assert_eq(s.text[8], " 2:5 error[expr.name.1] unknown name `prnt`  [Ctrl-. replace `prnt` with `print`]")
+    assert_eq(
+        s.text[8],
+        " 2:5 error[expr.name.1] unknown name `prnt`  [Ctrl-. replace `prnt` with `print`]",
+    )
     mut marked := 0
     for sp in s.spans
         if sp.bg == ERROR_BG
