@@ -9,6 +9,7 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 ```sh
 ./ail run tools/edit/edit.ail FILE                     # the editor, in a window
 ./ail run tools/edit/edit.ail --font 15 FILE           # ...with a smaller font (10 to 40)
+./ail run tools/edit/edit.ail --theme light FILE       # ...in a theme (see Themes)
 ./ail run tools/edit/edit.ail --print FILE             # print one screen as text
 ./ail run tools/edit/edit.ail --print --check FILE     # ...after Ctrl-K
 ./ail run tools/edit/edit.ail --print --outline FILE   # ...with the outline
@@ -54,8 +55,32 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 | Ctrl-Tab, Ctrl-Shift-Tab | Next, previous tab; a click on a tab selects it |
 | Ctrl-W | Close the tab; with unsaved changes, press it twice |
 | F2 | Rename the name under the cursor: through `ail api --refs` (declarations and locals), else every whole word; the prompt shows the count and how they were found, Enter applies, Ctrl-Z undoes (ADR 0244) |
+| Ctrl-Shift-T | Next theme: dark, light, solarized, high-contrast; remembered for the next start |
 | Ctrl-+ (or Ctrl-=), Ctrl--, Ctrl-0 | Larger, smaller, default font size (ADR 0243) |
 | Mouse | Click places the caret, drag or Shift-click selects, the wheel scrolls, a click on a diagnostic jumps to it |
+
+## Themes
+
+`dark` (the default), `light`, `solarized` and `high-contrast` live in
+[themes/themes.ail](themes/themes.ail) as maps from a color kind to
+`0xRRGGBB` (ADR 0295): `bg`, `fg`, `line_bg`, `gutter_fg`, `status_bg`,
+`status_fg`, `pane_bg`, `keyword`, `type`, `string`, `number`, `comment`,
+`attr`, `error_bg`, `warn_bg`, `select_bg`, `bracket_bg`, `occur_bg`,
+`error_fg` and `warn_fg`. A kind a theme leaves out keeps the dark color.
+To add a theme, add a map and its name to `NAMES` and `named`.
+
+`--theme NAME` picks one for this run. Ctrl-Shift-T moves to the next and
+writes `theme NAME` to `~/.ail-edit` (ADR 0296), which the next start
+reads; `--theme` wins over it. An unknown name keeps `dark` and the tab bar
+lists the names.
+
+Mac check for themes: run
+`./ail run tools/edit/edit.ail --theme light examples/hello.ail`. Expect
+a white background, `fn` in blue, the string in dark red, and a blue
+status line with white text. Press Cmd-Shift-T: the tab bar says `theme
+solarized` and the background turns dark teal. Quit with Cmd-Q and run
+`./ail run tools/edit/edit.ail examples/hello.ail`: it opens in solarized.
+Cmd-Shift-T twice more returns to `dark`.
 
 ## macOS sanity check
 

@@ -10,6 +10,7 @@ use std.env
 use std.proc
 use std.time
 use std.ui
+use themes
 
 # Colors, 0xRRGGBB.
 BG := 0x1e1e1e
@@ -35,6 +36,34 @@ BRACKET_BG := 0x3b514d
 OCCUR_BG := 0x343a40
 ERROR_FG := 0xf48771
 WARN_FG := 0xcca700
+
+## The color kinds a theme can change (tools/edit/themes, ADR 0295). OP_FG
+## is FG, so it follows "fg".
+FG_KINDS := {
+    "fg": FG,
+    "gutter_fg": GUTTER_FG,
+    "status_fg": STATUS_FG,
+    "keyword": KEYWORD_FG,
+    "type": TYPE_FG,
+    "string": STRING_FG,
+    "number": NUMBER_FG,
+    "comment": COMMENT_FG,
+    "attr": ATTR_FG,
+    "error_fg": ERROR_FG,
+    "warn_fg": WARN_FG,
+}
+
+BG_KINDS := {
+    "bg": BG,
+    "line_bg": LINE_BG,
+    "status_bg": STATUS_BG,
+    "pane_bg": PANE_BG,
+    "error_bg": ERROR_BG,
+    "warn_bg": WARN_BG,
+    "select_bg": SELECT_BG,
+    "bracket_bg": BRACKET_BG,
+    "occur_bg": OCCUR_BG,
+}
 
 UNDO_LIMIT := 200
 INDENT := 4
@@ -2719,6 +2748,34 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     ws.on_event(Close)
     assert(ws.quit)
 
+@test fn themes_recolor_and_cycle()
+    mut ws := Workspace.new(typed("", []))
+    assert_eq(ws.pal.bg_of(BG), BG)
+    assert(ws.set_theme("light"))
+    assert_eq(ws.pal.bg_of(BG), 0xffffff)
+    assert_eq(ws.pal.fg_of(KEYWORD_FG), 0x0000ff)
+    assert_eq(ws.pal.fg_of(OP_FG), ws.pal.fg_of(FG))
+    # A background color used as text follows its background kind.
+    assert_eq(ws.pal.fg_of(BG), 0xffffff)
+    assert(not ws.set_theme("neon"))
+    assert_eq(ws.theme, "light")
+    ws.on_event(Key(key: "T", ctrl: true, alt: false, shift: true))
+    assert_eq(ws.theme, "solarized")
+    assert_eq(ws.message, "theme solarized")
+    ws.on_event(Key(key: "T", ctrl: true, alt: false, shift: true))
+    ws.on_event(Key(key: "T", ctrl: true, alt: false, shift: true))
+    assert_eq(ws.theme, "dark")
+    for name in themes.NAMES
+        t := themes.named(name) else unreachable("listed")
+        for k in t.keys()
+            assert(FG_KINDS.contains(k) or BG_KINDS.contains(k))
+
+@test fn settings_keep_other_lines()
+    text := with_setting("font 15\ntheme dark\n", "theme", "light")
+    assert_eq(text, "font 15\ntheme light\n")
+    assert_eq(setting(text, "theme") else "", "light")
+    assert_eq(setting("", "theme") else "none", "none")
+
 @test fn ctrl_plus_and_minus_step_the_font_size()
     mut ws := Workspace.new(typed("", []))
     ws.on_event(Key(key: "=", ctrl: true, alt: false, shift: false))
@@ -2738,11 +2795,98 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
 
 ## Draws a screen: the runs in order, then the caret.
 fn draw(mut w ui.Window, s Screen)
-    w.clear(BG)
+    draw_themed(mut w, s, palette(Map[str, int]()))
+
+## Draws a screen in a theme's colors.
+fn draw_themed(mut w ui.Window, s Screen, pal Palette)
+    w.clear(pal.bg_of(BG))
     for sp in s.spans
-        w.put(sp.col, sp.row, sp.text, sp.fg, sp.bg)
+        w.put(sp.col, sp.row, sp.text, pal.fg_of(sp.fg), pal.bg_of(sp.bg))
     w.cursor(s.cursor_col, s.cursor_row)
     w.present()
+
+# ---- Themes (ADR 0295) -----------------------------------------------------
+
+## A theme as a recoloring of the default (dark) colors, by role.
+struct Palette
+    fg Map[int, int]
+    bg Map[int, int]
+
+## The recoloring for a theme from `themes.named`.
+fn palette(t Map[str, int]) Palette
+    mut fg := Map[int, int]()
+    for k in FG_KINDS.keys()
+        if c := t.get(k)
+            fg[FG_KINDS[k]] = c
+    mut bg := Map[int, int]()
+    for k in BG_KINDS.keys()
+        if c := t.get(k)
+            bg[BG_KINDS[k]] = c
+    Palette(fg: fg, bg: bg)
+
+## A text color in the theme; a background color used as text follows its
+## background kind.
+fn Palette.fg_of(self, c int) int
+    fg.get(c) else (bg.get(c) else c)
+
+fn Palette.bg_of(self, c int) int
+    bg.get(c) else (fg.get(c) else c)
+
+## The editor's settings file, `~/.ail-edit`: lines of `KEY VALUE`.
+fn settings_path() str?
+    home := env.home() else return none
+    "{home}/.ail-edit"
+
+## The value of `key` in settings text.
+fn setting(text str, key str) str?
+    for line in text.split("\n")
+        if line.starts_with("{key} ")
+            return line.chars()[key.chars().len() + 1..].join("").trim()
+    none
+
+## Settings text with `key` set to `value`, other lines kept.
+fn with_setting(text str, key str, value str) str
+    mut out := List[str]()
+    for line in text.split("\n")
+        if line != "" and not line.starts_with("{key} ")
+            out.push(line)
+    out.push("{key} {value}")
+    "{out.join("\n")}\n"
+
+## The theme remembered in `~/.ail-edit`, or "dark".
+fn saved_theme() str
+    path := settings_path() else return "dark"
+    if not fs.exists(path)
+        return "dark"
+    text := fs.read_text(path) else return "dark"
+    setting(text, "theme") else "dark"
+
+## Remembers `name` in `~/.ail-edit`; a failure only shows a message.
+fn save_theme(name str) str
+    path := settings_path() else return "no home directory: the theme isn't remembered"
+    mut text := ""
+    if fs.exists(path)
+        text = fs.read_text(path) else ""
+    fs.write_text(path, with_setting(text, "theme", name)) else err
+        return "can't write {err.path}: {err.kind}"
+    ""
+
+## Uses the theme called `name`; false, changing nothing, if there is none.
+fn Workspace.set_theme(mut self, name str) bool
+    t := themes.named(name) else return false
+    theme = name
+    pal = palette(t)
+    true
+
+## Ctrl-Shift-T: the next theme, remembered for the next start.
+fn Workspace.next_theme(mut self)
+    at := themes.NAMES.index_of(theme) else -1
+    set_theme(themes.NAMES[(at + 1) % themes.NAMES.len()])
+    message = "theme {theme}"
+    if remember
+        failed := save_theme(theme)
+        if failed != ""
+            message = "theme {theme} ({failed})"
 
 ## Applies one window event. Closing the window is Ctrl-Q: with unsaved
 ## changes the first close asks and the second quits.
@@ -2951,6 +3095,11 @@ struct Workspace
     message str
     ## The font size, as a cell height in pixels (std.ui.15).
     font int
+    ## The theme's name and colors (ADR 0295); `remember` saves changes to
+    ## `~/.ail-edit` (off in tests).
+    theme str
+    pal Palette
+    remember bool
 
 fn Workspace.new(ed Editor) Workspace
     Workspace(
@@ -2966,6 +3115,9 @@ fn Workspace.new(ed Editor) Workspace
         quit: false,
         message: "",
         font: 20,
+        theme: "dark",
+        pal: palette(Map[str, int]()),
+        remember: false,
     )
 
 ## The file name a tab shows: the path after its last `/`.
@@ -3046,6 +3198,9 @@ fn Workspace.on_event(mut self, ev ui.Event)
                 return
             if ctrl and (k == "p" or k == "P")
                 start_picking()
+                return
+            if ctrl and shift and (k == "t" or k == "T")
+                next_theme()
                 return
             if ctrl and (k == "=" or k == "+" or k == "-" or k == "0")
                 zoom(k)
@@ -3282,7 +3437,7 @@ fn Workspace.render(self) Screen
         s.put(0, x, labels[i], fg, bg)
         x += labels[i].chars().len() + 1
     if message != ""
-        s.put(0, x + 1, message, STATUS_FG, PANE_BG)
+        s.put(0, x + 1, message, FG, PANE_BG)
     inner := eds[active].render()
     for sp in inner.spans
         s.spans.push(Span(row: sp.row + 1, col: sp.col, text: sp.text, fg: sp.fg, bg: sp.bg))
@@ -3333,7 +3488,7 @@ fn Workspace.window(mut self) ! ui.UiError
         if font != w.font_size()
             w.set_font_size(font)
             font = w.font_size()
-        draw(mut w, render())
+        draw_themed(mut w, render(), pal)
         on_window_event(w.next_event(), w.modifiers())
         while not quit
             ev := w.poll_event() else break
@@ -3359,6 +3514,13 @@ fn window_main(mut ed Editor, flags List[str])
     ed.index()
     mut ws := Workspace.new(ed)
     ws.font = font_flag(flags)
+    ws.remember = true
+    mut name := saved_theme()
+    at := flags.index_of("--theme") else -1
+    if at >= 0 and at + 1 < flags.len()
+        name = flags[at + 1]
+    if not ws.set_theme(name)
+        ws.message = "no theme `{name}`: try {themes.NAMES.join(", ")}"
     ws.window() else err
         print("edit: no window ({err.kind}: {err.message}); printing the screen instead")
         print_screen(mut ed, flags)
