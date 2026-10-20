@@ -124,6 +124,8 @@ struct Symbol
     col int
     signature str
     doc str
+    ## Contracts, effects and the error set, one per line (`requires x > 0`).
+    facts List[str]
 
 ## A use of a declaration: `{id, line, col}` from `ail api --symbols`.
 struct SymbolRef
@@ -181,6 +183,8 @@ struct Editor
     locals List[Completion]
     member_of str
     rename RenamePlan
+    ## Lines the tests never ran (Ctrl-Shift-C), 0-based; cleared by an edit.
+    missed Set[int]
     ## Successful saves, so the workspace can check the other tabs.
     saves int
     comp_sel int
@@ -223,6 +227,7 @@ fn Editor.new(path str, text str, cols int, rows int) Editor
         locals: [],
         member_of: "",
         rename: RenamePlan(name: "", at: [], semantic: false),
+        missed: Set[int](),
         saves: 0,
         comp_sel: 0,
         selecting: false,
@@ -246,6 +251,7 @@ fn Editor.snapshot(mut self)
     dirty = true
     indexed = false
     diags = []
+    missed = Set[int]()
 
 fn Editor.set_col(mut self, c int)
     col = c
@@ -619,6 +625,25 @@ struct ApiIndex
 
 ## Every declaration (nested ones too) and every reference in
 ## `ail api --symbols` output.
+## What a declaration's `ail api` entry adds to its signature: contracts,
+## effects (capabilities included) and the error set (err.api.1).
+fn facts_of(it Json) List[str]
+    mut out := List[str]()
+    for key in ["requires", "ensures"]
+        for c in jarr(it, key)
+            out.push("{key} {jtext(c)}")
+    mut effects := List[str]()
+    for e in jarr(it, "effects")
+        effects.push(jtext(e))
+    if effects.len() > 0
+        out.push("effects: {effects.join(", ")}")
+    mut errs := List[str]()
+    for e in jarr(it, "fails_with")
+        errs.push(jtext(e))
+    if errs.len() > 0
+        out.push("fails with {errs.join(" | ")}")
+    out
+
 fn parse_api(text str) ApiIndex
     mut syms := List[Symbol]()
     mut refs := List[SymbolRef]()
@@ -634,6 +659,7 @@ fn parse_api(text str) ApiIndex
             col: jint(it, "col"),
             signature: jstr(it, "signature"),
             doc: jstr(it, "doc"),
+            facts: facts_of(it),
         ))
         for key in ["fields", "variants", "methods"]
             for sub in jarr(it, key)
@@ -931,8 +957,11 @@ fn parse_locals(j Json) List[Completion]
 ## is used instead.
 fn Editor.query_at(mut self, hover bool) bool
     if hover
-        j := api_at("--type", text(), line + 1, col + 1) else return false
-        show_type(j)
+        t := api_at("--type", text(), line + 1, col + 1) else Json.Null
+        uses := api_at("--refs", text(), line + 1, col + 1) else Json.Null
+        if t == Json.Null and uses == Json.Null
+            return false
+        show_info(t, uses)
         return true
     j := api_at("--refs", text(), line + 1, col + 1) else return false
     for r in jarr(j, "refs")
@@ -944,23 +973,38 @@ fn Editor.query_at(mut self, hover bool) bool
             return true
     false
 
-fn Editor.show_type(mut self, j Json)
-    pane_text = ["{jstr(j, "text")}: {jstr(j, "type")}"]
-    callee := j.get("callee") else Json.Null
-    if callee != Json.Null
+## Ctrl-I: everything `ail api` knows about the name under the cursor: the
+## expression's type (`--type`), the declaration's signature, contracts,
+## effects, error set and doc (from the call or the `--symbols` index), and
+## how many uses `--refs` finds in this file (ADR 0312).
+fn Editor.show_info(mut self, t Json, found Json)
+    pane_text = []
+    if t != Json.Null
+        pane_text.push("{jstr(t, "text")}: {jstr(t, "type")}")
+    callee := t.get("callee") else Json.Null
+    mut id := jstr(t, "symbol")
+    if id == ""
+        id = jstr(found, "symbol")
+    mut doc := ""
+    if sym := symbol(id)
+        pane_text.push(sym.signature)
+        for f in sym.facts
+            pane_text.push("    {f}")
+        doc = sym.doc
+    elif callee != Json.Null
         pane_text.push(jstr(callee, "signature"))
-        doc := jstr(callee, "doc")
-        if doc != ""
-            for d in doc.split("\n")
-                pane_text.push("## {d}")
-    id := jstr(j, "symbol")
-    if id != ""
-        if sym := symbol(id)
-            if not pane_text.contains(sym.signature)
-                pane_text.push(sym.signature)
-            if sym.doc != "" and callee == Json.Null
-                for d in sym.doc.split("\n")
-                    pane_text.push("## {d}")
+        for f in facts_of(callee)
+            pane_text.push("    {f}")
+        doc = jstr(callee, "doc")
+    if doc != ""
+        for d in doc.split("\n")
+            pane_text.push("## {d}")
+    if found != Json.Null
+        mut uses := 0
+        for r in jarr(found, "refs")
+            if (r.get("def") else Json.Null) != Json.Bool(true)
+                uses += 1
+        pane_text.push("{id}: {uses} uses in this file (F12 goes to the definition)")
     pane = Text
     message = "Esc closes"
 
@@ -1352,7 +1396,10 @@ fn Editor.render(self) Screen
             bg = LINE_BG
             s.band(r, bg)
         num := "{l + 1}"
-        s.put(r, 0, "{num.pad_left(gw - 1, ' ')} ", GUTTER_FG, bg)
+        if missed.contains(l)
+            s.put(r, 0, "{num.pad_left(gw - 1, ' ')}!", ERROR_FG, bg)
+        else
+            s.put(r, 0, "{num.pad_left(gw - 1, ' ')} ", GUTTER_FG, bg)
         cs := lines[l].chars()
         if left >= cs.len()
             continue
@@ -2620,7 +2667,7 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
 
 @test fn hover_shows_type_signature_and_doc()
     mut ed := indexed([])
-    ed.show_type(parse_json(TYPE_JSON) else Json.Null)
+    ed.show_info(parse_json(TYPE_JSON) else Json.Null, Json.Null)
     assert_eq(ed.pane_text, ["add: fn(int, int) int", "fn add(a int, b int) int", "## Adds."])
     assert_eq(ed.pane, Text)
 
@@ -2791,7 +2838,7 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     hits := search_text("a.ail", "fn main()\n    total := 1\n    print(total)", "total")
     assert_eq(hits.len(), 2)
     assert_eq(hits[1].loc, Loc(path: "a.ail", line: 3, col: 11))
-    assert_eq(hits[1].text, "print(total)")
+    assert_eq(hits[1].text, "a.ail:3:11: print(total)")
     mut ws := Workspace.new(typed("fn main()\n    total := 1\n    print(total)", []))
     ws.eds[0].path = "a.ail"
     ws.rows = 24
@@ -2867,6 +2914,29 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     ws.eds[0].path = "a.ail"
     ws.eds[0].diags = parse_diags(DIAG_JSON)
     assert_eq(ws.tab_labels(), [" a.ail E1 "])
+
+@test fn agent_panel_rows_from_trace_errors_and_coverage()
+    trace := "\{\"trace\":\"call\",\"fn\":\"half\",\"depth\":2,\"args\":\{\"n\":\"4\"},\"line\":12,\"col\":10}\n\{\"severity\":\"trap\",\"rule\":\"type.coll.4\",\"line\":15,\"col\":12,\"message\":\"index 2 is out of bounds\",\"stack\":[\{\"fn\":\"main\",\"line\":15,\"col\":12,\"args\":\{},\"locals\":\{\"x\":\"2\"}}]}"
+    rows := trace_hits("a.ail", trace, "2")
+    assert_eq(rows.len(), 4)
+    assert_eq(rows[0].text, "  call half(n = 4)  12:10")
+    assert_eq(rows[1].text, "trap[type.coll.4] index 2 is out of bounds  15:12")
+    assert_eq(rows[2].text, "  in main 15:12  locals: x = 2")
+    assert_eq(rows[3].loc.line, 0)
+    errs := "\{\"functions\":[\{\"name\":\"half\",\"line\":5,\"fails_with\":[\"E\"],\"paths\":[\{\"line\":8,\"col\":16,\"kind\":\"return\",\"errors\":[\"E\"]}]}]}"
+    paths := failure_hits("a.ail", errs)
+    assert_eq(paths[0].text, "fn half fails with E")
+    assert_eq(paths[1].text, "  8:16 return: E")
+    assert_eq(paths[1].loc, Loc(path: "a.ail", line: 8, col: 16))
+    missed := parse_coverage("\{\"test\":\"t\"}\n\{\"coverage\":true,\"missed\":[[2,3],[7,7]]}")
+    assert_eq(missed.len(), 3)
+    assert(missed.contains(1) and missed.contains(2) and missed.contains(6))
+    # The marks show in the gutter until the next edit.
+    mut ed := typed("a\nb\nc", [])
+    ed.missed = missed
+    assert(ed.render().text[1].starts_with("  2!"))
+    ed.apply(Insert("x"))
+    assert_eq(ed.missed.len(), 0)
 
 @test fn quitting_asks_once_for_unsaved_tabs()
     mut ws := Workspace.new(typed("", keys("x")))
@@ -3270,9 +3340,9 @@ fn key_rows() List[KeyRow]
         ),
         key_row(
             "Ctrl-I",
-            "Show type",
+            "Show info",
             "ctrl+i",
-            "Show the type of the expression under the cursor, and the signature and doc comment of what it names (`ail api --type`)",
+            "Info on the name under the cursor: its type (`ail api --type`), signature, contracts, effects, error set, doc comment and number of uses (`--refs`) (ADR 0312)",
         ),
         key_row(
             "F2",
@@ -3344,6 +3414,24 @@ fn key_rows() List[KeyRow]
             "Run the buffer (`ail run`); the output fills the pane (its end, when long), Esc closes it, and a click on a `FILE:LINE:COL` or `at LINE:COL` jumps there, opening the file in a tab if needed",
         ),
         key_row("F6", "Test file", "f6", "Run the buffer's tests (`ail test`), shown like F5"),
+        key_row(
+            "Shift-F5",
+            "Run with trace",
+            "shift+f5",
+            "Run with every trace event (`ail run --trace=all`): calls with arguments, returns, contracts, and a trap with each frame's locals; Up/Down, Enter jumps to an event (ADR 0312)",
+        ),
+        key_row(
+            "Ctrl-Shift-E",
+            "Failure paths",
+            "ctrl+shift+e",
+            "Each function's error set and every return, `?` and `else` that fails or handles, from `ail check --errors`; Up/Down, Enter jumps (ADR 0312)",
+        ),
+        key_row(
+            "Ctrl-Shift-C",
+            "Test coverage",
+            "ctrl+shift+c",
+            "Run the tests with line coverage (`ail test --coverage=lines`) and mark the lines they never ran in the gutter, until the next edit (ADR 0313)",
+        ),
         key_row(
             "Ctrl-Shift-P",
             "",
@@ -3446,12 +3534,17 @@ enum WsKey
     NextHit
     Tree
     Theme
+    Trace
+    FailurePaths
+    Coverage
     Zoom(key str)
 
 fn workspace_key(k str, ctrl bool, shift bool) WsKey?
     if not ctrl
         if k == "f4" and not shift
             return NextHit
+        if k == "f5" and shift
+            return Trace
         return none
     if k == "tab"
         if shift
@@ -3464,6 +3557,8 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
             "p" | "P" => Palette
             "f" | "F" => Search
             "t" | "T" => Theme
+            "e" | "E" => FailurePaths
+            "c" | "C" => Coverage
             _ => none
     match k
         "b" | "B" => Tree
@@ -3530,6 +3625,7 @@ struct Workspace
     searching bool
     search str
     hits List[Hit]
+    hits_title str
     hit_sel int
     hit_top int
     browsing bool
@@ -3567,6 +3663,7 @@ fn Workspace.new(ed Editor) Workspace
         searching: false,
         search: "",
         hits: [],
+        hits_title: "",
         hit_sel: 0,
         hit_top: 0,
         browsing: false,
@@ -3673,6 +3770,9 @@ fn Workspace.on_event(mut self, ev ui.Event)
                     NextHit => next_hit()
                     Tree => toggle_tree()
                     Theme => next_theme()
+                    Trace => trace_run()
+                    FailurePaths => failure_paths()
+                    Coverage => eds[active].coverage()
                 return
             saves := eds[active].saves
             eds[active].on_event(ev)
@@ -3995,7 +4095,10 @@ fn search_text(path str, text str, query str) List[Hit]
     ls := text.lines()
     for l in 0..ls.len()
         if c := ls[l].find(query)
-            out.push(Hit(loc: Loc(path: path, line: l + 1, col: c + 1), text: ls[l].trim()))
+            out.push(Hit(
+                loc: Loc(path: path, line: l + 1, col: c + 1),
+                text: "{path}:{l + 1}:{c + 1}: {ls[l].trim()}",
+            ))
     out
 
 ## Searches every `.ail` file under the directory, open tabs as they are in
@@ -4049,11 +4152,22 @@ fn Workspace.search_event(mut self, ev ui.Event)
 ## Puts the hits in the active tab's pane and focuses them: Up/Down
 ## select, Enter (or F4, the next one) jumps, Escape closes.
 fn Workspace.show_hits(mut self, found List[Hit])
-    hits = found
-    hit_sel = 0
-    if hits.len() == 0
+    mut more := ""
+    if found.len() >= 1000
+        more = " (first 1000)"
+    if found.len() == 0
         message = "no match for `{search}`"
         return
+    show_list("search `{search}`: {found.len()} matches{more}", found)
+
+## Puts rows in the active tab's pane under `title` and focuses them:
+## Up/Down select, Enter (or F4, the next) jumps to a row's position,
+## Escape closes. Search, trace and failure paths all use it.
+fn Workspace.show_list(mut self, title str, found List[Hit])
+    hits = found
+    hits_title = title
+    hit_sel = 0
+    hit_top = 0
     browsing = true
     fill_hits()
 
@@ -4064,13 +4178,9 @@ fn Workspace.fill_hits(mut self)
     ed.pane = Text
     room := (ed.pane_rows() - 1).max(1)
     hit_top = hit_top.min(hit_sel).max(hit_sel - room + 1).max(0)
-    mut more := ""
-    if hits.len() >= 1000
-        more = " (first 1000)"
-    ed.pane_text = ["search `{search}`: {hits.len()} matches{more}; Up/Down, Enter jumps, F4 next, Esc closes"]
+    ed.pane_text = ["{hits_title}; Up/Down, Enter jumps, F4 next, Esc closes"]
     for i in hit_top..(hit_top + room).min(hits.len())
-        h := hits[i]
-        ed.pane_text.push("{h.loc.path}:{h.loc.line}:{h.loc.col}: {h.text}")
+        ed.pane_text.push(hits[i].text)
     eds[active] = ed
 
 ## Opens the selected hit's file in a tab, moves there, and shows the hits
@@ -4079,6 +4189,8 @@ fn Workspace.jump_to_hit(mut self)
     if hit_sel >= hits.len()
         return
     loc := hits[hit_sel].loc
+    if loc.line == 0
+        return
     open(loc.path)
     eds[active].jump_to(loc)
     fill_hits()
@@ -4127,6 +4239,149 @@ fn Workspace.render_search(self, mut s Screen)
             x := left()
             s.put(r, x, " ".repeat(cols - x), FG, SELECT_BG)
             s.put(r, x + 1, ed.pane_text[1 + hit_sel - hit_top], FG, SELECT_BG)
+
+# ---- The agent panel: trace, failure paths, coverage ----------------------
+
+## A JSON value as short text: strings as they are, others as JSON.
+fn jtext(j Json) str
+    if s := j.as_str()
+        return s
+    j.to_text()
+
+## `name: value, ...` from a JSON object such as a frame's `locals`.
+fn json_pairs(j Json) str
+    mut out := List[str]()
+    for m in j.as_obj() else List[JsonMember]()
+        out.push("{m.key} = {jtext(m.value)}")
+    out.join(", ")
+
+## The rows of `ail run --trace=all --json` (standard error): calls indented
+## by depth, returns, contracts, and a trap with every frame's locals; then
+## the program's output. Rows with a position jump there (ADR 0312).
+fn trace_hits(path str, err str, out str) List[Hit]
+    mut hits := List[Hit]()
+    for l in err.lines()
+        j := parse_json(l) else continue
+        at := Loc(path: path, line: jint(j, "line"), col: jint(j, "col"))
+        pad := "  ".repeat((jint(j, "depth") - 1).max(0))
+        kind := jstr(j, "trace")
+        if kind == "call"
+            hits.push(Hit(
+                loc: at,
+                text: "{pad}call {jstr(j, "fn")}({json_pairs(j.get("args") else Json.Null)})  {at.line}:{at.col}",
+            ))
+        elif kind == "return"
+            hits.push(Hit(
+                loc: at,
+                text: "{pad}return {jstr(j, "fn")} = {jtext(j.get("value") else Json.Null)}",
+            ))
+        elif kind == "contract"
+            mut held := "held"
+            if (j.get("held") else Json.Null) != Json.Bool(true)
+                held = "FAILED"
+            hits.push(Hit(
+                loc: at,
+                text: "{pad}{jstr(j, "kind")} {jstr(j, "cond")} {held}  {at.line}:{at.col}",
+            ))
+        elif kind == "summary"
+            hits.push(Hit(
+                loc: Loc(path: path, line: 0, col: 0),
+                text: "{jint(j, "shown")} events, {jint(j, "dropped")} dropped",
+            ))
+        elif kind != ""
+            hits.push(Hit(loc: at, text: "{pad}{kind} {jstr(j, "fn")}  {at.line}:{at.col}"))
+        elif jstr(j, "severity") == "trap"
+            hits.push(Hit(
+                loc: at,
+                text: "trap[{jstr(j, "rule")}] {jstr(j, "message")}  {at.line}:{at.col}",
+            ))
+            for f in jarr(j, "stack")
+                floc := Loc(path: path, line: jint(f, "line"), col: jint(f, "col"))
+                mut row := "  in {jstr(f, "fn")} {floc.line}:{floc.col}"
+                args := json_pairs(f.get("args") else Json.Null)
+                if args != ""
+                    row = "{row}  args: {args}"
+                locals := json_pairs(f.get("locals") else Json.Null)
+                if locals != ""
+                    row = "{row}  locals: {locals}"
+                hits.push(Hit(loc: floc, text: row))
+    for l in out.lines()
+        hits.push(Hit(loc: Loc(path: path, line: 0, col: 0), text: "> {l}"))
+    hits
+
+## The rows of `ail check --errors` (err.api.1): each function with the
+## errors it can fail with, then each failure path (return, propagate,
+## handle) at its position (ADR 0312).
+fn failure_hits(path str, out str) List[Hit]
+    mut hits := List[Hit]()
+    j := parse_json(out.trim()) else return hits
+    for f in jarr(j, "functions")
+        mut fails := List[str]()
+        for e in jarr(f, "fails_with")
+            fails.push(jtext(e))
+        mut head := "fn {jstr(f, "name")}"
+        if fails.len() > 0
+            head = "{head} fails with {fails.join(" | ")}"
+        else
+            head = "{head} fails with nothing"
+        hits.push(Hit(loc: Loc(path: path, line: jint(f, "line"), col: 1), text: head))
+        for p in jarr(f, "paths")
+            mut errs := List[str]()
+            for e in jarr(p, "errors")
+                errs.push(jtext(e))
+            mut what := jstr(p, "kind")
+            if jstr(p, "how") != ""
+                what = "{what} ({jstr(p, "how")})"
+            if jstr(p, "call") != ""
+                what = "{what} {jstr(p, "call")}()"
+            hits.push(Hit(
+                loc: Loc(path: path, line: jint(p, "line"), col: jint(p, "col")),
+                text: "  {jint(p, "line")}:{jint(p, "col")} {what}: {errs.join(" | ")}",
+            ))
+    hits
+
+## Shift-F5: runs the buffer with every trace event; the events fill the
+## pane and take Up/Down and Enter.
+fn Workspace.trace_run(mut self)
+    r := eds[active].ail_on_buffer(["run", "--trace=all", "--json"]) else return
+    show_list("trace (exit {r.status})", trace_hits(eds[active].path, r.err, r.out))
+
+## Ctrl-Shift-E: the file's failure paths from `ail check --errors`.
+fn Workspace.failure_paths(mut self)
+    r := eds[active].ail_on_buffer(["check", "--errors"]) else return
+    if r.status != 0
+        message = "failure paths need a program without errors: Ctrl-K shows them"
+        return
+    show_list("failure paths", failure_hits(eds[active].path, r.out))
+
+## The lines `ail test --coverage=lines --json` reports as never run,
+## 0-based, and its summary line.
+fn parse_coverage(out str) Set[int]
+    mut missed := Set[int]()
+    for l in out.lines()
+        j := parse_json(l) else continue
+        if (j.get("coverage") else Json.Null) != Json.Bool(true)
+            continue
+        for r in jarr(j, "missed")
+            span := r.as_arr() else continue
+            if span.len() == 2
+                a := ((span[0].as_num() else 0.0).to_int())
+                b := ((span[1].as_num() else 0.0).to_int())
+                for n in a..b + 1
+                    missed.add(n - 1)
+    missed
+
+## Ctrl-Shift-C: runs the tests with line coverage and marks the lines
+## they never ran in the gutter until the next edit (ADR 0313).
+fn Editor.coverage(mut self)
+    r := ail_on_buffer(["test", "--coverage=lines", "--json"]) else return
+    missed = parse_coverage(r.out)
+    for l in r.out.lines()
+        j := parse_json(l) else continue
+        if (j.get("coverage") else Json.Null) == Json.Bool(true)
+            message = "coverage: lines {jint(j, "lines_hit")}/{jint(j, "lines")}, functions {jint(j, "functions_hit")}/{jint(j, "functions")}; unrun lines are marked; an edit clears them"
+            return
+    message = "no coverage: does the file have @test functions? (exit {r.status})"
 
 # ---- The file picker (Ctrl-P) ---------------------------------------------
 
@@ -4334,7 +4589,7 @@ fn window_main(mut ed Editor, flags List[str])
         ws.message = "no theme `{name}`: try {themes.NAMES.join(", ")}"
     ws.window() else err
         print("edit: no window ({err.kind}: {err.message}); printing the screen instead")
-        print_screen(mut ed, flags)
+        print_screen(ed, flags)
 
 ## `--font N`: the font size to start with; 20 when absent or not a number.
 fn font_flag(flags List[str]) int
@@ -4347,36 +4602,31 @@ fn font_flag(flags List[str]) int
 ## an agent or a test can drive the editor without a window:
 ## `--check`, `--outline`, `--explain`; `--at=LINE:COL` (1-based) moves the
 ## cursor; `--type=TEXT` types; `--key=SPEC` presses a key such as `f2`,
-## `enter` or `ctrl+space` (`ctrl+`, `alt+`, `shift+` prefixes).
-fn print_screen(mut ed Editor, flags List[str])
+## `enter`, `ctrl+space` or `shift+f5` (`ctrl+`, `alt+`, `shift+`
+## prefixes). Keys go through the workspace, as in the window.
+fn print_screen(ed Editor, flags List[str])
+    mut ws := Workspace.new(ed)
     for f in flags
         if f == "--check"
-            ed.run(Check)
+            ws.eds[ws.active].run(Check)
         elif f == "--outline"
-            ed.run(Outline)
+            ws.eds[ws.active].run(Outline)
         elif f == "--explain"
-            ed.run(Explain)
+            ws.eds[ws.active].run(Explain)
         elif at := f.strip_prefix("--at=")
             parts := at.split(":")
-            ed.line = ((parts[0].to_int() else 1) - 1).max(0).min(ed.lines.len() - 1)
-            ed.set_col(((parts[parts.len() - 1].to_int() else 1) - 1).max(0).min(ed.cur().len()))
-            ed.scroll()
+            mut e := ws.eds[ws.active]
+            e.line = ((parts[0].to_int() else 1) - 1).max(0).min(e.lines.len() - 1)
+            e.set_col(((parts[parts.len() - 1].to_int() else 1) - 1).max(0).min(e.cur().len()))
+            e.scroll()
+            ws.eds[ws.active] = e
         elif t := f.strip_prefix("--type=")
             for c in t.chars()
-                ed.run(Insert("{c}"))
+                ws.on_event(press("{c}"))
         elif spec := f.strip_prefix("--key=")
-            if cmd := key_spec(spec)
-                ed.run(cmd)
-    for row in ed.render().text
+            ws.on_event(key_event(spec))
+    for row in ws.render().text
         print(row)
-
-## The command for a key written `ctrl+shift+f`, `f2` or `enter`.
-fn key_spec(spec str) Command?
-    mut parts := spec.split("+")
-    mut key := parts.pop() else return none
-    if key == "space"
-        key = " "
-    key_command(key, parts.contains("ctrl"), parts.contains("alt"), parts.contains("shift"))
 
 ## `--bench`: the time to render one screen, averaged over 20 renders at
 ## the middle of the buffer.
@@ -4416,6 +4666,6 @@ fn main() !
         bench(mut ed)
         return
     if flags.contains("--print")
-        print_screen(mut ed, flags)
+        print_screen(ed, flags)
         return
     window_main(mut ed, flags)
