@@ -88,11 +88,18 @@ struct Editor
     quit_armed bool
     quit bool
     undo List[Snapshot]
+    redo List[Snapshot]
     diags List[Diag]
     pane Pane
     pane_text List[str]
     outline List[OutlineItem]
     outline_sel int
+    searching bool
+    selecting bool
+    anchor_line int
+    anchor_col int
+    clip str
+    query str
 
 fn Editor.new(path str, text str, cols int, rows int) Editor
     mut lines := text.split("\n")
@@ -115,11 +122,18 @@ fn Editor.new(path str, text str, cols int, rows int) Editor
         quit_armed: false,
         quit: false,
         undo: [],
+        redo: [],
         diags: [],
         pane: Pane.Diags,
         pane_text: [],
         outline: [],
         outline_sel: 0,
+        searching: false,
+        query: "",
+        selecting: false,
+        anchor_line: 0,
+        anchor_col: 0,
+        clip: "",
     )
 
 ## The buffer as file text: lines joined with `\n`, ending with one.
@@ -133,6 +147,7 @@ fn Editor.snapshot(mut self)
     undo.push(Snapshot(lines: lines, line: line, col: col))
     if undo.len() > UNDO_LIMIT
         undo = undo[1..]
+    redo = []
     dirty = true
     diags = []
 
@@ -229,11 +244,75 @@ fn Editor.undo_last(mut self)
     s := undo.pop() else
         message = "nothing to undo"
         return
+    redo.push(Snapshot(lines: lines, line: line, col: col))
+    restore(s)
+
+fn Editor.redo_last(mut self)
+    s := redo.pop() else
+        message = "nothing to redo"
+        return
+    undo.push(Snapshot(lines: lines, line: line, col: col))
+    restore(s)
+
+fn Editor.restore(mut self, s Snapshot)
+    selecting = false
     lines = s.lines
     line = s.line
     set_col(s.col)
     diags = []
     dirty = true
+
+# ---- Selection ----------------------------------------------------------
+
+## A stretch of the buffer from (line, col) up to, not including,
+## (end_line, end_col); all 0-based.
+struct Range
+    line int
+    col int
+    end_line int
+    end_col int
+
+## The selection in buffer order, or `none` when nothing is selected.
+fn Editor.selection(self) Range?
+    if not selecting or anchor_line == line and anchor_col == col
+        return none
+    if anchor_line < line or anchor_line == line and anchor_col < col
+        return Range(line: anchor_line, col: anchor_col, end_line: line, end_col: col)
+    Range(line: line, col: col, end_line: anchor_line, end_col: anchor_col)
+
+fn Editor.selected_text(self) str
+    r := selection() else return ""
+    if r.line == r.end_line
+        return lines[r.line].chars()[r.col..r.end_col].join("")
+    mut parts := [lines[r.line].chars()[r.col..].join("")]
+    for l in r.line + 1..r.end_line
+        parts.push(lines[l])
+    parts.push(lines[r.end_line].chars()[..r.end_col].join(""))
+    parts.join("\n")
+
+## Copies the selection to the editor's clipboard; false if there is none.
+fn Editor.copy(mut self) bool
+    if selection() == none
+        message = "nothing selected"
+        return false
+    clip = selected_text()
+    true
+
+## Deletes the selection, if any, and ends selecting. True if it deleted.
+fn Editor.cut_selection(mut self) bool
+    r := selection() else
+        selecting = false
+        return false
+    selecting = false
+    replace(r.line, r.col, r.end_line, r.end_col, "")
+    true
+
+## The background of a selected character, else `bg`.
+fn sel_bg(sel Range?, l int, c int, bg int) int
+    r := sel else return bg
+    if l < r.line or l > r.end_line or l == r.line and c < r.col or l == r.end_line and c >= r.end_col
+        return bg
+    SELECT_BG
 
 # ---- Movement -----------------------------------------------------------
 
@@ -514,6 +593,7 @@ fn Editor.render(self) Screen
     h := text_rows()
     gw := gutter_width()
     w := (cols - gw).max(0)
+    sel := selection()
     for r in 0..h
         l := top + r
         if l >= lines.len()
@@ -532,9 +612,9 @@ fn Editor.render(self) Screen
         mut i := left
         while i < end
             fg := fgs[i]
-            b := diag_bg(diags, l, i, bg)
+            b := sel_bg(sel, l, i, diag_bg(diags, l, i, bg))
             mut j := i + 1
-            while j < end and fgs[j] == fg and diag_bg(diags, l, j, bg) == b
+            while j < end and fgs[j] == fg and sel_bg(sel, l, j, diag_bg(diags, l, j, bg)) == b
                 j += 1
             s.put(r, gw + i - left, cs[i..j].join(""), fg, b)
             i = j
@@ -615,7 +695,15 @@ enum Command
     Backspace
     Delete
     Go(dir Dir)
+    Select(dir Dir)
+    SelectAll
+    Copy
+    Cut
+    Paste
     Undo
+    Redo
+    Find
+    FindNext
     Fix
     Escape
     Quit
@@ -634,18 +722,58 @@ fn Editor.apply(mut self, cmd Command)
     if pane == Outline and outline_key(cmd)
         scroll()
         return
+    if searching and search_key(cmd)
+        scroll()
+        return
     match cmd
-        Insert(t) => insert(t)
-        Newline => newline()
-        Tab => insert(" ".repeat(INDENT - col % INDENT))
-        Backspace => backspace()
-        Delete => delete()
-        Go(d) => go(d)
+        Insert(t) =>
+            cut_selection()
+            insert(t)
+        Newline =>
+            cut_selection()
+            newline()
+        Tab =>
+            cut_selection()
+            insert(" ".repeat(INDENT - col % INDENT))
+        Backspace =>
+            if not cut_selection()
+                backspace()
+        Delete =>
+            if not cut_selection()
+                delete()
+        Go(d) =>
+            selecting = false
+            go(d)
+        Select(d) =>
+            if not selecting
+                selecting = true
+                anchor_line = line
+                anchor_col = col
+            go(d)
+        SelectAll =>
+            selecting = true
+            anchor_line = 0
+            anchor_col = 0
+            go(Bottom)
+        Copy => copy()
+        Cut =>
+            if copy()
+                cut_selection()
+        Paste =>
+            cut_selection()
+            insert(clip)
         Undo => undo_last()
+        Redo => redo_last()
+        Find =>
+            searching = true
+            query = ""
+            message = "find: type, Enter or F3 for the next, Esc stops"
+        FindNext => find(true)
         Fix => apply_fix()
         Escape =>
             pane = Diags
             message = ""
+            selecting = false
         Quit =>
             if dirty and not quit_armed
                 quit_armed = true
@@ -691,7 +819,73 @@ fn Editor.apply_fix(mut self)
         i -= 1
     message = "applied: {d.fix_title}; Ctrl-K checks again"
 
+## Typing while finding (Ctrl-F): characters and Backspace edit the query
+## and search from the cursor; Enter finds the next match; Escape and any
+## other command stop finding. True if `cmd` was used here.
+fn Editor.search_key(mut self, cmd Command) bool
+    match cmd
+        Insert(t) =>
+            query = "{query}{t}"
+            find(false)
+        Backspace =>
+            q := query.chars()
+            query = q[..(q.len() - 1).max(0)].join("")
+            find(false)
+        Newline | FindNext => find(true)
+        Escape =>
+            searching = false
+            message = ""
+        Tab | Delete | Go(_) | Select(_) | SelectAll | Copy | Cut | Paste => return stop_search()
+        Undo | Redo | Find | Fix => return stop_search()
+        Quit | Resize(_, _) | Save | Check | Explain | Outline => return stop_search()
+    true
+
+fn Editor.stop_search(mut self) bool
+    searching = false
+    false
+
+## Where `q` occurs in `cs` at or after `start`, or `none`.
+fn find_in(cs List[char], q List[char], start int) int?
+    mut i := start
+    while i + q.len() <= cs.len()
+        if cs[i..i + q.len()] == q
+            return i
+        i += 1
+    none
+
+## Moves the cursor to the next match of `query`: at the cursor, or after it
+## when `next`, wrapping around the end of the buffer.
+fn Editor.find(mut self, next bool)
+    q := query.chars()
+    if q.len() == 0
+        message = "find: "
+        return
+    mut start := col
+    if next
+        start += 1
+    n := lines.len()
+    for k in 0..n + 1
+        l := (line + k) % n
+        mut from := 0
+        if k == 0
+            from = start
+        cs := lines[l].chars()
+        if from > cs.len()
+            continue
+        if c := find_in(cs, q, from)
+            line = l
+            set_col(c)
+            message = "find: {query}"
+            return
+    message = "find: {query} (not found)"
+
 ## The command for a key from `std.ui` (`Event.Key`), or `none`.
+## Moving with Shift held selects.
+fn go_or_select(d Dir, shift bool) Command
+    if shift
+        return Select(d)
+    Go(d)
+
 fn key_command(key str, ctrl bool, alt bool, shift bool) Command?
     if ctrl
         return match key
@@ -699,12 +893,18 @@ fn key_command(key str, ctrl bool, alt bool, shift bool) Command?
             "q" | "Q" => Quit
             "k" | "K" => Check
             "z" | "Z" => Undo
+            "y" | "Y" => Redo
+            "f" | "F" => Find
+            "a" | "A" => SelectAll
+            "c" | "C" => Copy
+            "x" | "X" => Cut
+            "v" | "V" => Paste
             "." => Fix
             "o" | "O" => Outline
-            "home" => Go(Top)
-            "end" => Go(Bottom)
-            "left" => Go(WordLeft)
-            "right" => Go(WordRight)
+            "home" => go_or_select(Top, shift)
+            "end" => go_or_select(Bottom, shift)
+            "left" => go_or_select(WordLeft, shift)
+            "right" => go_or_select(WordRight, shift)
             _ => none
     if alt
         return none
@@ -714,15 +914,16 @@ fn key_command(key str, ctrl bool, alt bool, shift bool) Command?
         "backspace" => Backspace
         "delete" => Delete
         "escape" => Escape
-        "left" => Go(Left)
-        "right" => Go(Right)
-        "up" => Go(Up)
-        "down" => Go(Down)
-        "home" => Go(Home)
-        "end" => Go(End)
-        "pageup" => Go(PageUp)
-        "pagedown" => Go(PageDown)
+        "left" => go_or_select(Left, shift)
+        "right" => go_or_select(Right, shift)
+        "up" => go_or_select(Up, shift)
+        "down" => go_or_select(Down, shift)
+        "home" => go_or_select(Home, shift)
+        "end" => go_or_select(End, shift)
+        "pageup" => go_or_select(PageUp, shift)
+        "pagedown" => go_or_select(PageDown, shift)
         "f1" => Explain
+        "f3" => FindNext
         _ =>
             if key.chars().len() == 1
                 return Insert(key)
@@ -1052,6 +1253,71 @@ DIAG_JSON := "\{\"api\":1,\"severity\":\"error\",\"rule\":\"expr.name.1\",\"file
     assert_eq(ed.diags.len(), 0)
     ed.apply(Undo)
     assert_eq(ed.lines[1], "    prnt(1)")
+
+@test fn redo_after_undo()
+    mut ed := typed("", [Insert("a"), Insert("b"), Undo])
+    assert_eq(ed.lines[0], "a")
+    ed.apply(Redo)
+    assert_eq(ed.lines[0], "ab")
+    ed.apply(Undo)
+    ed.apply(Insert("c"))
+    ed.apply(Redo)
+    assert_eq(ed.message, "nothing to redo")
+    assert_eq(ed.lines[0], "ac")
+    assert_eq(key_command("y", true, false, false), Redo)
+
+@test fn find_as_you_type()
+    mut ed := typed("alpha\nbeta\nalpha beta", [Go(Down), Find])
+    for c in ["b", "e"]
+        ed.apply(Insert(c))
+    assert_eq([ed.line, ed.col], [1, 0])
+    ed.apply(Newline)
+    assert_eq([ed.line, ed.col], [2, 6])
+    ed.apply(Newline)
+    assert_eq([ed.line, ed.col], [1, 0])
+    ed.apply(Backspace)
+    ed.apply(Insert("x"))
+    assert_eq(ed.message, "find: bx (not found)")
+    ed.apply(Escape)
+    assert(not ed.searching)
+    ed.apply(Insert("Z"))
+    assert_eq(ed.lines[1], "Zbeta")
+    ed.apply(Find)
+    ed.apply(Insert("a"))
+    ed.apply(Go(Right))
+    assert(not ed.searching)
+    assert_eq(key_command("f3", false, false, false), FindNext)
+
+@test fn select_copy_cut_paste()
+    mut ed := typed("one two\nthree", [Go(WordRight)])
+    for _ in 0..4
+        ed.apply(key_command("right", false, false, true) else Escape)
+    assert_eq(ed.selected_text(), " two")
+    ed.apply(Select(Down))
+    assert_eq(ed.selected_text(), " two\nthree")
+    ed.apply(Cut)
+    assert_eq(ed.lines, ["one"])
+    ed.apply(Go(Home))
+    ed.apply(Paste)
+    assert_eq(ed.lines, [" two", "threeone"])
+    ed.apply(SelectAll)
+    ed.apply(Copy)
+    assert_eq(ed.clip, " two\nthreeone")
+    ed.apply(Insert("x"))
+    assert_eq(ed.lines, ["x"])
+    ed.apply(Copy)
+    assert_eq(ed.message, "nothing selected")
+
+@test fn selection_is_drawn()
+    mut ed := typed("abcdef", [Go(Right), Select(Right), Select(Right)])
+    mut shown := ""
+    for sp in ed.render().spans
+        if sp.bg == SELECT_BG
+            shown = sp.text
+    assert_eq(shown, "bc")
+    ed.apply(Backspace)
+    assert_eq(ed.lines[0], "adef")
+    assert(not ed.selecting)
 
 @test fn outline_parse_and_jump()
     items := parse_outline("    1  fn main()\n        ## Doc.\n   12      fn Point.x(self) int\n")

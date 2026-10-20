@@ -21,17 +21,21 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 |---|---|
 | Arrows, Home, End, PageUp, PageDown | Move. Home goes to the indentation, then column 1 |
 | Ctrl-Left, Ctrl-Right | Move by word |
+| Shift with any move | Select; typing, Backspace or Delete replaces the selection |
+| Ctrl-A, Ctrl-C, Ctrl-X, Ctrl-V | Select all, copy, cut, paste (the editor's own clipboard) |
 | Ctrl-Home, Ctrl-End | Start, end of the file |
 | Enter | New line, indented like this one, one level deeper after a block opener (`fn`, `if`, `match`, `x => `, `else err`, ...) |
 | Tab | Spaces to the next multiple of 4 (AIL has no tabs, lex.block.1) |
 | Backspace | In indentation, removes one level |
-| Ctrl-Z | Undo |
+| Ctrl-Z, Ctrl-Y | Undo, redo |
+| Ctrl-F | Find as you type; Enter or F3 finds the next match, Escape stops |
+| F3 | Find the next match |
 | Ctrl-S | Save, then check |
 | Ctrl-K | Check: `ail check --json`; spans are marked, the pane lists them |
 | Ctrl-. | Apply the first fix of the diagnostic under the cursor |
 | F1 | Explain the diagnostic under the cursor (`ail explain RULE`) |
 | Ctrl-O | Outline (`ail api --text`); Up/Down select, Enter jumps |
-| Escape | Close the explanation or the outline |
+| Escape | Close the explanation or the outline; stop selecting or finding |
 | Ctrl-Q | Quit; with unsaved changes, press it twice. Closing the window counts as Ctrl-Q |
 
 The `ail` it runs is `$AIL`, else `./ail` when started from the repository
@@ -43,7 +47,7 @@ imports resolve as they will on save.
 
 - Works headless, tested: editing, auto-indent, undo, moves, highlighting,
   scrolling, diagnostics with fixes, explain, outline parsing, quit
-  confirmation (14 `@test`s, run by `./ail selftest`).
+  confirmation, find, redo, selection and the clipboard (18 `@test`s, run by `./ail selftest`).
 - Window front end: written against the agreed `std.ui` API (lane 11 of
   the [buildout plan](../../docs/design/ai-first-plan.md)) and kept in
   `window.ail.pending` until `std.ui` is in the bootstrap; until then
@@ -52,5 +56,5 @@ imports resolve as they will on save.
   says so.
 - Speed (Linux x86-64, interpreter): a 100x32 screen of a 1,000-line file
   renders in about 6 ms; an edit takes about 0.1 ms.
-- Not yet: selection, copy and paste, search, redo, multi-line `"""` string
+- Not yet: the system clipboard, replace, multi-line `"""` string
   highlighting, mouse.
