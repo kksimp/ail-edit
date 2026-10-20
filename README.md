@@ -73,7 +73,7 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-Shift-C | Run the tests with line coverage (`ail test --coverage=lines`) and mark the lines they never ran in the gutter, until the next edit (ADR 0313) |
 | Ctrl-Shift-P | Command palette: every command here with its key; type part of its name, Up/Down, Enter runs it |
 | Ctrl-B | Show the file tree (`.ail` files first) and focus it; again hides it. Up/Down select, Enter or Right opens a file or expands a directory, Left collapses, Esc returns to the editor; a click opens (ADR 0293) |
-| Ctrl-Shift-H | Type what to find, Enter, the replacement, Enter: every changed line of the project's `.ail` files is previewed old → new; Ctrl-Enter applies it to the buffers (files open as tabs, nothing saved, Ctrl-Z undoes per tab), Esc cancels (ADR 0339) |
+| Ctrl-Shift-H | Type what to find, Enter, the replacement, Enter: every changed line of the project's `.ail` files is previewed old -> new; Ctrl-Enter applies it to the buffers (files open as tabs, nothing saved, Ctrl-Z undoes per tab), Esc cancels (ADR 0339) |
 | Ctrl-Shift-F | Search every `.ail` file under the directory (open tabs as edited); the matches fill the pane, Up/Down select, Enter jumps, Esc closes (ADR 0292) |
 | F4 | Jump to the next match of the last project search |
 | Ctrl-P | Open a file: type part of its path (letters in order), Up/Down, Enter |

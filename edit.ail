@@ -3546,7 +3546,7 @@ fn key_rows() List[KeyRow]
             "Ctrl-Shift-H",
             "Replace in files",
             "ctrl+shift+h",
-            "Type what to find, Enter, the replacement, Enter: every changed line of the project's `.ail` files is previewed old → new; Ctrl-Enter applies it to the buffers (files open as tabs, nothing saved, Ctrl-Z undoes per tab), Esc cancels (ADR 0339)",
+            "Type what to find, Enter, the replacement, Enter: every changed line of the project's `.ail` files is previewed old -> new; Ctrl-Enter applies it to the buffers (files open as tabs, nothing saved, Ctrl-Z undoes per tab), Esc cancels (ADR 0339)",
         ),
         key_row(
             "Ctrl-Shift-F",
@@ -4648,7 +4648,7 @@ fn Workspace.start_replace(mut self)
     start_search()
     repl_step = 1
 
-## The preview: one row per changed line, `PATH:L:C: old → new`.
+## The preview: one row per changed line, `PATH:L:C: old -> new`.
 fn Workspace.preview_replace(mut self)
     found := search_project(search, 1000)
     if found.len() == 0
@@ -4662,7 +4662,7 @@ fn Workspace.preview_replace(mut self)
         old := h.text.split(": ")[1..].join(": ")
         preview.push(Hit(
             loc: h.loc,
-            text: "{h.loc.path}:{h.loc.line}:{h.loc.col}: {old} → {old.replace(search, repl_with)}",
+            text: "{h.loc.path}:{h.loc.line}:{h.loc.col}: {old} -> {old.replace(search, repl_with)}",
         ))
     show_list(
         "replace `{search}` with `{repl_with}`: {found.len()} lines in {touched.len()} files; Ctrl-Enter applies",
