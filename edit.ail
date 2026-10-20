@@ -3810,6 +3810,20 @@ fn base_name(path str) str
     parts := path.split("/")
     parts[parts.len() - 1]
 
+## `path` as a list row shows it: relative to `root` when it lies inside,
+## unchanged when it is already relative, else its base name.
+fn shown_path(root str, path str) str
+    if rel := path.strip_prefix("{root}/")
+        return rel
+    if path.starts_with("/")
+        return base_name(path)
+    path
+
+@test fn shown_paths_stay_short()
+    assert_eq(shown_path("/w", "/w/src/a.ail"), "src/a.ail")
+    assert_eq(shown_path("/w", "/var/folders/x/T/ail-edit-1/agent.ail"), "agent.ail")
+    assert_eq(shown_path("/w", "src/a.ail"), "src/a.ail")
+
 ## Opens `path` in a new tab, or switches to it if it is open.
 fn Workspace.open(mut self, path str)
     for i in 0..eds.len()
@@ -4713,8 +4727,11 @@ fn Workspace.apply_replace(mut self)
 
 ## The rows of `ail check --json` output (standard error), one per
 ## diagnostic not already in `seen`: `FILE:LINE:COL: severity[rule]
-## message`. A check copy of an unsaved buffer counts as its file.
-fn problem_hits(err str, mut seen Set[str]) List[Hit]
+## message`. A check copy of an unsaved buffer counts as its file. The
+## row shows the file relative to `root` (the working directory), or its
+## base name when it lies elsewhere, so a long absolute path (macOS's
+## temporary directory, say) doesn't push the message off the row.
+fn problem_hits(root str, err str, mut seen Set[str]) List[Hit]
     mut hits := List[Hit]()
     for l in err.lines()
         j := parse_json(l) else continue
@@ -4724,7 +4741,7 @@ fn problem_hits(err str, mut seen Set[str]) List[Hit]
         if f := file.strip_suffix(".edit-check.ail")
             file = f
         at := Loc(path: file, line: jint(j, "line"), col: jint(j, "col"))
-        row := "{file}:{at.line}:{at.col}: {jstr(j, "severity")}[{jstr(j, "rule")}] {jstr(j, "message")}"
+        row := "{shown_path(root, file)}:{at.line}:{at.col}: {jstr(j, "severity")}[{jstr(j, "rule")}] {jstr(j, "message")}"
         if seen.contains(row)
             continue
         seen.add(row)
@@ -4740,7 +4757,7 @@ fn Workspace.problems(mut self)
     mut others := List[Hit]()
     for i in 0..eds.len()
         r := eds[i].ail_on_buffer(["check", "--json"]) else continue
-        for h in problem_hits(r.err, mut seen)
+        for h in problem_hits(env.cwd(), r.err, mut seen)
             if h.text.contains(": error[")
                 errors.push(h)
             else
@@ -4768,11 +4785,11 @@ fn Workspace.problems(mut self)
 @test fn problem_rows_from_check_json()
     out := "\{\"severity\":\"error\",\"rule\":\"expr.name.1\",\"file\":\"a.ail.edit-check.ail\",\"line\":3,\"col\":5,\"message\":\"unknown name\"}\nnot json\n"
     mut seen := Set[str]()
-    hits := problem_hits(out, mut seen)
+    hits := problem_hits("/w", out, mut seen)
     assert_eq(hits.len(), 1)
     assert_eq(hits[0].text, "a.ail:3:5: error[expr.name.1] unknown name")
     assert_eq(hits[0].loc.line, 3)
-    assert_eq(problem_hits(out, mut seen).len(), 0)
+    assert_eq(problem_hits("/w", out, mut seen).len(), 0)
 
 # ---- The file picker (Ctrl-P) ---------------------------------------------
 
