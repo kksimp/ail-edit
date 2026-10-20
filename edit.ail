@@ -1455,7 +1455,11 @@ fn Editor.render(self) Screen
     if dirty
         flag = " *"
     counts := "{diag_count("error")} errors, {diag_count("warning")} warnings"
-    left_part := " {path}{flag}  Ln {line + 1}, Col {col + 1}  {counts}"
+    mut left_part := " {path}{flag}  Ln {line + 1}, Col {col + 1}  {counts}"
+    # A long path (a temporary directory on macOS) would push the message
+    # off the line: show the file's name instead.
+    if message != "" and left_part.chars().len() + 4 + message.chars().len() > cols
+        left_part = " {base_name(path)}{flag}  Ln {line + 1}, Col {col + 1}  {counts}"
     s.put(status_row, 0, left_part, STATUS_FG, STATUS_BG)
     if message != ""
         s.put(status_row, left_part.len() + 2, "| {message}", STATUS_FG, STATUS_BG)
@@ -3094,6 +3098,62 @@ fn save_theme(name str) str
         return "can't write {err.path}: {err.kind}"
     ""
 
+## The settings key for the tabs open in project directory `dir`.
+fn session_key(dir str) str
+    "open:{dir}"
+
+## Tabs and cursors as a setting value: `LINE,COL,PATH` entries (1-based)
+## separated by `|`, the active tab first (ADR 0339).
+fn session_value(eds List[Editor], active int) str
+    mut parts := List[str]()
+    for i in 0..eds.len()
+        ed := eds[(active + i) % eds.len()]
+        parts.push("{ed.line + 1},{ed.col + 1},{ed.path}")
+    parts.join("|")
+
+## The places a session value names, the active tab first.
+fn session_places(value str) List[Loc]
+    mut out := List[Loc]()
+    for part in value.split("|")
+        bits := part.split(",")
+        if bits.len() < 3
+            continue
+        l := bits[0].to_int() else continue
+        c := bits[1].to_int() else continue
+        out.push(Loc(path: bits[2..].join(","), line: l, col: c))
+    out
+
+## Remembers the open tabs and cursors for the current directory in
+## `~/.ail-edit`; a failure is silent, since the window is closing.
+fn Workspace.save_session(self)
+    path := settings_path() else return
+    mut text := ""
+    if fs.exists(path)
+        text = fs.read_text(path) else ""
+    fs.write_text(path, with_setting(
+        text,
+        session_key(env.cwd()),
+        session_value(eds, active),
+    )) else err
+        return
+
+## Reopens the tabs remembered for the current directory, at their cursors,
+## then shows the file the editor was started with.
+fn Workspace.restore_session(mut self)
+    path := settings_path() else return
+    if not fs.exists(path)
+        return
+    text := fs.read_text(path) else return
+    value := setting(text, session_key(env.cwd())) else return
+    first := eds[active].path
+    for at in session_places(value)
+        if at.path == first
+            eds[active].jump_to(at)
+        elif fs.exists(at.path)
+            open(at.path)
+            eds[active].jump_to(at)
+    open(first)
+
 ## Uses the theme called `name`; false, changing nothing, if there is none.
 fn Workspace.set_theme(mut self, name str) bool
     t := themes.named(name) else return false
@@ -3453,6 +3513,12 @@ fn key_rows() List[KeyRow]
             "Each function's error set and every return, `?` and `else` that fails or handles, from `ail check --errors`; Up/Down, Enter jumps (ADR 0312)",
         ),
         key_row(
+            "Ctrl-Shift-M",
+            "Problems",
+            "ctrl+shift+m",
+            "Every diagnostic of the open tabs' programs (`ail check --json`, modules included, buffers as edited), errors first; Up/Down, Enter jumps, opening the file (ADR 0339)",
+        ),
+        key_row(
             "Ctrl-Shift-I",
             "Program card",
             "ctrl+shift+i",
@@ -3475,6 +3541,12 @@ fn key_rows() List[KeyRow]
             "File tree",
             "ctrl+b",
             "Show the file tree (`.ail` files first) and focus it; again hides it. Up/Down select, Enter or Right opens a file or expands a directory, Left collapses, Esc returns to the editor; a click opens (ADR 0293)",
+        ),
+        key_row(
+            "Ctrl-Shift-H",
+            "Replace in files",
+            "ctrl+shift+h",
+            "Type what to find, Enter, the replacement, Enter: every changed line of the project's `.ail` files is previewed old → new; Ctrl-Enter applies it to the buffers (files open as tabs, nothing saved, Ctrl-Z undoes per tab), Esc cancels (ADR 0339)",
         ),
         key_row(
             "Ctrl-Shift-F",
@@ -3570,6 +3642,8 @@ enum WsKey
     FailurePaths
     Coverage
     Card
+    Problems
+    ReplaceInFiles
     Zoom(key str)
 
 fn workspace_key(k str, ctrl bool, shift bool) WsKey?
@@ -3593,6 +3667,8 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
             "e" | "E" => FailurePaths
             "c" | "C" => Coverage
             "i" | "I" => Card
+            "m" | "M" => Problems
+            "h" | "H" => ReplaceInFiles
             _ => none
     match k
         "b" | "B" => Tree
@@ -3658,6 +3734,10 @@ struct Workspace
     ## and Enter go to them.
     searching bool
     search str
+    ## Replace in files (ADR 0339): 0 off, 1 typing what to find, 2 typing
+    ## the replacement, 3 the preview is showing.
+    repl_step int
+    repl_with str
     hits List[Hit]
     hits_title str
     hit_sel int
@@ -3696,6 +3776,8 @@ fn Workspace.new(ed Editor) Workspace
         files: [],
         searching: false,
         search: "",
+        repl_step: 0,
+        repl_with: "",
         hits: [],
         hits_title: "",
         hit_sel: 0,
@@ -3773,10 +3855,15 @@ fn Workspace.on_event(mut self, ev ui.Event)
     if searching
         search_event(ev)
         return
+    if browsing and repl_step == 3
+        if ev == Key(key: "enter", ctrl: true, alt: false, shift: false)
+            apply_replace()
+            return
     if browsing
         if k := pressed(ev)
             if hits_key(k)
                 return
+    repl_step = 0
     if tree_focus
         if k := pressed(ev)
             if tree_key(k)
@@ -3808,6 +3895,8 @@ fn Workspace.on_event(mut self, ev ui.Event)
                     FailurePaths => failure_paths()
                     Coverage => eds[active].coverage()
                     Card => card_view()
+                    Problems => problems()
+                    ReplaceInFiles => start_replace()
                 return
             saves := eds[active].saves
             eds[active].on_event(ev)
@@ -4175,11 +4264,26 @@ fn Workspace.search_event(mut self, ev ui.Event)
                 return
             if k == "escape"
                 searching = false
+                repl_step = 0
+            elif k == "enter" and repl_step == 1
+                if search == ""
+                    searching = false
+                    repl_step = 0
+                else
+                    repl_step = 2
+                    repl_with = ""
+            elif k == "enter" and repl_step == 2
+                searching = false
+                preview_replace()
             elif k == "enter"
                 searching = false
                 show_hits(search_project(search, 1000))
+            elif k == "backspace" and repl_step == 2
+                repl_with = drop_last(repl_with)
             elif k == "backspace"
                 search = drop_last(search)
+            elif k.chars().len() == 1 and repl_step == 2
+                repl_with = "{repl_with}{k}"
             elif k.chars().len() == 1
                 search = "{search}{k}"
         Close => quit_all()
@@ -4264,11 +4368,17 @@ fn Workspace.next_hit(mut self)
 ## The search prompt on the tab bar, or the selected hit's pane row.
 fn Workspace.render_search(self, mut s Screen)
     if searching
-        head := " search the project: "
-        s.put(0, 0, "{head}{search} ".pad_right(cols, ' '), STATUS_FG, SELECT_BG)
-        s.text[0] = "{head}{search}"
+        mut head := " search the project: "
+        mut entry := search
+        if repl_step == 1
+            head = " replace in files, find: "
+        elif repl_step == 2
+            head = " replace `{search}` with: "
+            entry = repl_with
+        s.put(0, 0, "{head}{entry} ".pad_right(cols, ' '), STATUS_FG, SELECT_BG)
+        s.text[0] = "{head}{entry}"
         s.cursor_row = 0
-        s.cursor_col = head.chars().len() + search.chars().len()
+        s.cursor_col = head.chars().len() + entry.chars().len()
     elif browsing
         ed := eds[active]
         r := 1 + ed.text_rows() + 2 + hit_sel - hit_top
@@ -4481,7 +4591,11 @@ fn card_item(mut hits List[Hit], it Json, sources List[Source], depth int, paren
     mut row := "{pad}{sig}"
     if effects.len() > 0
         row = "{row}  [{effects.join(" ")}]"
-    at := declared_at(sources, sig) else parent
+    # api.card.2 gives the position; an older `ail` without it falls back to
+    # finding the signature in the sources.
+    mut at := Loc(path: jstr(it, "file"), line: jint(it, "line"), col: jint(it, "col"))
+    if at.line == 0 or at.path == ""
+        at = declared_at(sources, sig) else parent
     hits.push(Hit(loc: at, text: row))
     for f in facts_of(it)
         if not f.starts_with("effects:")
@@ -4525,6 +4639,128 @@ fn Workspace.card_view(mut self)
             text = fs.read_text(f) else ""
         sources.push(Source(path: f, lines: text.lines()))
     show_list("program card {jstr(j, "card")}", card_hits(j, sources))
+
+# ---- Replace in files (Ctrl-Shift-H) ---------------------------------------
+
+## Ctrl-Shift-H: asks what to find (the word at the cursor to start), then
+## the replacement.
+fn Workspace.start_replace(mut self)
+    start_search()
+    repl_step = 1
+
+## The preview: one row per changed line, `PATH:L:C: old → new`.
+fn Workspace.preview_replace(mut self)
+    found := search_project(search, 1000)
+    if found.len() == 0
+        repl_step = 0
+        message = "no match for `{search}`"
+        return
+    mut preview := List[Hit]()
+    mut touched := Set[str]()
+    for h in found
+        touched.add(h.loc.path)
+        old := h.text.split(": ")[1..].join(": ")
+        preview.push(Hit(
+            loc: h.loc,
+            text: "{h.loc.path}:{h.loc.line}:{h.loc.col}: {old} → {old.replace(search, repl_with)}",
+        ))
+    show_list(
+        "replace `{search}` with `{repl_with}`: {found.len()} lines in {touched.len()} files; Ctrl-Enter applies",
+        preview,
+    )
+    repl_step = 3
+
+## Ctrl-Enter on the preview: replaces in every previewed file's buffer,
+## opening it as a tab; nothing is saved, and Ctrl-Z undoes each tab.
+fn Workspace.apply_replace(mut self)
+    back := eds[active].path
+    mut done := Set[str]()
+    for h in hits
+        p := h.loc.path
+        if done.contains(p)
+            continue
+        done.add(p)
+        mut at := -1
+        for i in 0..eds.len()
+            if eds[i].path == p or eds[i].path == "./{p}"
+                at = i
+        if at < 0
+            open(p)
+            at = active
+        eds[at].query = search
+        eds[at].input = repl_with
+        eds[at].replace_all()
+    open(back)
+    browsing = false
+    repl_step = 0
+    hits = []
+    eds[active].pane = Diags
+    eds[active].message = "replaced `{search}` in {done.len()} files, not saved; Ctrl-Z undoes per tab"
+
+# ---- Problems (Ctrl-Shift-M) ----------------------------------------------
+
+## The rows of `ail check --json` output (standard error), one per
+## diagnostic not already in `seen`: `FILE:LINE:COL: severity[rule]
+## message`. A check copy of an unsaved buffer counts as its file.
+fn problem_hits(err str, mut seen Set[str]) List[Hit]
+    mut hits := List[Hit]()
+    for l in err.lines()
+        j := parse_json(l) else continue
+        if jstr(j, "rule") == ""
+            continue
+        mut file := jstr(j, "file")
+        if f := file.strip_suffix(".edit-check.ail")
+            file = f
+        at := Loc(path: file, line: jint(j, "line"), col: jint(j, "col"))
+        row := "{file}:{at.line}:{at.col}: {jstr(j, "severity")}[{jstr(j, "rule")}] {jstr(j, "message")}"
+        if seen.contains(row)
+            continue
+        seen.add(row)
+        hits.push(Hit(loc: at, text: row))
+    hits
+
+## Ctrl-Shift-M: every diagnostic of the programs of the open tabs (each
+## checked whole, modules included, buffers as edited), errors first, as
+## a list Enter jumps from (ADR 0339).
+fn Workspace.problems(mut self)
+    mut seen := Set[str]()
+    mut errors := List[Hit]()
+    mut others := List[Hit]()
+    for i in 0..eds.len()
+        r := eds[i].ail_on_buffer(["check", "--json"]) else continue
+        for h in problem_hits(r.err, mut seen)
+            if h.text.contains(": error[")
+                errors.push(h)
+            else
+                others.push(h)
+    if errors.len() + others.len() == 0
+        message = "no problems in {eds.len()} open file(s)"
+        return
+    mut found := errors
+    found.extend(others)
+    show_list("problems: {errors.len()} errors, {others.len()} others", found)
+
+@test fn sessions_round_trip()
+    mut a := Editor.new("src/a,b.ail", "x\nyz", 40, 10)
+    a.jump_to(Loc(path: "", line: 2, col: 3))
+    b := Editor.new("b.ail", "", 40, 10)
+    v := session_value([b, a], 1)
+    assert_eq(v, "2,3,src/a,b.ail|1,1,b.ail")
+    at := session_places("{v}|junk")
+    assert_eq(at.len(), 2)
+    assert_eq(at[0].path, "src/a,b.ail")
+    assert_eq(at[0].line, 2)
+    assert_eq(at[0].col, 3)
+    assert_eq(session_key("/p"), "open:/p")
+
+@test fn problem_rows_from_check_json()
+    out := "\{\"severity\":\"error\",\"rule\":\"expr.name.1\",\"file\":\"a.ail.edit-check.ail\",\"line\":3,\"col\":5,\"message\":\"unknown name\"}\nnot json\n"
+    mut seen := Set[str]()
+    hits := problem_hits(out, mut seen)
+    assert_eq(hits.len(), 1)
+    assert_eq(hits[0].text, "a.ail:3:5: error[expr.name.1] unknown name")
+    assert_eq(hits[0].loc.line, 3)
+    assert_eq(problem_hits(out, mut seen).len(), 0)
 
 # ---- The file picker (Ctrl-P) ---------------------------------------------
 
@@ -4702,6 +4938,8 @@ fn Workspace.window(mut self) ! ui.UiError
         while not quit
             ev := w.poll_event() else break
             on_window_event(ev, w.modifiers())
+    if remember
+        save_session()
     w.close()
 
 ## An event with the modifiers held when it happened (std.ui.14): a
@@ -4724,6 +4962,7 @@ fn window_main(mut ed Editor, flags List[str])
     mut ws := Workspace.new(ed)
     ws.font = font_flag(flags)
     ws.remember = true
+    ws.restore_session()
     mut name := saved_theme()
     at := flags.index_of("--theme") else -1
     if at >= 0 and at + 1 < flags.len()
