@@ -2750,6 +2750,38 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     ws.on_event(key_event("ctrl+p"))
     assert(ws.picking and not ws.commanding)
 
+@test fn project_search_fills_the_pane_and_jumps()
+    hits := search_text("a.ail", "fn main()\n    total := 1\n    print(total)", "total")
+    assert_eq(hits.len(), 2)
+    assert_eq(hits[1].loc, Loc(path: "a.ail", line: 3, col: 11))
+    assert_eq(hits[1].text, "print(total)")
+    mut ws := Workspace.new(typed("fn main()\n    total := 1\n    print(total)", []))
+    ws.eds[0].path = "a.ail"
+    ws.rows = 24
+    ws.on_event(Resize(cols: 60, rows: 24))
+    ws.on_event(key_event("ctrl+shift+f"))
+    assert(ws.searching)
+    assert_eq(ws.search, "fn")
+    assert(ws.render().text[0].starts_with(" search the project: fn"))
+    ws.on_event(press("escape"))
+    assert(not ws.searching)
+    ws.search = "total"
+    ws.show_hits(hits)
+    assert(ws.browsing)
+    ed := ws.eds[0]
+    assert_eq(ed.pane, Text)
+    assert_eq(ed.pane_text[2], "a.ail:3:11: print(total)")
+    ws.on_event(press("down"))
+    ws.on_event(press("enter"))
+    assert(not ws.browsing)
+    assert_eq(ws.eds[0].line, 2)
+    assert_eq(ws.eds[0].col, 10)
+    # F4 wraps to the first hit; typing goes to the editor again.
+    ws.on_event(press("f4"))
+    assert_eq(ws.eds[0].line, 1)
+    ws.on_event(press("x"))
+    assert(ws.eds[0].lines[1].contains("x"))
+
 @test fn quitting_asks_once_for_unsaved_tabs()
     mut ws := Workspace.new(typed("", keys("x")))
     ws.on_event(Close)
@@ -3118,6 +3150,18 @@ fn key_rows() List[KeyRow]
             "Command palette: every command here with its key; type part of its name, Up/Down, Enter runs it",
         ),
         key_row(
+            "Ctrl-Shift-F",
+            "Search the project",
+            "ctrl+shift+f",
+            "Search every `.ail` file under the directory (open tabs as edited); the matches fill the pane, Up/Down select, Enter jumps, Esc closes (ADR 0292)",
+        ),
+        key_row(
+            "F4",
+            "Next search result",
+            "f4",
+            "Jump to the next match of the last project search",
+        ),
+        key_row(
             "Ctrl-P",
             "Open file",
             "ctrl+p",
@@ -3168,6 +3212,15 @@ fn key_event(spec str) ui.Event
         shift: parts.contains("shift"),
     )
 
+## The key of a key event without Ctrl or Alt.
+fn pressed(ev ui.Event) str?
+    match ev
+        Key(k, ctrl, alt, _) =>
+            if ctrl or alt
+                return none
+            k
+        Resize(_, _) | Close | Mouse(_, _, _, _) | Scroll(_) => none
+
 ## Keys the workspace handles itself, before the active tab sees them.
 enum WsKey
     NextTab
@@ -3176,10 +3229,14 @@ enum WsKey
     QuitAll
     OpenFile
     Palette
+    Search
+    NextHit
     Zoom(key str)
 
 fn workspace_key(k str, ctrl bool, shift bool) WsKey?
     if not ctrl
+        if k == "f4" and not shift
+            return NextHit
         return none
     if k == "tab"
         if shift
@@ -3190,6 +3247,7 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
     if shift
         return match k
             "p" | "P" => Palette
+            "f" | "F" => Search
             _ => none
     match k
         "w" | "W" => CloseTab
@@ -3247,6 +3305,14 @@ struct Workspace
     commanding bool
     query str
     files List[str]
+    ## Ctrl-Shift-F: the query being typed, the hits, and whether Up/Down
+    ## and Enter go to them.
+    searching bool
+    search str
+    hits List[Hit]
+    hit_sel int
+    hit_top int
+    browsing bool
     pick_sel int
     quit_armed bool
     quit bool
@@ -3264,6 +3330,12 @@ fn Workspace.new(ed Editor) Workspace
         commanding: false,
         query: "",
         files: [],
+        searching: false,
+        search: "",
+        hits: [],
+        hit_sel: 0,
+        hit_top: 0,
+        browsing: false,
         pick_sel: 0,
         quit_armed: false,
         quit: false,
@@ -3325,6 +3397,13 @@ fn Workspace.on_event(mut self, ev ui.Event)
     if picking
         pick_event(ev)
         return
+    if searching
+        search_event(ev)
+        return
+    if browsing
+        if k := pressed(ev)
+            if hits_key(k)
+                return
     # A message stays up through a resize, which a font change causes.
     resize := match ev
         Resize(_, _) => true
@@ -3344,6 +3423,8 @@ fn Workspace.on_event(mut self, ev ui.Event)
                     OpenFile => start_picking()
                     Palette => start_palette()
                     Zoom(z) => zoom(z)
+                    Search => start_search()
+                    NextHit => next_hit()
                 return
             eds[active].on_event(ev)
         Resize(_, _) => on_resize(ev)
@@ -3482,6 +3563,153 @@ fn Workspace.on_resize(mut self, ev ui.Event)
                 ed.apply(Command.Resize(cols: c, rows: (r - 1).max(1)))
         Key(_, _, _, _) | Close | Mouse(_, _, _, _) | Scroll(_) => return
 
+# ---- Project search (Ctrl-Shift-F) ----------------------------------------
+
+## A match of a project search: where, and its line's text.
+struct Hit
+    loc Loc
+    text str
+
+## Every line of `text` containing `query`, as hits in `path` (1-based).
+fn search_text(path str, text str, query str) List[Hit]
+    mut out := List[Hit]()
+    if query == ""
+        return out
+    ls := text.lines()
+    for l in 0..ls.len()
+        if c := ls[l].find(query)
+            out.push(Hit(loc: Loc(path: path, line: l + 1, col: c + 1), text: ls[l].trim()))
+    out
+
+## Searches every `.ail` file under the directory, open tabs as they are in
+## the editor (unsaved changes included), at most `limit` hits.
+fn Workspace.search_project(self, q str, limit int) List[Hit]
+    mut out := List[Hit]()
+    for f in list_files(".", 8, 5000)
+        if not f.ends_with(".ail") or f.ends_with(".edit-check.ail") or f.ends_with(".edit-query.ail")
+            continue
+        mut text := ""
+        mut open := false
+        for ed in eds
+            if ed.path == f or ed.path == "./{f}"
+                text = ed.text()
+                open = true
+        if not open
+            got := fs.read_text(f) else continue
+            text = got
+        for h in search_text(f, text, q)
+            if out.len() >= limit
+                return out
+            out.push(h)
+    out
+
+fn Workspace.start_search(mut self)
+    searching = true
+    search = ""
+    ed := eds[active]
+    if w := ed.word_at()
+        search = ed.lines[ed.line].slice(w.col, w.end_col)
+
+## Typing the query: Enter searches, Escape cancels.
+fn Workspace.search_event(mut self, ev ui.Event)
+    match ev
+        Key(k, ctrl, _, _) =>
+            if ctrl
+                return
+            if k == "escape"
+                searching = false
+            elif k == "enter"
+                searching = false
+                show_hits(search_project(search, 1000))
+            elif k == "backspace"
+                search = drop_last(search)
+            elif k.chars().len() == 1
+                search = "{search}{k}"
+        Close => quit_all()
+        Resize(_, _) => on_resize(ev)
+        Mouse(_, _, _, _) | Scroll(_) => return
+
+## Puts the hits in the active tab's pane and focuses them: Up/Down
+## select, Enter (or F4, the next one) jumps, Escape closes.
+fn Workspace.show_hits(mut self, found List[Hit])
+    hits = found
+    hit_sel = 0
+    if hits.len() == 0
+        message = "no match for `{search}`"
+        return
+    browsing = true
+    fill_hits()
+
+## Writes the visible part of the hits into the active tab's pane, keeping
+## the selection in view.
+fn Workspace.fill_hits(mut self)
+    mut ed := eds[active]
+    ed.pane = Text
+    room := (ed.pane_rows() - 1).max(1)
+    hit_top = hit_top.min(hit_sel).max(hit_sel - room + 1).max(0)
+    mut more := ""
+    if hits.len() >= 1000
+        more = " (first 1000)"
+    ed.pane_text = ["search `{search}`: {hits.len()} matches{more}; Up/Down, Enter jumps, F4 next, Esc closes"]
+    for i in hit_top..(hit_top + room).min(hits.len())
+        h := hits[i]
+        ed.pane_text.push("{h.loc.path}:{h.loc.line}:{h.loc.col}: {h.text}")
+    eds[active] = ed
+
+## Opens the selected hit's file in a tab, moves there, and shows the hits
+## in that tab's pane.
+fn Workspace.jump_to_hit(mut self)
+    if hit_sel >= hits.len()
+        return
+    loc := hits[hit_sel].loc
+    open(loc.path)
+    eds[active].jump_to(loc)
+    fill_hits()
+
+## Keys while the hits are focused; others go to the editor.
+fn Workspace.hits_key(mut self, k str) bool
+    if k == "up"
+        hit_sel = (hit_sel - 1).max(0)
+    elif k == "down"
+        hit_sel = (hit_sel + 1).min(hits.len() - 1)
+    elif k == "enter"
+        jump_to_hit()
+        browsing = false
+        return true
+    elif k == "escape"
+        browsing = false
+        return false
+    else
+        browsing = false
+        return false
+    fill_hits()
+    true
+
+## F4: the next hit, from anywhere, wrapping to the first.
+fn Workspace.next_hit(mut self)
+    if hits.len() == 0
+        message = "no search results: Ctrl-Shift-F searches the project"
+        return
+    if not browsing
+        hit_sel = (hit_sel + 1) % hits.len()
+    jump_to_hit()
+    browsing = false
+
+## The search prompt on the tab bar, or the selected hit's pane row.
+fn Workspace.render_search(self, mut s Screen)
+    if searching
+        head := " search the project: "
+        s.put(0, 0, "{head}{search} ".pad_right(cols, ' '), STATUS_FG, SELECT_BG)
+        s.text[0] = "{head}{search}"
+        s.cursor_row = 0
+        s.cursor_col = head.chars().len() + search.chars().len()
+    elif browsing
+        ed := eds[active]
+        r := 1 + ed.text_rows() + 2 + hit_sel - hit_top
+        if r < rows and ed.pane == Text
+            s.band(r, SELECT_BG)
+            s.put(r, 1, ed.pane_text[1 + hit_sel - hit_top], FG, SELECT_BG)
+
 # ---- The file picker (Ctrl-P) ---------------------------------------------
 
 ## The files under `dir`, to `depth` levels, skipping hidden and build
@@ -3588,6 +3816,7 @@ fn Workspace.render(self) Screen
     if inner.cursor_row >= 0
         s.cursor_row = inner.cursor_row + 1
         s.cursor_col = inner.cursor_col
+    render_search(mut s)
     if picking
         render_picker(mut s)
     s

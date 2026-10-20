@@ -62,6 +62,8 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | F5 | Run the buffer (`ail run`); the output fills the pane (its end, when long), Esc closes it, and a click on a `FILE:LINE:COL` or `at LINE:COL` jumps there, opening the file in a tab if needed |
 | F6 | Run the buffer's tests (`ail test`), shown like F5 |
 | Ctrl-Shift-P | Command palette: every command here with its key; type part of its name, Up/Down, Enter runs it |
+| Ctrl-Shift-F | Search every `.ail` file under the directory (open tabs as edited); the matches fill the pane, Up/Down select, Enter jumps, Esc closes (ADR 0292) |
+| F4 | Jump to the next match of the last project search |
 | Ctrl-P | Open a file: type part of its path (letters in order), Up/Down, Enter |
 | Ctrl-Tab | Next tab; a click on a tab selects it |
 | Ctrl-Shift-Tab | Previous tab |
