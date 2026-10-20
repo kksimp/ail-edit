@@ -28,8 +28,9 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 | Tab | Spaces to the next multiple of 4 (AIL has no tabs, lex.block.1) |
 | Backspace | In indentation, removes one level |
 | Ctrl-Space | Complete the word: after `.`, fields, variants and methods; otherwise the file's declarations (with signatures), keywords and words in the buffer. Up/Down choose, Enter or Tab accepts, Escape closes |
-| F12 | Go to the definition of the name under the cursor (`ail api --symbols`) |
-| Ctrl-I | Show the declaration and doc comment of the name under the cursor |
+| F12 | Go to the definition of the name under the cursor, locals included (`ail api --refs`, else the `--symbols` index) |
+| F2 | Rename the local or declaration under the cursor everywhere in the file (`ail api --refs`) |
+| Ctrl-I | Show the type of the expression under the cursor, and the signature and doc comment of what it names (`ail api --type`) |
 | Ctrl-Shift-F | Format with `ail fmt` (also on save, when the program has no errors) |
 | `(` `[` `{` `"` | Insert the closing pair; typing the closer steps over it; Backspace in an empty pair deletes both |
 | Ctrl-/ | Comment or uncomment the line or selected lines |
