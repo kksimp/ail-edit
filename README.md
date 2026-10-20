@@ -51,7 +51,7 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 | Ctrl-P | Open a file: type part of its path (letters in order), Up/Down, Enter |
 | Ctrl-Tab, Ctrl-Shift-Tab | Next, previous tab; a click on a tab selects it |
 | Ctrl-W | Close the tab; with unsaved changes, press it twice |
-| Mouse | Click places the caret, drag selects, the wheel scrolls, a click on a diagnostic jumps to it |
+| Mouse | Click places the caret, drag or Shift-click selects, the wheel scrolls, a click on a diagnostic jumps to it |
 
 The `ail` it runs is `$AIL`, else `./ail` when started from the repository
 root, else `ail` on `PATH`. A check of unsaved changes writes the buffer to
