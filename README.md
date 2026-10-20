@@ -57,6 +57,7 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-Z | Undo |
 | Ctrl-Y | Redo |
 | Ctrl-F | Find as you type; Enter or F3 finds the next match, Escape stops |
+| Alt-R | Toggles regex search for the find bar (std.regex syntax: `\d{4}`, `(a|b)+`); while finding, the query is re-searched (ADR 0490) |
 | F3 | Find the next match |
 | Ctrl-R | Replace: after Ctrl-F, type the replacement; Enter replaces this match and finds the next, Ctrl-Enter replaces all (one undo step) |
 | Ctrl-S | Format, save, then check |

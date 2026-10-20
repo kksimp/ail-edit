@@ -8,6 +8,7 @@
 use std.fs
 use std.env
 use std.proc
+use std.regex
 use std.time
 use std.ui
 use std.ui.widgets
@@ -175,6 +176,7 @@ struct Editor
     anchor_col int
     clip str
     query str
+    regex_find bool
     symbols List[Symbol]
     refs List[SymbolRef]
     indexed bool
@@ -221,6 +223,7 @@ fn Editor.new(path str, text str, cols int, rows int) Editor
         prompt: Prompt.NoPrompt,
         input: "",
         query: "",
+        regex_find: false,
         symbols: [],
         refs: [],
         indexed: false,
@@ -895,7 +898,7 @@ fn typed_word(cmd Command) str?
         Newline | Tab | Backspace | Delete | Go(_) | Select(_) | SelectAll | Copy | Cut => none
         Paste | Undo | Redo | Find | FindNext | Fix | Escape | Quit | Resize(_, _) => none
         Replace | ReplaceAll | GoToLine | ToggleComment | DuplicateLine | MoveLine(_) => none
-        Complete | GoToDefinition | Hover | Format | Rename | Save | Check | Explain | Outline => none
+        Complete | GoToDefinition | Hover | Format | Rename | Save | Check | Explain | Outline | ToggleRegex => none
 
 fn Editor.accept_completion(mut self)
     completing = false
@@ -1581,6 +1584,7 @@ enum Command
     Redo
     Find
     FindNext
+    ToggleRegex
     Fix
     Escape
     Quit
@@ -1665,6 +1669,9 @@ fn Editor.apply(mut self, cmd Command)
         Undo => undo_last()
         Redo => redo_last()
         Find => open_prompt(FindText)
+        ToggleRegex =>
+            regex_find = not regex_find
+            message = "find: regex {on_off(regex_find)}"
         FindNext => find(true)
         Replace =>
             if query == ""
@@ -1744,9 +1751,9 @@ fn Editor.show_prompt(mut self)
         NoPrompt => ""
         FindText =>
             if message.ends_with("(not found)")
-                "find: {query}_   (not found)"
+                "{find_label(regex_find)}{query}_   (not found)"
             else
-                "find: {query}_   (Enter/F3 next, Ctrl-R replace, Esc)"
+                "{find_label(regex_find)}{query}_   (Enter/F3 next, Alt-R regex, Ctrl-R replace, Esc)"
         ReplaceText => "replace `{query}` with: {input}_   (Enter one, Ctrl-Enter all, Esc)"
         LineNumber => "go to line: {input}_"
         RenameTo =>
@@ -1769,6 +1776,12 @@ fn Editor.prompt_key(mut self, cmd Command) bool
             if prompt == LineNumber and not all_digits(t)
                 return true
             input = "{input}{t}"
+            show_prompt()
+        ToggleRegex =>
+            if prompt != FindText
+                return close_prompt()
+            regex_find = not regex_find
+            find(false)
             show_prompt()
         Backspace =>
             if prompt == FindText
@@ -1902,12 +1915,32 @@ fn Editor.find(mut self, next bool)
         cs := lines[l].chars()
         if from > cs.len()
             continue
-        if c := find_in(cs, q, from)
+        if c := match_from(cs, q, from, regex_find)
             line = l
             set_col(c)
-            message = "find: {query}"
+            message = "{find_label(regex_find)}{query}"
             return
-    message = "find: {query} (not found)"
+    message = "{find_label(regex_find)}{query} (not found)"
+
+## Where `q` first matches in `cs` from column `from`: its characters, or
+## with `rx` the regex `q` (std.regex, leftmost, ADR 0490), or none.
+fn match_from(cs List[char], q List[char], from int, rx bool) int?
+    if not rx
+        return find_in(cs, q, from)
+    re := regex.compile(q.join("")) else return none
+    m := regex.find(re, cs[from..cs.len()].join("")) else return none
+    from + m.start
+
+## The find bar's label: `find: ` or `find (regex): `.
+fn find_label(rx bool) str
+    if rx
+        return "find (regex): "
+    "find: "
+
+fn on_off(on bool) str
+    if on
+        return "on"
+    "off"
 
 ## Moving with Shift held selects.
 fn go_or_select(d Dir, shift bool) Command
@@ -1919,6 +1952,8 @@ fn go_or_select(d Dir, shift bool) Command
 fn key_command(key str, ctrl bool, alt bool, shift bool) Command?
     if alt and shift and (key == "f" or key == "F")
         return Format
+    if alt and (key == "r" or key == "R")
+        return ToggleRegex
     if ctrl
         return match key
             "s" | "S" => Save
@@ -2357,6 +2392,23 @@ DIAG_JSON := "\{\"api\":1,\"severity\":\"error\",\"rule\":\"expr.name.1\",\"file
     ed.apply(Go(Right))
     assert_eq(ed.prompt, NoPrompt)
     assert_eq(key_command("f3", false, false, false), FindNext)
+
+@test fn regex_find_matches_patterns()
+    mut ed := typed("ids 12 and 2026\nnone here", [Find])
+    ed.apply(Insert("\\d\{4}"))
+    assert(ed.message.ends_with("(not found)"))
+    ed.apply(ToggleRegex)
+    assert_eq(ed.regex_find, true)
+    assert_eq([ed.line, ed.col], [0, 11])
+    assert(ed.message.starts_with("find (regex): "))
+    ed.apply(Escape)
+    assert_eq(ed.prompt, NoPrompt)
+
+@test fn regex_find_reports_no_match()
+    mut ed := typed("alpha\nbeta", [Find, ToggleRegex])
+    ed.apply(Insert("z+"))
+    assert(ed.message.ends_with("(not found)"))
+    assert_eq(match_from(["a".chars()[0]], ["x".chars()[0]], 0, true), none)
 
 @test fn select_copy_cut_paste()
     mut ed := typed("one two\nthree", [Go(WordRight)])
@@ -3531,6 +3583,12 @@ fn key_rows() List[KeyRow]
             "Find",
             "ctrl+f",
             "Find as you type; Enter or F3 finds the next match, Escape stops",
+        ),
+        key_row(
+            "Alt-R",
+            "Find regex",
+            "alt+r",
+            "Toggles regex search for the find bar (std.regex syntax: `\\d\{4}`, `(a|b)+`); while finding, the query is re-searched (ADR 0490)",
         ),
         key_row("F3", "Find next", "f3", "Find the next match"),
         key_row(
