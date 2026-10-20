@@ -27,10 +27,20 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 | Enter | New line, indented like this one, one level deeper after a block opener (`fn`, `if`, `match`, `x => `, `else err`, ...) |
 | Tab | Spaces to the next multiple of 4 (AIL has no tabs, lex.block.1) |
 | Backspace | In indentation, removes one level |
+| Ctrl-Space | Complete the word: after `.`, fields, variants and methods; otherwise the file's declarations (with signatures), keywords and words in the buffer. Up/Down choose, Enter or Tab accepts, Escape closes |
+| F12 | Go to the definition of the name under the cursor (`ail api --symbols`) |
+| Ctrl-I | Show the declaration and doc comment of the name under the cursor |
+| Ctrl-Shift-F | Format with `ail fmt` (also on save, when the program has no errors) |
+| `(` `[` `{` `"` | Insert the closing pair; typing the closer steps over it; Backspace in an empty pair deletes both |
+| Ctrl-/ | Comment or uncomment the line or selected lines |
+| Ctrl-D | Duplicate the line or selected lines |
+| Alt-Up, Alt-Down | Move the line or selected lines |
+| Ctrl-G | Go to a line number |
 | Ctrl-Z, Ctrl-Y | Undo, redo |
 | Ctrl-F | Find as you type; Enter or F3 finds the next match, Escape stops |
 | F3 | Find the next match |
-| Ctrl-S | Save, then check |
+| Ctrl-R | Replace: after Ctrl-F, type the replacement; Enter replaces this match and finds the next, Ctrl-Enter replaces all (one undo step) |
+| Ctrl-S | Format, save, then check |
 | Ctrl-K | Check: `ail check --json`; spans are marked, the pane lists them |
 | Ctrl-. | Apply the first fix of the diagnostic under the cursor |
 | F1 | Explain the diagnostic under the cursor (`ail explain RULE`) |
@@ -45,16 +55,22 @@ imports resolve as they will on save.
 
 ## Status (2026-10-20)
 
-- Works headless, tested: editing, auto-indent, undo, moves, highlighting,
-  scrolling, diagnostics with fixes, explain, outline parsing, quit
-  confirmation, find, redo, selection and the clipboard (19 `@test`s, run by `./ail selftest`).
-- Window front end on `std.ui` (ADR 0177): tested on Linux under Xvfb
-  (typing, auto-indent, Ctrl-K marks spans, Ctrl-. fixes, Ctrl-S saves and
-  re-checks, Ctrl-Q quits). Without a display, `edit.ail FILE` prints one
+- Works headless, tested (26 `@test`s, run by `./ail selftest`): editing,
+  auto-indent, undo and redo, moves, highlighting, scrolling, selection and
+  the clipboard, find and replace, go to line, bracket matching and pairing,
+  comment toggle, duplicate and move lines, diagnostics with fixes, explain,
+  outline, completion, go to definition and hover (from a recorded
+  `ail api --symbols` output), quit confirmation.
+- Window front end on `std.ui` (ADR 0177), tested on Linux under Xvfb:
+  typing, Ctrl-K, Ctrl-. fixes, Ctrl-S, Ctrl-Space completion with
+  signatures, member completion after `.`, F12, Ctrl-Shift-F, Ctrl-/,
+  bracket pairing, Ctrl-Q. Without a display, `edit.ail FILE` prints one
   screen instead.
-- Outline: needs `ail api --text` (lane 2); without it the status line
-  says so.
+- Completion, go to definition and hover use the last `ail api --symbols`
+  index taken while the program had no errors (on opening, on Ctrl-K or
+  save with no errors, and on demand), so names declared since then come
+  from the buffer's words without signatures.
 - Speed (Linux x86-64, interpreter): a 100x32 screen of a 1,000-line file
-  renders in about 6 ms; an edit takes about 0.1 ms.
-- Not yet: the system clipboard, replace, multi-line `"""` string
-  highlighting, mouse.
+  renders in about 7 ms; an edit takes about 0.1 ms.
+- Not yet: multi-line `"""` string highlighting, types of locals in
+  completion (the API has no local types yet).
