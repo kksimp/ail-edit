@@ -677,6 +677,32 @@ fn Editor.candidates(self) List[Completion]
     sorted := out.sorted()
     sorted[..sorted.len().min(50)]
 
+## After a `.`, opens the completion popup when the index knows members.
+fn Editor.auto_complete_members(mut self)
+    cs := cur()
+    if symbols.len() == 0 or col < 2 or not is_word(cs[col - 2]) or cs[col - 2].is_digit()
+        return
+    open_completion()
+    if completing
+        message = ""
+
+## After a `(`, shows the signature of the function or method before it.
+fn Editor.signature_help(mut self)
+    cs := cur()
+    mut b := col - 1
+    while b > 0 and cs[b - 1] == ' '
+        b -= 1
+    mut a := b
+    while a > 0 and is_word(cs[a - 1])
+        a -= 1
+    if a == b
+        return
+    name := cs[a..b].join("")
+    for sym in symbols
+        if sym.name == name and (sym.kind == "fn" or sym.kind == "method")
+            message = sym.signature
+            return
+
 fn Editor.open_completion(mut self)
     completions = candidates()
     comp_sel = 0
@@ -888,8 +914,42 @@ fn quoted_end(cs List[char], q int, raw bool) int
         j += 1
     (j + 1).min(n)
 
-## The foreground color of each character of one line of AIL source. Each
-## line is colored on its own, so a `"""` string's inner lines look like code.
+TRIPLE := "\"\"\""
+
+## Just past the `"""` that closes a multi-line string (lex.str.3), searching
+## from `from`, or the end of the line.
+fn triple_end(cs List[char], from int) int
+    k := find_in(cs, TRIPLE.chars(), from) else return cs.len()
+    k + 3
+
+## Whether a line ends inside a `"""` string, given whether it starts in
+## one: each `"""` outside a comment opens or closes one.
+fn ends_in_triple(cs List[char], inside bool) bool
+    mut state := inside
+    mut i := 0
+    while i < cs.len()
+        if not state and cs[i] == '#'
+            break
+        if i + 2 < cs.len() and cs[i] == '"' and cs[i + 1] == '"' and cs[i + 2] == '"'
+            state = not state
+            i += 3
+        else
+            i += 1
+    state
+
+## The foreground colors of a line that may start inside a `"""` string.
+fn line_colors(cs List[char], inside bool) List[int]
+    if not inside
+        return colors(cs)
+    k := triple_end(cs, 0)
+    mut out := List[int]()
+    for _ in 0..k
+        out.push(STRING_FG)
+    out.extend(colors(cs[k..]))
+    out
+
+## The foreground color of each character of one line of AIL source, which
+## starts outside any `"""` string (see `line_colors`).
 fn colors(cs List[char]) List[int]
     mut out := List[int]()
     n := cs.len()
@@ -901,6 +961,9 @@ fn colors(cs List[char]) List[int]
         if c == '#'
             j = n
             fg = COMMENT_FG
+        elif c == '"' and i + 2 < n and cs[i + 1] == '"' and cs[i + 2] == '"'
+            j = triple_end(cs, i + 3)
+            fg = STRING_FG
         elif c == '"' or c == '\''
             j = quoted_end(cs, i, false)
             fg = STRING_FG
@@ -1014,10 +1077,17 @@ fn Editor.render(self) Screen
     mut brackets := List[Range]()
     if b := bracket_match()
         brackets = [b]
+    mut inside := false
+    for l in 0..top.min(lines.len())
+        if lines[l].contains(TRIPLE)
+            inside = ends_in_triple(lines[l].chars(), inside)
     for r in 0..h
         l := top + r
         if l >= lines.len()
             break
+        starts_inside := inside
+        if lines[l].contains(TRIPLE)
+            inside = ends_in_triple(lines[l].chars(), inside)
         mut bg := BG
         if l == line
             bg = LINE_BG
@@ -1027,7 +1097,7 @@ fn Editor.render(self) Screen
         cs := lines[l].chars()
         if left >= cs.len()
             continue
-        fgs := colors(cs)
+        fgs := line_colors(cs, starts_inside)
         end := cs.len().min(left + w)
         mut i := left
         while i < end
@@ -1205,6 +1275,10 @@ fn Editor.apply(mut self, cmd Command)
                 set_col(col + 1)
             else
                 insert_paired(t)
+            if t == "."
+                auto_complete_members()
+            elif t == "("
+                signature_help()
         Newline =>
             cut_selection()
             newline()
@@ -2085,6 +2159,39 @@ fn indexed(cmds List[Command]) Editor
     assert_eq(ed.line, 1)
     assert_eq(key_command("g", true, false, false), GoToLine)
     assert_eq(key_command("f", true, false, true), Format)
+
+## The color of the last run drawn over a cell.
+fn fg_at(s Screen, row int, col int) int
+    mut fg := -1
+    for sp in s.spans
+        if sp.row == row and sp.col <= col and col < sp.col + sp.text.len()
+            fg = sp.fg
+    fg
+
+@test fn multi_line_strings_are_highlighted()
+    src := "x := \"\"\"\n    fn not code\n    \"\"\" + y\n# \"\"\" comment\nfn f()"
+    mut ed := typed(src, [])
+    ed.cols = 60
+    s := ed.render()
+    assert_eq(fg_at(s, 0, 9), STRING_FG)
+    assert_eq(fg_at(s, 1, 8), STRING_FG)
+    assert_eq(fg_at(s, 2, 8), STRING_FG)
+    assert_eq(fg_at(s, 2, 12), OP_FG)
+    assert_eq(fg_at(s, 3, 6), COMMENT_FG)
+    assert_eq(fg_at(s, 4, 4), KEYWORD_FG)
+    assert(not ends_in_triple("# \"\"\"".chars(), false))
+
+@test fn dot_completes_and_paren_shows_signature()
+    mut ed := indexed([Go(Bottom), Newline, Insert("p"), Insert(".")])
+    assert(ed.completing)
+    assert_eq(ed.completions[0].text, "x")
+    ed.apply(Escape)
+    ed.apply(Backspace)
+    ed.apply(Backspace)
+    for c in ["a", "d", "d", "("]
+        ed.apply(Insert(c))
+    assert_eq(ed.message, "fn add(a int, b int) int")
+    assert_eq(ed.lines[10], "    add()")
 
 @test fn outline_parse_and_jump()
     items := parse_outline("    1  fn main()\n        ## Doc.\n   12      fn Point.x(self) int\n")

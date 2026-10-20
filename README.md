@@ -55,7 +55,7 @@ imports resolve as they will on save.
 
 ## Status (2026-10-20)
 
-- Works headless, tested (26 `@test`s, run by `./ail selftest`): editing,
+- Works headless, tested (28 `@test`s, run by `./ail selftest`): editing,
   auto-indent, undo and redo, moves, highlighting, scrolling, selection and
   the clipboard, find and replace, go to line, bracket matching and pairing,
   comment toggle, duplicate and move lines, diagnostics with fixes, explain,
@@ -72,5 +72,8 @@ imports resolve as they will on save.
   from the buffer's words without signatures.
 - Speed (Linux x86-64, interpreter): a 100x32 screen of a 1,000-line file
   renders in about 7 ms; an edit takes about 0.1 ms.
-- Not yet: multi-line `"""` string highlighting, types of locals in
+- Typing `.` after a name opens member completion; typing `(` after a
+  known function shows its signature on the status line. `"""` strings are
+  highlighted across lines.
+- Not yet: types of locals in
   completion (the API has no local types yet).
