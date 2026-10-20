@@ -2936,6 +2936,32 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     ed.apply(Insert("x"))
     assert_eq(ed.missed.len(), 0)
 
+@test fn the_program_card_lists_declarations_that_jump()
+    card := "\{\"card\":\"p\",\"entry\":\"main in a.ail\",\"tests\":[\"t\"],\"modules\":[\{\"module\":\"\",\"count\":2,\"items\":[\{\"kind\":\"fn\",\"name\":\"half\",\"signature\":\"fn half(n int) int\",\"effects\":[\"fail\"],\"requires\":[\"n >= 0\"]},\{\"kind\":\"const\",\"name\":\"N\",\"signature\":\"N := 16\"}]}],\"dropped\":[]}"
+    src := Source(path: "a.ail", lines: [
+        "N := 0x10",
+        "",
+        "pub fn half(n int) int",
+        "    requires n >= 0",
+        "    n / 2",
+    ])
+    rows := card_hits(parse_json(card) else Json.Null, [src])
+    mut texts := List[str]()
+    for r in rows
+        texts.push(r.text)
+    assert_eq(texts, [
+        "entry: main in a.ail",
+        "tests: t",
+        "module (root): 2 items",
+        "  fn half(n int) int  [fail]",
+        "      requires n >= 0",
+        "  N := 16",
+    ])
+    assert_eq(rows[3].loc, Loc(path: "a.ail", line: 3, col: 1))
+    assert_eq(rows[4].loc.line, 3)
+    assert_eq(rows[5].loc.line, 1)
+    assert_eq(rows[0].loc.line, 0)
+
 @test fn quitting_asks_once_for_unsaved_tabs()
     mut ws := Workspace.new(typed("", keys("x")))
     ws.on_event(Close)
@@ -3425,6 +3451,12 @@ fn key_rows() List[KeyRow]
             "Each function's error set and every return, `?` and `else` that fails or handles, from `ail check --errors`; Up/Down, Enter jumps (ADR 0312)",
         ),
         key_row(
+            "Ctrl-Shift-I",
+            "Program card",
+            "ctrl+shift+i",
+            "The program card (`ail api --card`) of the file's program, its modules included: entry point, tests, and every declaration with effects, contracts and error sets; Up/Down, Enter jumps to a declaration; refreshed on save (ADR 0331)",
+        ),
+        key_row(
             "Ctrl-Shift-C",
             "Test coverage",
             "ctrl+shift+c",
@@ -3535,6 +3567,7 @@ enum WsKey
     Trace
     FailurePaths
     Coverage
+    Card
     Zoom(key str)
 
 fn workspace_key(k str, ctrl bool, shift bool) WsKey?
@@ -3557,6 +3590,7 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
             "t" | "T" => Theme
             "e" | "E" => FailurePaths
             "c" | "C" => Coverage
+            "i" | "I" => Card
             _ => none
     match k
         "b" | "B" => Tree
@@ -3769,11 +3803,14 @@ fn Workspace.on_event(mut self, ev ui.Event)
                     Trace => trace_run()
                     FailurePaths => failure_paths()
                     Coverage => eds[active].coverage()
+                    Card => card_view()
                 return
             saves := eds[active].saves
             eds[active].on_event(ev)
             if eds[active].saves != saves
                 check_other_tabs()
+                if hits_title.starts_with("program card")
+                    card_view()
         Resize(_, _) => on_resize(ev)
         Close => quit_all()
         Mouse(c, r, button, kind) =>
@@ -4378,6 +4415,112 @@ fn Editor.coverage(mut self)
             message = "coverage: lines {jint(j, "lines_hit")}/{jint(j, "lines")}, functions {jint(j, "functions_hit")}/{jint(j, "functions")}; unrun lines are marked; an edit clears them"
             return
     message = "no coverage: does the file have @test functions? (exit {r.status})"
+
+# ---- The program card (Ctrl-Shift-I) --------------------------------------
+
+## A source file's lines, for finding where a card item is declared.
+struct Source
+    path str
+    lines List[str]
+
+## Where `signature` is declared: the first line that is it (after `pub `
+## and indentation) or starts with it, else for a constant the line that
+## assigns its name; none when no line matches.
+fn declared_at(sources List[Source], signature str) Loc?
+    for src in sources
+        for i in 0..src.lines.len()
+            mut t := src.lines[i].trim()
+            if p := t.strip_prefix("pub ")
+                t = p
+            if t == signature or t.starts_with("{signature} ")
+                return Loc(path: src.path, line: i + 1, col: indent_of(src.lines[i]) + 1)
+    # A constant's card shows its value, not its source text.
+    if at := signature.find(" := ")
+        name := signature.slice(0, at)
+        for src in sources
+            for i in 0..src.lines.len()
+                if src.lines[i].starts_with("{name} := ") or src.lines[i].starts_with("pub {name} := ")
+                    return Loc(path: src.path, line: i + 1, col: 1)
+    none
+
+## The rows of `ail api --card --json` (lane 67): the entry point and
+## tests, then each module's items with their signatures, effects,
+## contracts and error sets, members indented below; each declaration row
+## jumps to where it is declared in `sources` (ADR 0331).
+fn card_hits(j Json, sources List[Source]) List[Hit]
+    nowhere := Loc(path: "", line: 0, col: 0)
+    mut hits := List[Hit]()
+    if jstr(j, "entry") != ""
+        hits.push(Hit(loc: nowhere, text: "entry: {jstr(j, "entry")}"))
+    mut tests := List[str]()
+    for t in jarr(j, "tests")
+        tests.push(jtext(t))
+    if tests.len() > 0
+        hits.push(Hit(loc: nowhere, text: "tests: {tests.join(", ")}"))
+    for m in jarr(j, "modules")
+        mut name := jstr(m, "module")
+        if name == ""
+            name = "(root)"
+        hits.push(Hit(loc: nowhere, text: "module {name}: {jint(m, "count")} items"))
+        for it in jarr(m, "items")
+            card_item(mut hits, it, sources, 1, nowhere)
+    for d in jarr(j, "dropped")
+        hits.push(Hit(loc: nowhere, text: "(dropped to fit: {jtext(d)})"))
+    hits
+
+fn card_item(mut hits List[Hit], it Json, sources List[Source], depth int, parent Loc)
+    pad := "  ".repeat(depth)
+    sig := jstr(it, "signature")
+    mut effects := List[str]()
+    for e in jarr(it, "effects")
+        effects.push(jtext(e))
+    mut row := "{pad}{sig}"
+    if effects.len() > 0
+        row = "{row}  [{effects.join(" ")}]"
+    at := declared_at(sources, sig) else parent
+    hits.push(Hit(loc: at, text: row))
+    for f in facts_of(it)
+        if not f.starts_with("effects:")
+            hits.push(Hit(loc: at, text: "{pad}    {f}"))
+    # A variant's signature already shows its fields.
+    if jstr(it, "kind") != "variant"
+        for sub in jarr(it, "members")
+            card_item(mut hits, sub, sources, depth + 1, at)
+
+## Ctrl-Shift-I: the program card of the file's program (the file, the
+## modules beside it), as a list whose declarations Enter jumps to;
+## refreshed on save while it shows.
+fn Workspace.card_view(mut self)
+    path := eds[active].path
+    r := proc.run(ail_command(), ["api", "--card", "--json", "--budget", "100000", path]) else err
+        message = "can't run {err.cmd}: {err.kind}"
+        return
+    if r.status != 0
+        message = "no program card: the program has errors (Ctrl-K shows them)"
+        return
+    j := parse_json(r.out.trim()) else
+        message = "can't read the card"
+        return
+    # The file first, so its declarations win over same-named ones in
+    # other programs in the same directory.
+    parts := path.split("/")
+    mut dir := "."
+    if parts.len() > 1
+        dir = parts[..parts.len() - 1].join("/")
+    mut paths := [path]
+    for f in list_files(dir, 4, 2000)
+        if f.ends_with(".ail") and f != path and "./{f}" != path
+            paths.push(f)
+    mut sources := List[Source]()
+    for f in paths
+        mut text := ""
+        for ed in eds
+            if ed.path == f
+                text = ed.text()
+        if text == ""
+            text = fs.read_text(f) else ""
+        sources.push(Source(path: f, lines: text.lines()))
+    show_list("program card {jstr(j, "card")}", card_hits(j, sources))
 
 # ---- The file picker (Ctrl-P) ---------------------------------------------
 
