@@ -48,6 +48,8 @@ struct TextEdit
     end_col int
     text str
 
+impl Ord for TextEdit
+
 ## A diagnostic from `ail check --json` (docs/design/semantic-api.md).
 struct Diag
     severity str
@@ -77,6 +79,7 @@ enum Prompt
     FindText
     ReplaceText
     LineNumber
+    RenameTo
 
 ## A declaration from `ail api --symbols` (docs/design/semantic-api.md).
 struct Symbol
@@ -141,6 +144,9 @@ struct Editor
     indexed bool
     completing bool
     completions List[Completion]
+    locals List[Completion]
+    member_of str
+    renames List[TextEdit]
     comp_sel int
 
 fn Editor.new(path str, text str, cols int, rows int) Editor
@@ -178,6 +184,9 @@ fn Editor.new(path str, text str, cols int, rows int) Editor
         indexed: false,
         completing: false,
         completions: [],
+        locals: [],
+        member_of: "",
+        renames: [],
         comp_sel: 0,
         selecting: false,
         anchor_line: 0,
@@ -702,9 +711,14 @@ fn Editor.candidates(self) List[Completion]
     mut seen := Set[str]()
     seen.add(prefix)
     mut out := List[Completion]()
+    if not member
+        for c in locals
+            if c.text.starts_with(prefix) and seen.add(c.text)
+                out.push(c)
     for sym in symbols
         nested := sym.kind == "field" or sym.kind == "variant" or sym.kind == "method"
-        if nested == member and sym.name.starts_with(prefix) and seen.add(sym.name)
+        owned := member_of == "" or sym.id.starts_with("{sym.kind}:{member_of}.")
+        if nested == member and owned and sym.name.starts_with(prefix) and seen.add(sym.name)
             out.push(Completion(text: sym.name, detail: sym.signature))
     if not member
         for k in KEYWORDS.sorted()
@@ -725,7 +739,15 @@ fn Editor.candidates(self) List[Completion]
                 if w.starts_with(prefix) and seen.add(w)
                     out.push(Completion(text: w, detail: ""))
             i = j
-    sorted := out.sorted()
+    # The locals come first, then everything else by name.
+    mut sorted := List[Completion]()
+    mut rest := List[Completion]()
+    for c in out
+        if locals.contains(c)
+            sorted.push(c)
+        else
+            rest.push(c)
+    sorted.extend(rest.sorted())
     sorted[..sorted.len().min(50)]
 
 ## After a `.`, opens the completion popup when the index knows members.
@@ -799,7 +821,7 @@ fn typed_word(cmd Command) str?
         Newline | Tab | Backspace | Delete | Go(_) | Select(_) | SelectAll | Copy | Cut => none
         Paste | Undo | Redo | Find | FindNext | Fix | Escape | Quit | Resize(_, _) => none
         Replace | ReplaceAll | GoToLine | ToggleComment | DuplicateLine | MoveLine(_) => none
-        Complete | GoToDefinition | Hover | Format | Save | Check | Explain | Outline => none
+        Complete | GoToDefinition | Hover | Format | Rename | Save | Check | Explain | Outline => none
 
 fn Editor.accept_completion(mut self)
     completing = false
@@ -810,6 +832,144 @@ fn Editor.accept_completion(mut self)
     while a > 0 and is_word(cs[a - 1])
         a -= 1
     replace(line, a, line, col, completions[comp_sel].text)
+
+# ---- Position queries: `ail api --locals/--type/--refs` (api.loc, api.type, api.refs)
+
+## Runs `ail api MODE FILE LINE COL` on `text` (the buffer, maybe with the
+## word being typed taken out) and parses its one JSON object; `none` when
+## there's nothing at the position or the program doesn't parse.
+fn Editor.api_at(mut self, mode str, text str, l int, c int) Json?
+    file := "{path}.edit-query.ail"
+    fs.write_text(file, text) else return none
+    r := proc.run(ail_command(), ["api", mode, file, "{l}", "{c}"]) else return none
+    fs.remove(file) else err
+        message = "can't remove {err.path}: {err.kind}"
+    if r.status != 0
+        return none
+    j := parse_json(r.out.trim()) else return none
+    j
+
+## The buffer with columns `a..b` of the cursor's line taken out.
+fn Editor.text_without(self, a int, b int) str
+    mut ls := lines
+    ls[line] = "{lines[line].slice(0, a)}{lines[line].slice(b, lines[line].len())}"
+    "{ls.join("\n")}\n"
+
+## Before completing, asks `ail` what is in scope at the cursor: the type
+## before a `.` (so only its members are offered), or the locals with
+## their types.
+fn Editor.query_context(mut self)
+    locals = []
+    member_of = ""
+    cs := cur()
+    mut a := col
+    while a > 0 and is_word(cs[a - 1])
+        a -= 1
+    if a > 0 and cs[a - 1] == '.'
+        dot := a - 1
+        if dot < 1
+            return
+        j := api_at("--type", text_without(dot, col), line + 1, dot) else return
+        member_of = parse_type_name(jstr(j, "type"))
+        return
+    j := api_at("--locals", text_without(a, col), line + 1, a + 1) else return
+    locals = parse_locals(j)
+
+## `Point` from `Point`, `List[Point]` stays `List` (its members are built in).
+fn parse_type_name(t str) str
+    cs := t.chars()
+    mut n := 0
+    while n < cs.len() and is_word(cs[n])
+        n += 1
+    cs[..n].join("")
+
+fn parse_locals(j Json) List[Completion]
+    mut out := List[Completion]()
+    for v in jarr(j, "locals")
+        out.push(Completion(text: jstr(v, "name"), detail: "{jstr(v, "type")} ({jstr(v, "kind")})"))
+    out
+
+## Hover and go to definition through `--type` and `--refs`, which know
+## locals and types; false when `ail` has no answer, so the outline index
+## is used instead.
+fn Editor.query_at(mut self, hover bool) bool
+    if hover
+        j := api_at("--type", text(), line + 1, col + 1) else return false
+        show_type(j)
+        return true
+    j := api_at("--refs", text(), line + 1, col + 1) else return false
+    for r in jarr(j, "refs")
+        if (r.get("def") else Json.Null) == Json.Bool(true)
+            selecting = false
+            line = (jint(r, "line") - 1).max(0).min(lines.len() - 1)
+            set_col((jint(r, "col") - 1).max(0).min(cur().len()))
+            message = "definition of {jstr(j, "symbol")}"
+            return true
+    false
+
+fn Editor.show_type(mut self, j Json)
+    pane_text = ["{jstr(j, "text")}: {jstr(j, "type")}"]
+    callee := j.get("callee") else Json.Null
+    if callee != Json.Null
+        pane_text.push(jstr(callee, "signature"))
+        doc := jstr(callee, "doc")
+        if doc != ""
+            for d in doc.split("\n")
+                pane_text.push("## {d}")
+    id := jstr(j, "symbol")
+    if id != ""
+        if sym := symbol(id)
+            if not pane_text.contains(sym.signature)
+                pane_text.push(sym.signature)
+            if sym.doc != "" and callee == Json.Null
+                for d in sym.doc.split("\n")
+                    pane_text.push("## {d}")
+    pane = Text
+    message = "Esc closes"
+
+## F2: finds every use of the name under the cursor (`--refs`) and asks
+## for the new name.
+fn Editor.start_rename(mut self)
+    w := word_at() else
+        message = "nothing to rename here"
+        return
+    j := api_at("--refs", text(), line + 1, w.col + 1) else
+        message = "can't rename: `ail api --refs` has no answer here (errors?)"
+        return
+    renames = rename_edits(j, "{path}.edit-query.ail", w.end_col - w.col)
+    if renames.len() == 0
+        message = "nothing to rename here"
+        return
+    prompt = RenameTo
+    input = lines[line].slice(w.col, w.end_col)
+    show_prompt()
+
+## The edits that rename the uses `--refs` lists in this file (uses in
+## other modules are left alone).
+fn rename_edits(j Json, file str, len int) List[TextEdit]
+    mut out := List[TextEdit]()
+    for r in jarr(j, "refs")
+        if jstr(r, "file") == file
+            l := jint(r, "line")
+            c := jint(r, "col")
+            out.push(TextEdit(line: l, col: c, end_line: l, end_col: c + len, text: ""))
+    out
+
+## Applies a rename as one undo step, last use first so earlier positions
+## stay valid.
+fn Editor.rename_to(mut self, name str)
+    prompt = NoPrompt
+    if name == "" or renames.len() == 0
+        return
+    sorted := renames.sorted()
+    snapshot()
+    mut i := sorted.len() - 1
+    while i >= 0
+        e := sorted[i]
+        edit(e.line - 1, e.col - 1, e.end_line - 1, e.end_col - 1, name)
+        i -= 1
+    message = "renamed {sorted.len()} uses to {name}"
+    renames = []
 
 # ---- Movement -----------------------------------------------------------
 
@@ -1322,6 +1482,7 @@ enum Command
     GoToDefinition
     Hover
     Format
+    Rename
     Save
     Check
     Explain
@@ -1419,7 +1580,7 @@ fn Editor.apply(mut self, cmd Command)
         Resize(c, r) =>
             cols = c
             rows = r
-        Format | Save | Check | Explain | Outline => return
+        Format | Rename | Save | Check | Explain | Outline => return
     scroll()
 
 ## Up, Down and Enter in the outline pane; true if `cmd` was one of them.
@@ -1474,6 +1635,7 @@ fn Editor.show_prompt(mut self)
                 "find: {query}_   (Enter/F3 next, Ctrl-R replace, Esc)"
         ReplaceText => "replace `{query}` with: {input}_   (Enter one, Ctrl-Enter all, Esc)"
         LineNumber => "go to line: {input}_"
+        RenameTo => "rename to: {input}_   (Enter renames {renames.len()} uses, Esc)"
 
 ## Typing while a prompt is open: characters and Backspace edit it; Enter
 ## acts (find the next match, replace this match, go to the line); Escape
@@ -1504,6 +1666,7 @@ fn Editor.prompt_key(mut self, cmd Command) bool
                     find(true)
                     show_prompt()
                 ReplaceText => replace_one()
+                RenameTo => rename_to(input)
                 LineNumber =>
                     n := input.to_int() else 0
                     prompt = NoPrompt
@@ -1528,7 +1691,7 @@ fn Editor.prompt_key(mut self, cmd Command) bool
             message = ""
         Tab | Delete | Go(_) | Select(_) | SelectAll | Copy | Cut | Paste => return close_prompt()
         Undo | Redo | Find | Fix | GoToLine | ToggleComment | DuplicateLine => return close_prompt()
-        MoveLine(_) | Complete | GoToDefinition | Hover | Format => return close_prompt()
+        MoveLine(_) | Complete | GoToDefinition | Hover | Format | Rename => return close_prompt()
         Quit | Resize(_, _) | Save | Check | Explain | Outline => return close_prompt()
     true
 
@@ -1673,6 +1836,7 @@ fn key_command(key str, ctrl bool, alt bool, shift bool) Command?
         "f1" => Explain
         "f3" => FindNext
         "f12" => GoToDefinition
+        "f2" => Rename
         _ =>
             if key.len() == 1
                 return Insert(key)
@@ -1820,9 +1984,20 @@ fn Editor.toggle_outline(mut self)
 
 ## Applies any command, running `ail` or touching the file when it must.
 fn Editor.run(mut self, cmd Command)
-    if cmd == Complete or cmd == GoToDefinition or cmd == Hover
+    if cmd == Complete or cmd == Insert(".") and not completing
         index()
+        query_context()
         apply(cmd)
+        scroll()
+        return
+    if cmd == GoToDefinition or cmd == Hover or cmd == Rename
+        index()
+        prompt = NoPrompt
+        completing = false
+        if cmd == Rename
+            start_rename()
+        elif not query_at(cmd == Hover)
+            apply(cmd)
         scroll()
         return
     if cmd == Save or cmd == Check or cmd == Explain or cmd == Outline or cmd == Format
@@ -2311,6 +2486,52 @@ fn fg_at(s Screen, row int, col int) int
     assert_eq(ed.col, 8)
     ed.apply(Newline)
     assert_eq(ed.lines[4], "        ")
+
+LOCALS_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":11,\"col\":15,\"locals\":[\{\"name\":\"p\",\"type\":\"P\",\"mut\":false,\"kind\":\"binding\",\"line\":9,\"col\":5},\{\"name\":\"index\",\"type\":\"int\",\"mut\":false,\"kind\":\"loop\",\"line\":10,\"col\":9}]}"
+REFS_JSON := "\{\"api\":1,\"file\":\"t.ail.edit-query.ail\",\"line\":9,\"col\":5,\"symbol\":\"local:p\",\"refs\":[\{\"file\":\"t.ail.edit-query.ail\",\"line\":9,\"col\":5,\"def\":true},\{\"file\":\"t.ail.edit-query.ail\",\"line\":10,\"col\":15,\"def\":false},\{\"file\":\"other.ail\",\"line\":1,\"col\":1,\"def\":false}]}"
+TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"add\",\"start_col\":11,\"end_col\":14,\"type\":\"fn(int, int) int\",\"symbol\":\"fn:add\",\"callee\":\{\"signature\":\"fn add(a int, b int) int\",\"doc\":\"Adds.\"}}"
+
+@test fn locals_and_member_types_steer_completion()
+    mut ed := indexed([])
+    ed.locals = parse_locals(parse_json(LOCALS_JSON) else Json.Null)
+    assert_eq(ed.locals[1], Completion(text: "index", detail: "int (loop)"))
+    ed.apply(Go(Bottom))
+    ed.apply(Newline)
+    ed.apply(Insert("i"))
+    ed.apply(Complete)
+    assert_eq(ed.completions[0].text, "index")
+    ed.apply(Escape)
+    ed.member_of = "Q"
+    ed.apply(Insert("."))
+    ed.apply(Complete)
+    assert(not ed.completing)
+    ed.member_of = parse_type_name("P")
+    ed.apply(Complete)
+    assert_eq(ed.completions[0].text, "x")
+    assert_eq(parse_type_name("List[P]"), "List")
+
+@test fn rename_applies_every_use_in_this_file()
+    mut ed := typed("fn main()\n    p := 1\n    print(p + p)", [])
+    j := parse_json(REFS_JSON.replace("9", "2").replace("10", "3")) else Json.Null
+    ed.renames = rename_edits(j, "t.ail.edit-query.ail", 1)
+    assert_eq(ed.renames.len(), 2)
+    ed.renames.push(TextEdit(line: 3, col: 11, end_line: 3, end_col: 12, text: ""))
+    ed.prompt = RenameTo
+    ed.input = "p"
+    for c in ["o", "s"]
+        ed.apply(Insert(c))
+    ed.apply(Newline)
+    assert_eq(ed.lines, ["fn main()", "    pos := 1", "    print(pos + pos)"])
+    assert_eq(ed.message, "renamed 3 uses to pos")
+    ed.apply(Undo)
+    assert_eq(ed.lines[2], "    print(p + p)")
+    assert_eq(key_command("f2", false, false, false), Rename)
+
+@test fn hover_shows_type_signature_and_doc()
+    mut ed := indexed([])
+    ed.show_type(parse_json(TYPE_JSON) else Json.Null)
+    assert_eq(ed.pane_text, ["add: fn(int, int) int", "fn add(a int, b int) int", "## Adds."])
+    assert_eq(ed.pane, Text)
 
 @test fn outline_parse_and_jump()
     items := parse_outline("    1  fn main()\n        ## Doc.\n   12      fn Point.x(self) int\n")
