@@ -2,12 +2,13 @@
 ##
 ## The core is headless: an `Editor` value, `Command`s that change it, and a
 ## pure `render` from the editor to a `Screen` of colored text runs. Front
-## ends feed commands in and draw the screen: the `@test`s below, and the
-## window front end in `main` on `std.ui`.
+## ends feed commands in and draw the screen: the `@test`s below, `--print`,
+## and the window front end on `std.ui` (window.ail.pending until it lands).
 
 use std.fs
 use std.env
 use std.proc
+use std.time
 
 # Colors, 0xRRGGBB.
 BG := 0x1e1e1e
@@ -783,7 +784,7 @@ fn Editor.toggle_outline(mut self)
         return
     r := ail_on_buffer(["api", "--text"]) else return
     if r.status != 0
-        if r.out.starts_with("usage:")
+        if r.err.starts_with("usage:")
             message = "no outline: this `ail` has no `api` command"
         else
             message = "no outline: `ail api` needs a program without errors"
@@ -1013,6 +1014,25 @@ fn print_screen(mut ed Editor, flags List[str])
     for row in ed.render().text
         print(row)
 
+## `--bench`: the time to render one screen, averaged over 20 renders at
+## the middle of the buffer.
+fn bench(mut ed Editor)
+    ed.line = ed.lines.len() / 2
+    ed.scroll()
+    start := time.now_ms()
+    mut cells := 0
+    for _ in 0..20
+        for sp in ed.render().spans
+            cells += sp.text.chars().len()
+    ms := (time.now_ms() - start).to_float() / 20.0
+    print("{ed.lines.len()} lines, {ed.cols}x{ed.rows} screen: {ms:.1} ms per render ({cells / 20} cells drawn)")
+    t := time.now_ms()
+    for _ in 0..20
+        ed.apply(Insert("x"))
+        ed.apply(Newline)
+    keys_ms := (time.now_ms() - t).to_float() / 40.0
+    print("{keys_ms:.1} ms per edit (insert or newline)")
+
 fn main() !
     args := env.args()
     if args.len() == 0
@@ -1023,4 +1043,8 @@ fn main() !
     if fs.exists(path)
         text = fs.read_text(path)?
     mut ed := Editor.new(path, text, 100, 32)
-    print_screen(mut ed, args[..args.len() - 1])
+    flags := args[..args.len() - 1]
+    if flags.contains("--bench")
+        bench(mut ed)
+        return
+    print_screen(mut ed, flags)

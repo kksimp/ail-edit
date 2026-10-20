@@ -1,0 +1,44 @@
+# The window front end of tools/edit/edit.ail on `std.ui` (ADR 0177).
+# It is kept out of edit.ail until `std.ui` is in the bootstrap; then this
+# text goes at the end of edit.ail, `use std.ui` goes with the other
+# imports, and `main` calls `window_main` instead of `print_screen` when
+# `--print` isn't given (ADR 0180).
+
+## Draws a screen: the runs in order, then the caret.
+fn draw(mut w ui.Window, s Screen)
+    w.clear(BG)
+    for sp in s.spans
+        w.put(sp.col, sp.row, sp.text, sp.fg, sp.bg)
+    w.cursor(s.cursor_col, s.cursor_row)
+    w.present()
+
+## Applies one window event. Closing the window is Ctrl-Q: with unsaved
+## changes the first close asks and the second quits.
+fn Editor.on_event(mut self, ev ui.Event)
+    match ev
+        Key(k, ctrl, alt, shift) =>
+            if cmd := key_command(k, ctrl, alt, shift)
+                run(cmd)
+        Resize(c, r) => apply(Command.Resize(cols: c, rows: r))
+        Close => apply(Quit)
+
+## The event loop: wait for an event, apply it and any others already
+## pending, then draw once.
+fn Editor.window(mut self) ! ui.UiError
+    mut w := ui.open("edit {path}", cols, rows)?
+    size := w.size()
+    apply(Command.Resize(cols: size.cols, rows: size.rows))
+    draw(mut w, render())
+    while not quit
+        on_event(w.next_event())
+        while not quit
+            ev := w.poll_event() else break
+            on_event(ev)
+        draw(mut w, render())
+    w.close()
+
+## Opens the window, or prints one screen when there's no display.
+fn window_main(mut ed Editor, flags List[str])
+    ed.window() else err
+        print("edit: no window ({err.kind}: {err.message}); printing the screen instead")
+        print_screen(mut ed, flags)
