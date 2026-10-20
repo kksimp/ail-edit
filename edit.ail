@@ -3452,8 +3452,11 @@ fn font_flag(flags List[str]) int
         return 20
     flags[at + 1].to_int() else 20
 
-## `--print`: render one screen to standard output instead of opening a
-## window, after the commands named by `--check`, `--outline`, `--explain`.
+## `--print`: runs the flags in order, then prints the screen as text, so
+## an agent or a test can drive the editor without a window:
+## `--check`, `--outline`, `--explain`; `--at=LINE:COL` (1-based) moves the
+## cursor; `--type=TEXT` types; `--key=SPEC` presses a key such as `f2`,
+## `enter` or `ctrl+space` (`ctrl+`, `alt+`, `shift+` prefixes).
 fn print_screen(mut ed Editor, flags List[str])
     for f in flags
         if f == "--check"
@@ -3462,8 +3465,27 @@ fn print_screen(mut ed Editor, flags List[str])
             ed.run(Outline)
         elif f == "--explain"
             ed.run(Explain)
+        elif at := f.strip_prefix("--at=")
+            parts := at.split(":")
+            ed.line = ((parts[0].to_int() else 1) - 1).max(0).min(ed.lines.len() - 1)
+            ed.set_col(((parts[parts.len() - 1].to_int() else 1) - 1).max(0).min(ed.cur().len()))
+            ed.scroll()
+        elif t := f.strip_prefix("--type=")
+            for c in t.chars()
+                ed.run(Insert("{c}"))
+        elif spec := f.strip_prefix("--key=")
+            if cmd := key_spec(spec)
+                ed.run(cmd)
     for row in ed.render().text
         print(row)
+
+## The command for a key written `ctrl+shift+f`, `f2` or `enter`.
+fn key_spec(spec str) Command?
+    mut parts := spec.split("+")
+    mut key := parts.pop() else return none
+    if key == "space"
+        key = " "
+    key_command(key, parts.contains("ctrl"), parts.contains("alt"), parts.contains("shift"))
 
 ## `--bench`: the time to render one screen, averaged over 20 renders at
 ## the middle of the buffer.
@@ -3487,7 +3509,7 @@ fn bench(mut ed Editor)
 fn main() !
     args := env.args()
     if args.len() == 0
-        print("usage: ail run tools/edit/edit.ail [--font N] [--print [--check] [--outline] [--explain]] FILE")
+        print("usage: ail run tools/edit/edit.ail [--font N] [--print [--check] [--outline] [--explain] [--at=L:C] [--type=TEXT] [--key=KEY]...] FILE")
         return
     path := args[args.len() - 1]
     mut text := ""

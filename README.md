@@ -12,6 +12,7 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 ./ail run tools/edit/edit.ail --print FILE             # print one screen as text
 ./ail run tools/edit/edit.ail --print --check FILE     # ...after Ctrl-K
 ./ail run tools/edit/edit.ail --print --outline FILE   # ...with the outline
+./ail run tools/edit/edit.ail --print --at=11:15 --key=ctrl+i FILE  # move, press keys, type (--type=TEXT)
 ./ail run tools/edit/edit.ail --bench FILE             # time a render and an edit
 ./ail test tools/edit/edit.ail                         # the headless tests
 ```
