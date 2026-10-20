@@ -86,5 +86,7 @@ imports resolve as they will on save.
 - The word under the cursor is marked wherever else it appears on screen;
   each line with a diagnostic shows the first message after its text;
   typing `else` or `elif` lines it up with its `if`.
-- Not yet: types of locals in completion (the API has no local types yet),
-  Shift-click selection.
+- Completion offers the locals in scope with their types (`ail api --locals`)
+  and, after `x.`, only the members of `x`'s type (`ail api --type`). The
+  position queries need a program that parses; otherwise the editor falls
+  back to the outline index and the buffer's words.
