@@ -22,7 +22,7 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 | Arrows, Home, End, PageUp, PageDown | Move. Home goes to the indentation, then column 1 |
 | Ctrl-Left, Ctrl-Right | Move by word |
 | Shift with any move | Select; typing, Backspace or Delete replaces the selection |
-| Ctrl-A, Ctrl-C, Ctrl-X, Ctrl-V | Select all, copy, cut, paste (the editor's own clipboard) |
+| Ctrl-A, Ctrl-C, Ctrl-X, Ctrl-V | Select all, copy, cut, paste (in the window, also the system clipboard) |
 | Ctrl-Home, Ctrl-End | Start, end of the file |
 | Enter | New line, indented like this one, one level deeper after a block opener (`fn`, `if`, `match`, `x => `, `else err`, ...) |
 | Tab | Spaces to the next multiple of 4 (AIL has no tabs, lex.block.1) |
@@ -36,7 +36,12 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 | F1 | Explain the diagnostic under the cursor (`ail explain RULE`) |
 | Ctrl-O | Outline (`ail api --text`); Up/Down select, Enter jumps |
 | Escape | Close the explanation or the outline; stop selecting or finding |
-| Ctrl-Q | Quit; with unsaved changes, press it twice. Closing the window counts as Ctrl-Q |
+| Ctrl-Q | Quit; with unsaved changes in any tab, press it twice. Closing the window counts as Ctrl-Q |
+| F5, F6 | Run the buffer (`ail run`), or its tests (`ail test`); the output fills the pane |
+| Ctrl-P | Open a file: type part of its path (letters in order), Up/Down, Enter |
+| Ctrl-Tab, Ctrl-Shift-Tab | Next, previous tab; a click on a tab selects it |
+| Ctrl-W | Close the tab; with unsaved changes, press it twice |
+| Mouse | Click places the caret, drag selects, the wheel scrolls, a click on a diagnostic jumps to it |
 
 The `ail` it runs is `$AIL`, else `./ail` when started from the repository
 root, else `ail` on `PATH`. A check of unsaved changes writes the buffer to
@@ -47,14 +52,16 @@ imports resolve as they will on save.
 
 - Works headless, tested: editing, auto-indent, undo, moves, highlighting,
   scrolling, diagnostics with fixes, explain, outline parsing, quit
-  confirmation, find, redo, selection and the clipboard (19 `@test`s, run by `./ail selftest`).
+  confirmation, find, redo, selection and the clipboard, mouse and wheel,
+  tabs and the file picker, run output (24 `@test`s, run by `./ail selftest`).
 - Window front end on `std.ui` (ADR 0177): tested on Linux under Xvfb
   (typing, auto-indent, Ctrl-K marks spans, Ctrl-. fixes, Ctrl-S saves and
-  re-checks, Ctrl-Q quits). Without a display, `edit.ail FILE` prints one
-  screen instead.
+  re-checks, Ctrl-Q quits; drag selection, wheel, Ctrl-C to and from the X11
+  clipboard, Ctrl-P opening a second tab, F5 running it; ADR 0241). Without
+  a display, `edit.ail FILE` prints one screen instead.
 - Outline: needs `ail api --text` (lane 2); without it the status line
   says so.
 - Speed (Linux x86-64, interpreter): a 100x32 screen of a 1,000-line file
   renders in about 6 ms; an edit takes about 0.1 ms.
-- Not yet: the system clipboard, replace, multi-line `"""` string
-  highlighting, mouse.
+- Not yet: replace, multi-line `"""` string highlighting, Shift-click
+  selection.
