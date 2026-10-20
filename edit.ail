@@ -1,0 +1,1026 @@
+## edit: a code editor for AIL, written in AIL (ADR 0180).
+##
+## The core is headless: an `Editor` value, `Command`s that change it, and a
+## pure `render` from the editor to a `Screen` of colored text runs. Front
+## ends feed commands in and draw the screen: the `@test`s below, and the
+## window front end in `main` on `std.ui`.
+
+use std.fs
+use std.env
+use std.proc
+
+# Colors, 0xRRGGBB.
+BG := 0x1e1e1e
+FG := 0xd4d4d4
+LINE_BG := 0x2a2a2a
+GUTTER_FG := 0x858585
+STATUS_BG := 0x007acc
+STATUS_FG := 0xffffff
+PANE_BG := 0x252526
+KEYWORD_FG := 0x569cd6
+TYPE_FG := 0x4ec9b0
+STRING_FG := 0xce9178
+NUMBER_FG := 0xb5cea8
+COMMENT_FG := 0x6a9955
+ATTR_FG := 0xc586c0
+OP_FG := 0xd4d4d4
+ERROR_BG := 0x5a1d1d
+WARN_BG := 0x4d4a1d
+SELECT_BG := 0x264f78
+
+UNDO_LIMIT := 200
+INDENT := 4
+
+# ---- Buffer -------------------------------------------------------------
+
+## One edit of a fix from `ail check --json`: replace the text from
+## (line, col) up to, not including, (end_line, end_col). 1-based columns.
+struct TextEdit
+    line int
+    col int
+    end_line int
+    end_col int
+    text str
+
+## A diagnostic from `ail check --json` (docs/design/semantic-api.md).
+struct Diag
+    severity str
+    rule str
+    line int
+    col int
+    end_line int
+    end_col int
+    message str
+    help str
+    fix_title str
+    fix List[TextEdit]
+
+## A declaration from `ail api --text`.
+struct OutlineItem
+    line int
+    text str
+
+struct Snapshot
+    lines List[str]
+    line int
+    col int
+
+enum Pane
+    Diags
+    Text
+    Outline
+
+## The whole editor state. `line` and `col` are 0-based; `col` counts
+## characters. `top` and `left` scroll the view.
+struct Editor
+    path str
+    lines List[str]
+    line int
+    col int
+    goal int
+    top int
+    left int
+    cols int
+    rows int
+    dirty bool
+    message str
+    quit_armed bool
+    quit bool
+    undo List[Snapshot]
+    diags List[Diag]
+    pane Pane
+    pane_text List[str]
+    outline List[OutlineItem]
+    outline_sel int
+
+fn Editor.new(path str, text str, cols int, rows int) Editor
+    mut lines := text.split("\n")
+    if lines.len() > 1 and lines[lines.len() - 1] == ""
+        lines.pop()
+    if lines.len() == 0
+        lines.push("")
+    Editor(path: path, lines: lines, line: 0, col: 0, goal: 0, top: 0, left: 0,
+        cols: cols, rows: rows, dirty: false, message: "", quit_armed: false,
+        quit: false, undo: [], diags: [], pane: Pane.Diags, pane_text: [],
+        outline: [], outline_sel: 0)
+
+## The buffer as file text: lines joined with `\n`, ending with one.
+fn Editor.text(self) str
+    "{lines.join("\n")}\n"
+
+fn Editor.cur(self) List[char]
+    lines[line].chars()
+
+fn Editor.snapshot(mut self)
+    undo.push(Snapshot(lines: lines, line: line, col: col))
+    if undo.len() > UNDO_LIMIT
+        undo = undo[1..]
+    dirty = true
+    diags = []
+
+fn Editor.set_col(mut self, c int)
+    col = c
+    goal = c
+
+
+## `xs[..from]`, then `mid`, then `xs[to..]`.
+fn splice(xs List[str], from int, to int, mid List[str]) List[str]
+    mut out := xs[..from]
+    for s in mid
+        out.push(s)
+    for s in xs[to..]
+        out.push(s)
+    out
+
+## Replaces the text from (l1, c1) up to (l2, c2), all 0-based, with `s`,
+## which may hold newlines, and puts the cursor at the end of the new text.
+fn Editor.replace(mut self, l1 int, c1 int, l2 int, c2 int, s str)
+    snapshot()
+    edit(l1, c1, l2, c2, s)
+
+## `replace` without an undo snapshot.
+fn Editor.edit(mut self, l1 int, c1 int, l2 int, c2 int, s str)
+    before := lines[l1].chars()[..c1].join("")
+    after := lines[l2].chars()[c2..].join("")
+    mut parts := s.split("\n")
+    end := parts.len() - 1
+    mut end_col := parts[end].chars().len()
+    if end == 0
+        end_col += c1
+    parts[0] = "{before}{parts[0]}"
+    parts[end] = "{parts[end]}{after}"
+    lines = splice(lines, l1, l2 + 1, parts)
+    line = l1 + end
+    set_col(end_col)
+
+fn Editor.insert(mut self, s str)
+    replace(line, col, line, col, s)
+
+## Spaces at the start of a line.
+fn indent_of(s str) int
+    mut n := 0
+    for c in s.chars()
+        if c != ' '
+            break
+        n += 1
+    n
+
+BLOCK_WORDS := "fn if elif else while for match struct enum trait impl error"
+
+## Whether a line opens an indented block (lex.block.1): a declaration or a
+## control-flow header, a `match` arm or `if` value, or `else err`.
+fn opens_block(s str) bool
+    t := s.trim()
+    if t == "" or t.starts_with("#")
+        return false
+    words := t.split(" ")
+    n := words.len()
+    mut first := words[0]
+    if first.starts_with("@") and n > 1
+        first = words[1]
+    if BLOCK_WORDS.split(" ").contains(first) or t.ends_with("=>")
+        return true
+    n >= 2 and (words[n - 1] == "else" or words[n - 2] == "else" or words[n - 2] == ":="
+        and (words[n - 1] == "match" or words[n - 1] == "if")) or t.contains(":= if ") or t.contains(":= match ")
+
+fn Editor.newline(mut self)
+    cs := cur()
+    head := cs[..col].join("")
+    mut n := indent_of(head).min(col)
+    if opens_block(head)
+        n += INDENT
+    insert("\n{" ".repeat(n)}")
+
+fn Editor.backspace(mut self)
+    if col > 0
+        cs := cur()
+        head := cs[..col].join("")
+        mut n := 1
+        if head.trim() == "" and col % INDENT == 0
+            n = INDENT
+        replace(line, col - n, line, col, "")
+    elif line > 0
+        prev := lines[line - 1].chars().len()
+        replace(line - 1, prev, line, 0, "")
+
+fn Editor.delete(mut self)
+    if col < cur().len()
+        replace(line, col, line, col + 1, "")
+    elif line + 1 < lines.len()
+        replace(line, col, line + 1, 0, "")
+
+fn Editor.undo_last(mut self)
+    s := undo.pop() else
+        message = "nothing to undo"
+        return
+    lines = s.lines
+    line = s.line
+    set_col(s.col)
+    diags = []
+    dirty = true
+
+# ---- Movement -----------------------------------------------------------
+
+enum Dir
+    Left
+    Right
+    Up
+    Down
+    WordLeft
+    WordRight
+    Home
+    End
+    PageUp
+    PageDown
+    Top
+    Bottom
+
+fn is_word(c char) bool
+    c.is_alnum() or c == '_'
+
+## The text rows the buffer gets: the window minus the status line and pane.
+fn Editor.text_rows(self) int
+    (rows - 1 - pane_rows()).max(1)
+
+fn Editor.pane_rows(self) int
+    if rows < 10
+        return 0
+    if pane == Outline or pane == Text
+        return (rows / 3).max(4)
+    4
+
+fn Editor.move_to_line(mut self, l int)
+    line = l.max(0).min(lines.len() - 1)
+    col = goal.min(cur().len())
+
+fn Editor.go(mut self, d Dir)
+    n := cur().len()
+    match d
+        Left =>
+            if col > 0
+                set_col(col - 1)
+            elif line > 0
+                line -= 1
+                set_col(cur().len())
+        Right =>
+            if col < n
+                set_col(col + 1)
+            elif line + 1 < lines.len()
+                line += 1
+                set_col(0)
+        Up => move_to_line(line - 1)
+        Down => move_to_line(line + 1)
+        PageUp => move_to_line(line - text_rows())
+        PageDown => move_to_line(line + text_rows())
+        Top =>
+            line = 0
+            set_col(0)
+        Bottom =>
+            line = lines.len() - 1
+            set_col(cur().len())
+        Home =>
+            ind := indent_of(lines[line])
+            if col == ind
+                set_col(0)
+            else
+                set_col(ind)
+        End => set_col(n)
+        WordLeft =>
+            cs := cur()
+            mut c := col
+            while c > 0 and not is_word(cs[c - 1])
+                c -= 1
+            while c > 0 and is_word(cs[c - 1])
+                c -= 1
+            set_col(c)
+        WordRight =>
+            cs := cur()
+            mut c := col
+            while c < n and not is_word(cs[c])
+                c += 1
+            while c < n and is_word(cs[c])
+                c += 1
+            set_col(c)
+
+## Scrolls so the cursor is inside the view.
+fn Editor.scroll(mut self)
+    h := text_rows()
+    if line < top
+        top = line
+    if line >= top + h
+        top = line - h + 1
+    w := (cols - gutter_width()).max(1)
+    if col < left
+        left = col
+    if col >= left + w
+        left = col - w + 1
+
+fn Editor.gutter_width(self) int
+    "{lines.len()}".chars().len().max(3) + 1
+
+# ---- Syntax highlighting ------------------------------------------------
+
+## The reserved words of lex.kw.1, plus the literals `true`, `false` and
+## `none`, which are keywords there too.
+KEYWORDS := {"and", "any", "as", "break", "continue", "defer", "elif", "else", "enum",
+    "error", "extern", "false", "fn", "for", "if", "impl", "in", "match", "move", "mut",
+    "none", "not", "or", "pub", "ref", "return", "self", "spawn", "struct", "todo",
+    "trait", "true", "unique", "unsafe", "use", "while"}
+
+## The end of a quoted literal that starts at `q` (the opening quote),
+## just past its closing quote; `raw` literals have no escapes (lex.str).
+fn quoted_end(cs List[char], q int, raw bool) int
+    quote := cs[q]
+    n := cs.len()
+    mut j := q + 1
+    while j < n and cs[j] != quote
+        if not raw and cs[j] == '\\'
+            j += 1
+        j += 1
+    (j + 1).min(n)
+
+## The foreground color of each character of one line of AIL source. Each
+## line is colored on its own, so a `"""` string's inner lines look like code.
+fn colors(cs List[char]) List[int]
+    mut out := List[int]()
+    n := cs.len()
+    mut i := 0
+    while i < n
+        c := cs[i]
+        mut j := i + 1
+        mut fg := OP_FG
+        if c == '#'
+            j = n
+            fg = COMMENT_FG
+        elif c == '"' or c == '\''
+            j = quoted_end(cs, i, false)
+            fg = STRING_FG
+        elif c == 'r' and i + 1 < n and cs[i + 1] == '"' and (i == 0 or not is_word(cs[i - 1]))
+            j = quoted_end(cs, i + 1, true)
+            fg = STRING_FG
+        elif c.is_digit()
+            while j < n and (is_word(cs[j]) or cs[j] == '.' and j + 1 < n and cs[j + 1].is_digit())
+                j += 1
+            fg = NUMBER_FG
+        elif is_word(c) or c == '@'
+            while j < n and is_word(cs[j])
+                j += 1
+            if c == '@'
+                fg = ATTR_FG
+            elif KEYWORDS.contains(cs[i..j].join(""))
+                fg = KEYWORD_FG
+            elif c.is_upper()
+                fg = TYPE_FG
+            else
+                fg = FG
+        for _ in i..j
+            out.push(fg)
+        i = j
+    out
+
+# ---- View ---------------------------------------------------------------
+
+## A run of text on one row of the screen. Runs are drawn in order, so a
+## later run covers an earlier one.
+struct Span
+    row int
+    col int
+    text str
+    fg int
+    bg int
+
+## What a front end draws: colored runs, the plain text of each row (for
+## tests and agents), and where the caret goes.
+struct Screen
+    cols int
+    rows int
+    text List[str]
+    spans List[Span]
+    cursor_col int
+    cursor_row int
+
+fn Screen.new(cols int, rows int) Screen
+    mut text := List[str]()
+    for _ in 0..rows
+        text.push("")
+    Screen(cols: cols, rows: rows, text: text, spans: [], cursor_col: -1, cursor_row: -1)
+
+## Fills a whole row with `bg`.
+fn Screen.band(mut self, row int, bg int)
+    spans.push(Span(row: row, col: 0, text: " ".repeat(cols), fg: bg, bg: bg))
+
+## Writes `s` at `col` of `row`, clipped to the screen.
+fn Screen.put(mut self, row int, col int, s str, fg int, bg int)
+    if row < 0 or row >= rows or col >= cols
+        return
+    cs := s.chars()
+    shown := cs[..cs.len().min(cols - col)].join("")
+    spans.push(Span(row: row, col: col, text: shown, fg: fg, bg: bg))
+    have := text[row].chars()
+    mut pad := ""
+    if have.len() < col
+        pad = " ".repeat(col - have.len())
+    old_tail := have[(col + shown.chars().len()).min(have.len())..].join("")
+    text[row] = "{have[..col.min(have.len())].join("")}{pad}{shown}{old_tail}"
+
+## The background of character `c` (0-based) of line `l` (0-based): a
+## diagnostic's span if one covers it, else `bg`.
+fn diag_bg(diags List[Diag], l int, c int, bg int) int
+    for d in diags
+        start := d.line - 1
+        end := d.end_line - 1
+        mut sc := d.col - 1
+        mut ec := d.end_col - 1
+        if start == end and sc == ec
+            ec = sc + 1
+        if l < start or l > end
+            continue
+        if l == start and c < sc or l == end and c >= ec
+            continue
+        if d.severity == "error"
+            return ERROR_BG
+        return WARN_BG
+    bg
+
+fn Editor.diag_count(self, severity str) int
+    mut n := 0
+    for d in diags
+        if d.severity == severity
+            n += 1
+    n
+
+## The diagnostic under the cursor, or the first one on the cursor's line.
+fn Editor.diag_here(self) Diag?
+    mut found := List[Diag]()
+    for d in diags
+        if d.line - 1 <= line and line <= d.end_line - 1
+            if d.line - 1 == line and col + 1 >= d.col and (col + 1 < d.end_col or d.end_line - 1 > line)
+                return d
+            found.push(d)
+    found.pop()
+
+fn Editor.render(self) Screen
+    mut s := Screen.new(cols, rows)
+    h := text_rows()
+    gw := gutter_width()
+    w := (cols - gw).max(0)
+    for r in 0..h
+        l := top + r
+        if l >= lines.len()
+            break
+        mut bg := BG
+        if l == line
+            bg = LINE_BG
+            s.band(r, bg)
+        num := "{l + 1}"
+        s.put(r, 0, "{num.pad_left(gw - 1, ' ')} ", GUTTER_FG, bg)
+        cs := lines[l].chars()
+        if left >= cs.len()
+            continue
+        fgs := colors(cs)
+        end := cs.len().min(left + w)
+        mut i := left
+        while i < end
+            fg := fgs[i]
+            b := diag_bg(diags, l, i, bg)
+            mut j := i + 1
+            while j < end and fgs[j] == fg and diag_bg(diags, l, j, bg) == b
+                j += 1
+            s.put(r, gw + i - left, cs[i..j].join(""), fg, b)
+            i = j
+    # A diagnostic at the end of a line shows as one marked cell.
+    for d in diags
+        r := d.line - 1 - top
+        if r >= 0 and r < h and d.col - 1 >= lines[d.line - 1].chars().len()
+            c := gw + d.col - 1 - left
+            if c >= gw and c < cols
+                s.put(r, c, " ", FG, diag_bg([d], d.line - 1, d.col - 1, BG))
+    status_row := h
+    s.band(status_row, STATUS_BG)
+    mut flag := ""
+    if dirty
+        flag = " *"
+    counts := "{diag_count("error")} errors, {diag_count("warning")} warnings"
+    left_part := " {path}{flag}  Ln {line + 1}, Col {col + 1}  {counts}"
+    s.put(status_row, 0, left_part, STATUS_FG, STATUS_BG)
+    if message != ""
+        s.put(status_row, left_part.chars().len() + 2, "| {message}", STATUS_FG, STATUS_BG)
+    render_pane(mut s, status_row + 1)
+    if line >= top and line < top + h
+        s.cursor_row = line - top
+        s.cursor_col = gw + col - left
+    s
+
+fn Editor.render_pane(self, mut s Screen, first int)
+    n := pane_rows()
+    for r in first..first + n
+        s.band(r, PANE_BG)
+    match pane
+        Diags =>
+            if diags.len() == 0
+                s.put(first, 1, "No diagnostics. Ctrl-K checks, F1 explains, Ctrl-O outline.", GUTTER_FG, PANE_BG)
+            mut r := first
+            for d in diags
+                if r >= first + n
+                    break
+                mut fix := ""
+                if d.fix.len() > 0
+                    fix = "  [Ctrl-. {d.fix_title}]"
+                s.put(r, 1, "{d.line}:{d.col} {d.severity}[{d.rule}] {d.message}{fix}", FG, PANE_BG)
+                r += 1
+        Text =>
+            mut r := first
+            for t in pane_text
+                if r >= first + n
+                    break
+                s.put(r, 1, t, FG, PANE_BG)
+                r += 1
+        Outline =>
+            # Scroll the outline so the selection stays visible.
+            start := (outline_sel - n + 1).max(0)
+            mut r := first
+            for i in start..outline.len()
+                if r >= first + n
+                    break
+                item := outline[i]
+                mut bg := PANE_BG
+                if i == outline_sel
+                    bg = SELECT_BG
+                    s.band(r, bg)
+                s.put(r, 1, "{item.line:>5}  {item.text}", FG, bg)
+                r += 1
+
+# ---- Commands -----------------------------------------------------------
+
+enum Command
+    Insert(text str)
+    Newline
+    Tab
+    Backspace
+    Delete
+    Go(dir Dir)
+    Undo
+    Fix
+    Escape
+    Quit
+    Resize(cols int, rows int)
+    # These reach the file system or run `ail`; `Editor.run` handles them.
+    Save
+    Check
+    Explain
+    Outline
+
+## Applies a command that needs nothing outside the editor. `Save`,
+## `Check`, `Explain` and `Outline` do nothing here: see `Editor.run`.
+fn Editor.apply(mut self, cmd Command)
+    if cmd != Quit
+        quit_armed = false
+    if pane == Outline and outline_key(cmd)
+        scroll()
+        return
+    match cmd
+        Insert(t) => insert(t)
+        Newline => newline()
+        Tab => insert(" ".repeat(INDENT - col % INDENT))
+        Backspace => backspace()
+        Delete => delete()
+        Go(d) => go(d)
+        Undo => undo_last()
+        Fix => apply_fix()
+        Escape =>
+            pane = Diags
+            message = ""
+        Quit =>
+            if dirty and not quit_armed
+                quit_armed = true
+                message = "unsaved changes: Ctrl-Q again quits without saving"
+            else
+                quit = true
+        Resize(c, r) =>
+            cols = c
+            rows = r
+        Save | Check | Explain | Outline => return
+    scroll()
+
+## Up, Down and Enter in the outline pane; true if `cmd` was one of them.
+fn Editor.outline_key(mut self, cmd Command) bool
+    if cmd == Go(Up)
+        outline_sel = (outline_sel - 1).max(0)
+    elif cmd == Go(Down)
+        outline_sel = (outline_sel + 1).min(outline.len() - 1).max(0)
+    elif cmd == Newline
+        if outline_sel < outline.len()
+            line = (outline[outline_sel].line - 1).max(0).min(lines.len() - 1)
+            set_col(indent_of(lines[line]))
+            top = line
+        pane = Diags
+    else
+        return false
+    true
+
+## Applies the first fix of the diagnostic under the cursor (semantic-api
+## fixes: edits in source order, applied last to first).
+fn Editor.apply_fix(mut self)
+    d := diag_here() else
+        message = "no diagnostic here"
+        return
+    if d.fix.len() == 0
+        message = "no fix for {d.rule}"
+        return
+    snapshot()
+    mut i := d.fix.len() - 1
+    while i >= 0
+        e := d.fix[i]
+        edit(e.line - 1, e.col - 1, e.end_line - 1, e.end_col - 1, e.text)
+        i -= 1
+    message = "applied: {d.fix_title}; Ctrl-K checks again"
+
+## The command for a key from `std.ui` (`Event.Key`), or `none`.
+fn key_command(key str, ctrl bool, alt bool, shift bool) Command?
+    if ctrl
+        return match key
+            "s" | "S" => Save
+            "q" | "Q" => Quit
+            "k" | "K" => Check
+            "z" | "Z" => Undo
+            "." => Fix
+            "o" | "O" => Outline
+            "home" => Go(Top)
+            "end" => Go(Bottom)
+            "left" => Go(WordLeft)
+            "right" => Go(WordRight)
+            _ => none
+    if alt
+        return none
+    match key
+        "enter" => Newline
+        "tab" => Tab
+        "backspace" => Backspace
+        "delete" => Delete
+        "escape" => Escape
+        "left" => Go(Left)
+        "right" => Go(Right)
+        "up" => Go(Up)
+        "down" => Go(Down)
+        "home" => Go(Home)
+        "end" => Go(End)
+        "pageup" => Go(PageUp)
+        "pagedown" => Go(PageDown)
+        "f1" => Explain
+        _ =>
+            if key.chars().len() == 1
+                return Insert(key)
+            none
+
+# ---- Running `ail` ------------------------------------------------------
+
+## The `ail` command: `$AIL`, else `./ail` when run from the repository
+## root, else `ail` on `PATH`.
+fn ail_command() str
+    if a := env.get("AIL")
+        return a
+    if fs.exists("./ail")
+        return "./ail"
+    "ail"
+
+fn jstr(j Json, key str) str
+    (j.get(key) else Json.Null).as_str() else ""
+
+fn jint(j Json, key str) int
+    ((j.get(key) else Json.Null).as_num() else 0.0).to_int()
+
+fn jarr(j Json, key str) List[Json]
+    (j.get(key) else Json.Null).as_arr() else List[Json]()
+
+## The diagnostics in `ail check --json` output: one JSON object per line.
+## Lines that aren't diagnostics are skipped.
+fn parse_diags(text str) List[Diag]
+    mut out := List[Diag]()
+    for l in text.lines()
+        j := parse_json(l) else continue
+        if jstr(j, "rule") == ""
+            continue
+        mut fix := List[TextEdit]()
+        mut title := ""
+        fixes := jarr(j, "fixes")
+        if fixes.len() > 0
+            title = jstr(fixes[0], "title")
+            for e in jarr(fixes[0], "edits")
+                fix.push(TextEdit(line: jint(e, "line"), col: jint(e, "col"),
+                    end_line: jint(e, "end_line"), end_col: jint(e, "end_col"),
+                    text: jstr(e, "text")))
+        out.push(Diag(severity: jstr(j, "severity"), rule: jstr(j, "rule"),
+            line: jint(j, "line"), col: jint(j, "col"), end_line: jint(j, "end_line"),
+            end_col: jint(j, "end_col"), message: jstr(j, "message"), help: jstr(j, "help"),
+            fix_title: title, fix: fix))
+    out
+
+## The declarations in `ail api --text` output: `LINE  signature` per line;
+## doc lines (`##`) are skipped.
+fn parse_outline(text str) List[OutlineItem]
+    mut out := List[OutlineItem]()
+    for l in text.lines()
+        t := l.trim()
+        words := t.split(" ")
+        n := words[0].to_int() else continue
+        rest := l.chars()[7.min(l.chars().len())..].join("")
+        if rest.trim().starts_with("##")
+            continue
+        out.push(OutlineItem(line: n, text: rest))
+    out
+
+## Runs `ail ARGS... FILE` on the buffer: on the file itself when it's
+## saved, else on a copy beside it, so relative imports still resolve.
+fn Editor.ail_on_buffer(mut self, args List[str]) proc.Output?
+    mut file := path
+    if dirty
+        file = "{path}.edit-check.ail"
+        fs.write_text(file, text()) else err
+            message = "can't write {err.path}: {err.kind}"
+            return none
+    mut all := args
+    all.push(file)
+    r := proc.run(ail_command(), all) else err
+        message = "can't run {err.cmd}: {err.kind}"
+        return none
+    if dirty
+        fs.remove(file) else err
+            message = "can't remove {err.path}: {err.kind}"
+    r
+
+fn Editor.check(mut self)
+    r := ail_on_buffer(["check", "--json"]) else return
+    diags = parse_diags(r.err)
+    pane = Diags
+    message = "checked: {diag_count("error")} errors, {diag_count("warning")} warnings"
+
+fn Editor.save(mut self)
+    fs.write_text(path, text()) else err
+        message = "can't save {err.path}: {err.kind}"
+        return
+    dirty = false
+    check()
+    message = "saved; {message}"
+
+fn Editor.explain(mut self)
+    d := diag_here() else
+        message = "no diagnostic here to explain"
+        return
+    r := proc.run(ail_command(), ["explain", d.rule]) else err
+        message = "can't run {err.cmd}: {err.kind}"
+        return
+    pane_text = [d.message]
+    if d.help != ""
+        pane_text.push("help: {d.help}")
+    for l in r.out.lines()
+        pane_text.push(l)
+    pane = Text
+    message = "explain {d.rule}; Esc closes"
+
+fn Editor.toggle_outline(mut self)
+    if pane == Outline
+        pane = Diags
+        return
+    r := ail_on_buffer(["api", "--text"]) else return
+    if r.status != 0
+        if r.out.starts_with("usage:")
+            message = "no outline: this `ail` has no `api` command"
+        else
+            message = "no outline: `ail api` needs a program without errors"
+        return
+    outline = parse_outline(r.out)
+    outline_sel = 0
+    for i in 0..outline.len()
+        if outline[i].line - 1 <= line
+            outline_sel = i
+    pane = Outline
+    message = "outline: Up/Down select, Enter jumps, Esc closes"
+
+## Applies any command, running `ail` or touching the file when it must.
+fn Editor.run(mut self, cmd Command)
+    if cmd == Save
+        save()
+    elif cmd == Check
+        check()
+    elif cmd == Explain
+        explain()
+    elif cmd == Outline
+        toggle_outline()
+    else
+        apply(cmd)
+    scroll()
+
+# ---- Tests (headless) ---------------------------------------------------
+
+fn typed(text str, cmds List[Command]) Editor
+    mut ed := Editor.new("t.ail", text, 40, 12)
+    for c in cmds
+        ed.apply(c)
+    ed
+
+fn keys(s str) List[Command]
+    mut out := List[Command]()
+    for c in s.chars()
+        if c == '\n'
+            out.push(Newline)
+        else
+            out.push(Insert("{c}"))
+    out
+
+@test fn typing_and_auto_indent()
+    ed := typed("", keys("fn main()\nprint(1)\n"))
+    assert_eq(ed.lines, ["fn main()", "    print(1)", "    "])
+    assert_eq(ed.line, 2)
+    assert_eq(ed.col, 4)
+    assert(ed.dirty)
+
+@test fn block_openers()
+    assert(opens_block("    if x := f()"))
+    assert(opens_block("x := match c"))
+    assert(opens_block("    Red =>"))
+    assert(opens_block("n := parse(s) else err"))
+    assert(opens_block("@test fn t()"))
+    assert(not opens_block("x := 1"))
+    assert(not opens_block("# fn"))
+
+@test fn backspace_dedents_and_joins()
+    mut ed := typed("fn f()\n        x", [])
+    ed.apply(Go(Down))
+    ed.apply(Go(Home))
+    assert_eq(ed.col, 8)
+    ed.apply(Backspace)
+    assert_eq(ed.lines[1], "    x")
+    ed.apply(Go(Home))
+    ed.apply(Backspace)
+    assert_eq(ed.lines, ["fn f()    x"])
+    assert_eq(ed.col, 6)
+
+@test fn delete_and_undo()
+    mut ed := typed("ab\ncd", [])
+    ed.apply(Go(End))
+    ed.apply(Delete)
+    assert_eq(ed.lines, ["abcd"])
+    ed.apply(Insert("X"))
+    ed.apply(Undo)
+    ed.apply(Undo)
+    assert_eq(ed.lines, ["ab", "cd"])
+    assert_eq(ed.col, 2)
+    ed.apply(Undo)
+    assert_eq(ed.message, "nothing to undo")
+
+@test fn paste_with_newlines()
+    mut ed := typed("<>", [Go(Right)])
+    ed.apply(Insert("a\nbc\nd"))
+    assert_eq(ed.lines, ["<a", "bc", "d>"])
+    assert_eq(ed.line, 2)
+    assert_eq(ed.col, 1)
+
+@test fn word_and_line_moves()
+    mut ed := typed("foo.bar(baz)\nx", [Go(WordRight)])
+    assert_eq(ed.col, 3)
+    ed.apply(Go(WordRight))
+    assert_eq(ed.col, 7)
+    ed.apply(Go(WordLeft))
+    assert_eq(ed.col, 4)
+    ed.apply(Go(Down))
+    assert_eq(ed.col, 1)
+    ed.apply(Go(Up))
+    assert_eq(ed.col, 4)
+    ed.apply(Go(Bottom))
+    assert_eq(ed.line, 1)
+    ed.apply(Go(Right))
+    assert_eq(ed.line, 1)
+
+@test fn tab_inserts_spaces()
+    ed := typed("ab", [Go(Right), Tab])
+    assert_eq(ed.lines[0], "a   b")
+
+@test fn render_rows()
+    ed := typed("fn main()\n    print(\"hi\")", [Insert("x")])
+    s := ed.render()
+    assert_eq(s.text[0], "  1 xfn main()")
+    assert_eq(s.text[1], "  2     print(\"hi\")")
+    assert_eq(s.text[7], " t.ail *  Ln 1, Col 2  0 errors, 0 warni")
+    assert_eq(s.cursor_row, 0)
+    assert_eq(s.cursor_col, 5)
+    assert_eq(s.rows, 12)
+
+@test fn highlighting()
+    fgs := colors("fn f(x Int) # c".chars())
+    assert_eq(fgs[0], KEYWORD_FG)
+    assert_eq(fgs[3], FG)
+    assert_eq(fgs[7], TYPE_FG)
+    assert_eq(fgs[14], COMMENT_FG)
+    s := colors("@test \"a\\\"b\" 'c' 0x1f r\"\\d\"".chars())
+    assert_eq(s[0], ATTR_FG)
+    assert_eq(s[6], STRING_FG)
+    assert_eq(s[11], STRING_FG)
+    assert_eq(s[12], OP_FG)
+    assert_eq(s[13], STRING_FG)
+    assert_eq(s[17], NUMBER_FG)
+    assert_eq(s[20], NUMBER_FG)
+    assert_eq(s[22], STRING_FG)
+    assert_eq(s[26], STRING_FG)
+
+@test fn horizontal_and_vertical_scroll()
+    mut ed := typed("", [])
+    for _ in 0..30
+        ed.apply(Newline)
+    assert_eq(ed.line, 30)
+    s := ed.render()
+    assert_eq(s.cursor_row, ed.text_rows() - 1)
+    ed.apply(Insert("y".repeat(50)))
+    assert(ed.left > 0)
+    assert_eq(ed.render().cursor_col, 39)
+
+@test fn keys_map_to_commands()
+    assert_eq(key_command("s", true, false, false), Save)
+    assert_eq(key_command("Q", true, false, true), Quit)
+    assert_eq(key_command("left", true, false, false), Go(WordLeft))
+    assert_eq(key_command("A", false, false, true), Insert("A"))
+    assert_eq(key_command("f1", false, false, false), Explain)
+    assert_eq(key_command("enter", false, false, false), Newline)
+    assert_eq(key_command("x", false, true, false), none)
+    assert_eq(key_command("f5", false, false, false), none)
+
+@test fn quit_asks_when_dirty()
+    mut ed := typed("", [Insert("a"), Quit])
+    assert(not ed.quit)
+    assert(ed.quit_armed)
+    ed.apply(Go(Left))
+    ed.apply(Quit)
+    assert(not ed.quit)
+    ed.apply(Quit)
+    assert(ed.quit)
+    clean := typed("", [Quit])
+    assert(clean.quit)
+
+DIAG_JSON := "\{\"api\":1,\"severity\":\"error\",\"rule\":\"expr.name.1\",\"file\":\"t.ail\",\"line\":2,\"col\":5,\"message\":\"unknown name `prnt`\",\"help\":\"did you mean `print`?\",\"end_line\":2,\"end_col\":9,\"fixes\":[\{\"title\":\"replace `prnt` with `print`\",\"edits\":[\{\"line\":2,\"col\":5,\"end_line\":2,\"end_col\":9,\"text\":\"print\"}]}]}"
+
+@test fn diagnostics_parse_show_and_fix()
+    ds := parse_diags("noise\n{DIAG_JSON}\n")
+    assert_eq(ds.len(), 1)
+    assert_eq(ds[0].rule, "expr.name.1")
+    assert_eq(ds[0].fix[0].text, "print")
+    mut ed := typed("fn main()\n    prnt(1)", [])
+    ed.diags = ds
+    ed.cols = 100
+    s := ed.render()
+    assert_eq(s.text[8], " 2:5 error[expr.name.1] unknown name `prnt`  [Ctrl-. replace `prnt` with `print`]")
+    mut marked := 0
+    for sp in s.spans
+        if sp.bg == ERROR_BG
+            marked += 1
+            assert_eq(sp.text, "prnt")
+    assert_eq(marked, 1)
+    ed.apply(Fix)
+    assert_eq(ed.message, "no diagnostic here")
+    ed.apply(Go(Down))
+    ed.apply(Fix)
+    assert_eq(ed.lines[1], "    print(1)")
+    assert_eq(ed.diags.len(), 0)
+    ed.apply(Undo)
+    assert_eq(ed.lines[1], "    prnt(1)")
+
+@test fn outline_parse_and_jump()
+    items := parse_outline("    1  fn main()\n        ## Doc.\n   12      fn Point.x(self) int\n")
+    assert_eq(items.len(), 2)
+    assert_eq(items[1].line, 12)
+    assert_eq(items[1].text, "    fn Point.x(self) int")
+    mut text := ""
+    for i in 0..20
+        text = "{text}line {i}\n"
+    mut ed := typed(text, [])
+    ed.outline = items
+    ed.pane = Outline
+    ed.apply(Go(Down))
+    ed.apply(Newline)
+    assert_eq(ed.line, 11)
+    assert_eq(ed.pane, Diags)
+
+# ---- Front ends ---------------------------------------------------------
+
+## `--print`: render one screen to standard output instead of opening a
+## window, after the commands named by `--check`, `--outline`, `--explain`.
+fn print_screen(mut ed Editor, flags List[str])
+    for f in flags
+        if f == "--check"
+            ed.run(Check)
+        elif f == "--outline"
+            ed.run(Outline)
+        elif f == "--explain"
+            ed.run(Explain)
+    for row in ed.render().text
+        print(row)
+
+fn main() !
+    args := env.args()
+    if args.len() == 0
+        print("usage: ail run tools/edit/edit.ail [--print [--check] [--outline] [--explain]] FILE")
+        return
+    path := args[args.len() - 1]
+    mut text := ""
+    if fs.exists(path)
+        text = fs.read_text(path)?
+    mut ed := Editor.new(path, text, 100, 32)
+    print_screen(mut ed, args[..args.len() - 1])
