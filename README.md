@@ -47,7 +47,7 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 | Ctrl-O | Outline (`ail api --text`); Up/Down select, Enter jumps |
 | Escape | Close the explanation or the outline; stop selecting or finding |
 | Ctrl-Q | Quit; with unsaved changes in any tab, press it twice. Closing the window counts as Ctrl-Q |
-| F5, F6 | Run the buffer (`ail run`), or its tests (`ail test`); the output fills the pane |
+| F5, F6 | Run the buffer (`ail run`), or its tests (`ail test`); the output fills the pane (its end, when long), Esc closes it, and a click on a `FILE:LINE:COL` or `at LINE:COL` jumps there, opening the file in a tab if needed |
 | Ctrl-P | Open a file: type part of its path (letters in order), Up/Down, Enter |
 | Ctrl-Tab, Ctrl-Shift-Tab | Next, previous tab; a click on a tab selects it |
 | Ctrl-W | Close the tab; with unsaved changes, press it twice |

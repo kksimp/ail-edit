@@ -2359,6 +2359,43 @@ fn fg_at(s Screen, row int, col int) int
     assert_eq(extra_key("f5", false, false, false), RunFile)
     assert(extra_key("f5", true, false, false) == none)
 
+@test fn output_locations()
+    loc := output_location(
+        "/a/t.ail:3:13: trap[type.coll.4]: index 3",
+        "x.ail",
+    ) else unreachable("no location")
+    assert_eq([loc.path, "{loc.line}", "{loc.col}"], ["/a/t.ail", "3", "13"])
+    loc2 := output_location(
+        "t.ail.edit-check.ail:7:2: trap",
+        "t.ail",
+    ) else unreachable("no location")
+    assert_eq(loc2.path, "t.ail")
+    loc3 := output_location(
+        "FAIL a: assertion failed: left is 1, right is 2 at 4:14",
+        "u.ail",
+    ) else unreachable("no location")
+    assert_eq([loc3.path, "{loc3.line}", "{loc3.col}"], ["u.ail", "4", "14"])
+    assert(output_location("Hello, world!", "u.ail") == none)
+    assert(output_location("see notes.ail", "u.ail") == none)
+
+@test fn clicking_output_jumps()
+    mut ed := typed("fn main()\n    xs := [1]\n    print(xs[3])\n", [])
+    ed.show_output("run", proc.Output(
+        status: 1,
+        out: "",
+        err: "t.ail:3:13: trap[type.coll.4]: out of bounds\n",
+    ))
+    assert_eq(ed.pane_text.len(), 2)
+    ed.on_event(Mouse(col: 2, row: ed.text_rows() + 2, button: "left", kind: "down"))
+    assert_eq([ed.line, ed.col], [2, 12])
+    # Long output keeps its end.
+    mut long := ""
+    for i in 0..50
+        long = "{long}line {i}\n"
+    ed.show_output("run", proc.Output(status: 0, out: long, err: ""))
+    assert_eq(ed.pane_text[ed.pane_text.len() - 1], "line 49")
+    assert(ed.pane_text[1].starts_with("... "))
+
 @test fn tabs_and_the_picker()
     mut ws := Workspace.new(typed("x", []))
     ws.eds[0].path = "a.ail"
@@ -2470,6 +2507,9 @@ fn Editor.click_pane(mut self, i int)
         set_col((d.col - 1).max(0).min(cur().len()))
         selecting = false
         scroll()
+    elif loc := pane_location(i)
+        if loc.path == path
+            jump_to(loc)
     elif pane == Outline
         start := (outline_sel - pane_rows() + 1).max(0)
         if start + i < outline.len()
@@ -2505,14 +2545,80 @@ fn Editor.run_extra(mut self, x Extra)
     r := ail_on_buffer(words) else return
     show_output(words[0], r)
 
+## Shows a run's output in the pane: a header, then standard output and
+## standard error. When it doesn't fit, the end is kept, since traps and
+## failures come last. A click on a line with a location jumps there.
 fn Editor.show_output(mut self, what str, r proc.Output)
-    pane_text = ["ail {what}: exit {r.status}"]
+    mut out := List[str]()
     for l in r.out.lines()
-        pane_text.push(l)
+        out.push(l)
     for l in r.err.lines()
-        pane_text.push(l)
+        out.push(l)
     pane = Text
-    message = "{what}: exit {r.status}; Esc closes"
+    room := (pane_rows() - 1).max(1)
+    pane_text = ["ail {what}: exit {r.status}"]
+    if out.len() > room
+        pane_text.push("... {out.len() - room + 1} lines above")
+        out = out[out.len() - room + 1..]
+    for l in out
+        pane_text.push(l)
+    message = "{what}: exit {r.status}; click a location to jump, Esc closes"
+
+## A place in a file named by run output.
+struct Loc
+    path str
+    line int
+    col int
+
+## The digits at the start of `cs` from `i`, as a number, and where they end.
+fn number_at(cs List[char], i int) Range?
+    mut j := i
+    mut n := 0
+    while j < cs.len() and cs[j].is_digit()
+        n = n * 10 + (cs[j].to_digit(10) else 0)
+        j += 1
+    if j == i
+        return none
+    Range(line: n, col: j, end_line: 0, end_col: 0)
+
+## The location in a line of `ail run` or `ail test` output: `FILE:L:C`
+## (traps and failures) or `at L:C` (a failed test, in `path`). A check
+## copy of an unsaved buffer (`FILE.edit-check.ail`) counts as `FILE`.
+fn output_location(text str, path str) Loc?
+    cs := text.chars()
+    for i in 0..cs.len()
+        if cs[i] != ':' or i < 4 or cs[i - 4..i].join("") != ".ail"
+            continue
+        l := number_at(cs, i + 1) else continue
+        mut c := 1
+        if l.col < cs.len() and cs[l.col] == ':'
+            if n := number_at(cs, l.col + 1)
+                c = n.line
+        mut file := cs[..i].join("").trim()
+        if f := file.strip_suffix(".edit-check.ail")
+            file = f
+        return Loc(path: file, line: l.line, col: c)
+    parts := text.split(" at ")
+    if parts.len() > 1
+        tail := parts[parts.len() - 1].chars()
+        l := number_at(tail, 0) else return none
+        if l.col < tail.len() and tail[l.col] == ':'
+            c := number_at(tail, l.col + 1) else return none
+            return Loc(path: path, line: l.line, col: c.line)
+    none
+
+## Moves the caret to `loc`, which is in this editor's file.
+fn Editor.jump_to(mut self, loc Loc)
+    line = (loc.line - 1).max(0).min(lines.len() - 1)
+    set_col((loc.col - 1).max(0).min(cur().len()))
+    selecting = false
+    scroll()
+
+## The location named by pane row `i` of the output pane, if any.
+fn Editor.pane_location(self, i int) Loc?
+    if pane != Text or i < 0 or i >= pane_text.len()
+        return none
+    output_location(pane_text[i], path)
 
 # ---- Tabs ---------------------------------------------------------------
 
@@ -2633,6 +2739,13 @@ fn Workspace.on_event(mut self, ev ui.Event)
                 if kind == "down"
                     click_tab(c)
                 return
+            if kind == "down" and button == "left"
+                ed := eds[active]
+                if loc := ed.pane_location(r - 1 - ed.text_rows() - 1)
+                    if loc.path != ed.path
+                        open(loc.path)
+                        eds[active].jump_to(loc)
+                        return
             eds[active].on_event(Mouse(col: c, row: r - 1, button: button, kind: kind))
         Scroll(_) => eds[active].on_event(ev)
     if eds[active].quit
