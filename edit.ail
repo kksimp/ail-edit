@@ -30,6 +30,9 @@ ERROR_BG := 0x5a1d1d
 WARN_BG := 0x4d4a1d
 SELECT_BG := 0x264f78
 BRACKET_BG := 0x3b514d
+OCCUR_BG := 0x343a40
+ERROR_FG := 0xf48771
+WARN_FG := 0xcca700
 
 UNDO_LIMIT := 200
 INDENT := 4
@@ -474,6 +477,54 @@ fn Editor.move_line(mut self, down bool)
         lines = splice(lines, span.line - 1, span.end_line + 1, mid)
         line -= 1
         anchor_line -= 1
+
+## The word under the cursor when it is worth marking elsewhere: two or
+## more characters, not a keyword or a number; else "".
+fn Editor.word_here(self) str
+    w := word_at() else return ""
+    text := lines[line].slice(w.col, w.end_col)
+    if text.len() < 2 or KEYWORDS.contains(text) or text.chars()[0].is_digit()
+        return ""
+    text
+
+## For each character of `cs`, whether it is in a whole-word occurrence
+## of `word`.
+fn word_marks(cs List[char], word str) List[bool]
+    mut out := List[bool]()
+    for _ in cs
+        out.push(false)
+    if word == ""
+        return out
+    q := word.chars()
+    mut i := 0
+    while i < cs.len()
+        c := find_in(cs, q, i) else break
+        e := c + q.len()
+        if (c == 0 or not is_word(cs[c - 1])) and (e >= cs.len() or not is_word(cs[e]))
+            for k in c..e
+                out[k] = true
+        i = c + 1
+    out
+
+## After typing, a line that now reads `else` or `elif` moves back one level
+## to line up with its `if` (lex.block.1).
+fn Editor.dedent_else(mut self)
+    t := lines[line].trim()
+    if t != "else" and t != "elif"
+        return
+    ind := indent_of(lines[line])
+    if ind < INDENT
+        return
+    mut l := line - 1
+    while l >= 0 and (lines[l].trim() == "" or indent_of(lines[l]) >= ind)
+        l -= 1
+    if l < 0 or indent_of(lines[l]) != ind - INDENT
+        return
+    head := lines[l].trim()
+    if head.starts_with("if ") or head.starts_with("elif ") or head.contains(":= if ")
+        c := col
+        edit(line, 0, line, INDENT, "")
+        set_col(c - INDENT)
 
 ## The bracket matching the one at or just before the cursor, as a
 ## position, searching at most 500 lines away.
@@ -1074,6 +1125,7 @@ fn Editor.render(self) Screen
     gw := gutter_width()
     w := (cols - gw).max(0)
     sel := selection()
+    here := word_here()
     mut brackets := List[Range]()
     if b := bracket_match()
         brackets = [b]
@@ -1099,12 +1151,19 @@ fn Editor.render(self) Screen
             continue
         fgs := line_colors(cs, starts_inside)
         end := cs.len().min(left + w)
+        marks := word_marks(cs, here)
+        mut bgs := List[int]()
+        for k in left..end
+            mut cell := bg
+            if marks[k]
+                cell = OCCUR_BG
+            bgs.push(sel_bg(sel, l, k, diag_bg(diags, l, k, cell)))
         mut i := left
         while i < end
             fg := fgs[i]
-            b := sel_bg(sel, l, i, diag_bg(diags, l, i, bg))
+            b := bgs[i - left]
             mut j := i + 1
-            while j < end and fgs[j] == fg and sel_bg(sel, l, j, diag_bg(diags, l, j, bg)) == b
+            while j < end and fgs[j] == fg and bgs[j - left] == b
                 j += 1
             s.put(r, gw + i - left, cs[i..j].join(""), fg, b)
             i = j
@@ -1114,13 +1173,28 @@ fn Editor.render(self) Screen
         mark_bracket(mut s, b.end_line, b.end_col)
     if completing
         render_popup(mut s)
-    # A diagnostic at the end of a line shows as one marked cell.
+    # A diagnostic at the end of a line shows as one marked cell, and the
+    # first diagnostic of each line shows its message after the line.
+    mut shown := Set[int]()
     for d in diags
         r := d.line - 1 - top
-        if r >= 0 and r < h and d.col - 1 >= lines[d.line - 1].len()
+        if r < 0 or r >= h
+            continue
+        n := lines[d.line - 1].len()
+        if d.col - 1 >= n
             c := gw + d.col - 1 - left
             if c >= gw and c < cols
                 s.put(r, c, " ", FG, diag_bg([d], d.line - 1, d.col - 1, BG))
+        if shown.add(d.line)
+            mut fg := ERROR_FG
+            if d.severity != "error"
+                fg = WARN_FG
+            mut line_bg := BG
+            if d.line - 1 == line
+                line_bg = LINE_BG
+            x := (gw + n - left + 3).max(gw)
+            if x < cols
+                s.put(r, x, "-- {d.message}", fg, line_bg)
     status_row := h
     s.band(status_row, STATUS_BG)
     mut flag := ""
@@ -1275,6 +1349,7 @@ fn Editor.apply(mut self, cmd Command)
                 set_col(col + 1)
             else
                 insert_paired(t)
+            dedent_else()
             if t == "."
                 auto_complete_members()
             elif t == "("
@@ -2192,6 +2267,50 @@ fn fg_at(s Screen, row int, col int) int
         ed.apply(Insert(c))
     assert_eq(ed.message, "fn add(a int, b int) int")
     assert_eq(ed.lines[10], "    add()")
+
+@test fn occurrences_and_inline_messages()
+    mut ed := typed("total := 1\nx := total + subtotal\nprnt(total)", [Go(Right)])
+    ed.cols = 60
+    ds := parse_diags(DIAG_JSON)
+    ed.diags = [Diag(
+        severity: "error",
+        rule: "expr.name.1",
+        line: 3,
+        col: 1,
+        end_line: 3,
+        end_col: 5,
+        message: "unknown name",
+        help: "",
+        fix_title: "",
+        fix: ds[0].fix,
+    )]
+    s := ed.render()
+    mut occ := List[str]()
+    for sp in s.spans
+        if sp.bg == OCCUR_BG
+            occ.push("{sp.row}:{sp.text}")
+    assert_eq(occ, ["0:total", "1:total", "2:total"])
+    assert(s.text[2].ends_with("prnt(total)   -- unknown name"))
+    assert_eq(word_marks("ab abc ab".chars(), "ab"), [
+        true,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+        true,
+        true,
+    ])
+
+@test fn else_lines_up_with_its_if()
+    mut ed := typed("fn f()\n    if a\n        b", [Go(Bottom), Newline])
+    for c in ["e", "l", "s", "e"]
+        ed.apply(Insert(c))
+    assert_eq(ed.lines[3], "    else")
+    assert_eq(ed.col, 8)
+    ed.apply(Newline)
+    assert_eq(ed.lines[4], "        ")
 
 @test fn outline_parse_and_jump()
     items := parse_outline("    1  fn main()\n        ## Doc.\n   12      fn Point.x(self) int\n")
