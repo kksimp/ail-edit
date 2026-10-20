@@ -53,6 +53,7 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 | Ctrl-P | Open a file: type part of its path (letters in order), Up/Down, Enter |
 | Ctrl-Tab, Ctrl-Shift-Tab | Next, previous tab; a click on a tab selects it |
 | Ctrl-W | Close the tab; with unsaved changes, press it twice |
+| F2 | Rename the name under the cursor: through `ail api` for declarations, else every whole word; the prompt shows the count, Enter applies (ADR 0244) |
 | Ctrl-+ (or Ctrl-=), Ctrl--, Ctrl-0 | Larger, smaller, default font size (ADR 0243) |
 | Mouse | Click places the caret, drag or Shift-click selects, the wheel scrolls, a click on a diagnostic jumps to it |
 
