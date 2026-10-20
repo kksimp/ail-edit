@@ -21,6 +21,8 @@ STATUS_FG := 0xffffff
 ## The font sizes Ctrl-+ and Ctrl-- step through: those std.ui has (std.ui.15).
 FONT_SIZES := [10, 12, 13, 14, 15, 18, 20, 24, 26, 28, 30, 36, 40]
 PANE_BG := 0x252526
+## The file tree's width in columns (Ctrl-B).
+TREE_W := 28
 KEYWORD_FG := 0x569cd6
 TYPE_FG := 0x4ec9b0
 STRING_FG := 0xce9178
@@ -149,6 +151,8 @@ struct Editor
     locals List[Completion]
     member_of str
     rename RenamePlan
+    ## Successful saves, so the workspace can check the other tabs.
+    saves int
     comp_sel int
 
 fn Editor.new(path str, text str, cols int, rows int) Editor
@@ -189,6 +193,7 @@ fn Editor.new(path str, text str, cols int, rows int) Editor
         locals: [],
         member_of: "",
         rename: RenamePlan(name: "", at: [], semantic: false),
+        saves: 0,
         comp_sel: 0,
         selecting: false,
         anchor_line: 0,
@@ -1961,6 +1966,7 @@ fn Editor.save(mut self)
         message = "can't save {err.path}: {err.kind}"
         return
     dirty = false
+    saves += 1
     check()
     message = "saved; {message}"
 
@@ -2782,6 +2788,55 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     ws.on_event(press("x"))
     assert(ws.eds[0].lines[1].contains("x"))
 
+@test fn the_file_tree_lists_ail_files_first_and_opens_them()
+    d := "edit-tree-test.tmp"
+    fs.make_dir("{d}/sub") else err
+        assert(false)
+    for f in ["b.ail", "a.txt", ".hidden", "sub/c.ail"]
+        fs.write_text("{d}/{f}", "fn main()\n") else err
+            assert(false)
+    mut ws := Workspace.new(typed("x", []))
+    ws.on_event(Resize(cols: 80, rows: 20))
+    ws.tree_root = d
+    ws.on_event(key_event("ctrl+b"))
+    assert(ws.tree_open and ws.tree_focus)
+    assert_eq(ws.eds[0].cols, 80 - TREE_W - 1)
+    mut names := List[str]()
+    for t in ws.tree
+        names.push(t.name)
+    assert_eq(names, ["b.ail", "sub/", "a.txt"])
+    assert(ws.render().text[1].starts_with(" b.ail"))
+    ws.on_event(press("down"))
+    ws.on_event(press("enter"))
+    assert_eq(ws.tree.len(), 4)
+    assert_eq(ws.tree[2].path, "{d}/sub/c.ail")
+    ws.on_event(press("down"))
+    ws.on_event(press("left"))
+    assert_eq(ws.tree_sel, 1)
+    ws.on_event(press("down"))
+    ws.on_event(press("enter"))
+    assert_eq(ws.eds.len(), 2)
+    assert_eq(ws.eds[1].path, "{d}/sub/c.ail")
+    assert(not ws.tree_focus)
+    assert_eq(ws.eds[1].cols, 80 - TREE_W - 1)
+    # Typing goes to the editor; Ctrl-B focuses the tree, then hides it.
+    ws.on_event(press("x"))
+    assert_eq(ws.eds[1].lines[0], "xfn main()")
+    ws.on_event(key_event("ctrl+b"))
+    assert(ws.tree_focus)
+    ws.on_event(key_event("ctrl+b"))
+    assert(not ws.tree_open)
+    assert_eq(ws.eds[0].cols, 80)
+    for f in ["b.ail", "a.txt", ".hidden", "sub/c.ail", "sub", ""]
+        fs.remove("{d}/{f}") else err
+            assert(false)
+
+@test fn tab_labels_count_diagnostics()
+    mut ws := Workspace.new(typed("x", []))
+    ws.eds[0].path = "a.ail"
+    ws.eds[0].diags = parse_diags(DIAG_JSON)
+    assert_eq(ws.tab_labels(), [" a.ail E1 "])
+
 @test fn quitting_asks_once_for_unsaved_tabs()
     mut ws := Workspace.new(typed("", keys("x")))
     ws.on_event(Close)
@@ -3150,6 +3205,12 @@ fn key_rows() List[KeyRow]
             "Command palette: every command here with its key; type part of its name, Up/Down, Enter runs it",
         ),
         key_row(
+            "Ctrl-B",
+            "File tree",
+            "ctrl+b",
+            "Show the file tree (`.ail` files first) and focus it; again hides it. Up/Down select, Enter or Right opens a file or expands a directory, Left collapses, Esc returns to the editor; a click opens (ADR 0293)",
+        ),
+        key_row(
             "Ctrl-Shift-F",
             "Search the project",
             "ctrl+shift+f",
@@ -3231,6 +3292,7 @@ enum WsKey
     Palette
     Search
     NextHit
+    Tree
     Zoom(key str)
 
 fn workspace_key(k str, ctrl bool, shift bool) WsKey?
@@ -3250,6 +3312,7 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
             "f" | "F" => Search
             _ => none
     match k
+        "b" | "B" => Tree
         "w" | "W" => CloseTab
         "q" | "Q" => QuitAll
         "p" | "P" => OpenFile
@@ -3313,6 +3376,15 @@ struct Workspace
     hit_sel int
     hit_top int
     browsing bool
+    ## Ctrl-B: the file tree, whether it has the keys, and which directories
+    ## are expanded.
+    ## The directory the tree shows: the working directory.
+    tree_root str
+    tree_open bool
+    tree_focus bool
+    tree List[TreeRow]
+    tree_sel int
+    expanded Set[str]
     pick_sel int
     quit_armed bool
     quit bool
@@ -3336,6 +3408,12 @@ fn Workspace.new(ed Editor) Workspace
         hit_sel: 0,
         hit_top: 0,
         browsing: false,
+        tree_root: ".",
+        tree_open: false,
+        tree_focus: false,
+        tree: [],
+        tree_sel: 0,
+        expanded: Set[str](),
         pick_sel: 0,
         quit_armed: false,
         quit: false,
@@ -3360,7 +3438,7 @@ fn Workspace.open(mut self, path str)
             message = "can't open {err.path}: {err.kind}"
             return
         text = got
-    mut ed := Editor.new(path, text, cols, (rows - 1).max(1))
+    mut ed := Editor.new(path, text, (cols - left()).max(10), (rows - 1).max(1))
     ed.index()
     eds.push(ed)
     active = eds.len() - 1
@@ -3404,6 +3482,10 @@ fn Workspace.on_event(mut self, ev ui.Event)
         if k := pressed(ev)
             if hits_key(k)
                 return
+    if tree_focus
+        if k := pressed(ev)
+            if tree_key(k)
+                return
     # A message stays up through a resize, which a font change causes.
     resize := match ev
         Resize(_, _) => true
@@ -3425,8 +3507,12 @@ fn Workspace.on_event(mut self, ev ui.Event)
                     Zoom(z) => zoom(z)
                     Search => start_search()
                     NextHit => next_hit()
+                    Tree => toggle_tree()
                 return
+            saves := eds[active].saves
             eds[active].on_event(ev)
+            if eds[active].saves != saves
+                check_other_tabs()
         Resize(_, _) => on_resize(ev)
         Close => quit_all()
         Mouse(c, r, button, kind) =>
@@ -3434,6 +3520,11 @@ fn Workspace.on_event(mut self, ev ui.Event)
                 if kind == "down"
                     click_tab(c)
                 return
+            if c < left()
+                if kind == "down" and button == "left"
+                    click_tree(r)
+                return
+            tree_focus = false
             if kind == "down" and button == "left"
                 ed := eds[active]
                 if loc := ed.pane_location(r - 1 - ed.text_rows() - 1)
@@ -3441,10 +3532,17 @@ fn Workspace.on_event(mut self, ev ui.Event)
                         open(loc.path)
                         eds[active].jump_to(loc)
                         return
-            eds[active].on_event(Mouse(col: c, row: r - 1, button: button, kind: kind))
+            eds[active].on_event(Mouse(col: c - left(), row: r - 1, button: button, kind: kind))
         Scroll(_) => eds[active].on_event(ev)
     if eds[active].quit
         close_tab()
+
+## After a save, checks every other open tab too, since a change can break
+## a file that uses it; each tab's label shows its counts (ADR 0293).
+fn Workspace.check_other_tabs(mut self)
+    for i in 0..eds.len()
+        if i != active
+            eds[i].run(Check)
 
 ## Ctrl-+ (or Ctrl-=) and Ctrl-- step the font size; Ctrl-0 resets it.
 fn Workspace.zoom(mut self, k str)
@@ -3470,6 +3568,12 @@ fn Workspace.tab_labels(self) List[str]
         mut flag := ""
         if ed.dirty
             flag = " *"
+        e := ed.diag_count("error")
+        w := ed.diag_count("warning")
+        if e > 0
+            flag = "{flag} E{e}"
+        if w > 0
+            flag = "{flag} W{w}"
         out.push(" {base_name(ed.path)}{flag} ")
     out
 
@@ -3559,9 +3663,157 @@ fn Workspace.on_resize(mut self, ev ui.Event)
         Resize(c, r) =>
             cols = c
             rows = r
-            for mut ed in eds
-                ed.apply(Command.Resize(cols: c, rows: (r - 1).max(1)))
+            resize_tabs()
         Key(_, _, _, _) | Close | Mouse(_, _, _, _) | Scroll(_) => return
+
+# ---- The file tree (Ctrl-B) -----------------------------------------------
+
+## A row of the file tree: a file or directory under the working directory.
+struct TreeRow
+    path str
+    name str
+    depth int
+    dir bool
+
+## The tree's width in columns, the separator included; 0 when closed.
+fn Workspace.left(self) int
+    if not tree_open
+        return 0
+    TREE_W + 1
+
+## The entries of `dir` as rows: `.ail` files first, then directories, then
+## other files, each group by name; hidden and build directories skipped.
+## Expanded directories list their entries below them.
+fn Workspace.tree_rows(self, dir str, depth int) List[TreeRow]
+    names := fs.list_dir(dir) else return List[TreeRow]()
+    mut ail := List[TreeRow]()
+    mut dirs := List[TreeRow]()
+    mut rest := List[TreeRow]()
+    for n in names.sorted()
+        if n.starts_with(".") or n == "target"
+            continue
+        mut path := n
+        if dir != "."
+            path = "{dir}/{n}"
+        if sub := fs.list_dir(path)
+            if sub.len() >= 0
+                dirs.push(TreeRow(path: path, name: "{n}/", depth: depth, dir: true))
+        elif n.ends_with(".ail")
+            ail.push(TreeRow(path: path, name: n, depth: depth, dir: false))
+        else
+            rest.push(TreeRow(path: path, name: n, depth: depth, dir: false))
+    mut out := ail
+    for d in dirs
+        out.push(d)
+        if expanded.contains(d.path)
+            out.extend(tree_rows(d.path, depth + 1))
+    out.extend(rest)
+    out
+
+## Ctrl-B: opens the tree and focuses it; focused, closes it; open but not
+## focused, focuses it.
+fn Workspace.toggle_tree(mut self)
+    if tree_open and tree_focus
+        tree_open = false
+        tree_focus = false
+    else
+        if not tree_open
+            tree = tree_rows(tree_root, 0)
+            tree_sel = 0
+        tree_open = true
+        tree_focus = true
+    resize_tabs()
+
+## Gives every tab the columns the tree leaves.
+fn Workspace.resize_tabs(mut self)
+    c := (cols - left()).max(10)
+    r := (rows - 1).max(1)
+    for mut ed in eds
+        ed.apply(Command.Resize(cols: c, rows: r))
+
+## Enter or a click on a row: a directory expands or collapses, a file
+## opens in a tab and takes the focus.
+fn Workspace.activate_tree_row(mut self)
+    if tree_sel >= tree.len()
+        return
+    t := tree[tree_sel]
+    if t.dir
+        if expanded.contains(t.path)
+            expanded.remove(t.path)
+        else
+            expanded.add(t.path)
+        tree = tree_rows(tree_root, 0)
+        return
+    open(t.path)
+    tree_focus = false
+
+## Keys while the tree has the focus: Up/Down select, Enter or Right opens,
+## Left collapses (or goes to the parent), Escape gives the focus back.
+## Other keys go to the editor. True if `k` was used here.
+fn Workspace.tree_key(mut self, k str) bool
+    if k == "up"
+        tree_sel = (tree_sel - 1).max(0)
+    elif k == "down"
+        tree_sel = (tree_sel + 1).min((tree.len() - 1).max(0))
+    elif k == "enter" or k == "right"
+        activate_tree_row()
+    elif k == "left"
+        if tree_sel < tree.len()
+            t := tree[tree_sel]
+            if t.dir and expanded.contains(t.path)
+                activate_tree_row()
+            else
+                mut i := tree_sel
+                while i > 0 and tree[i].depth >= t.depth
+                    i -= 1
+                if tree[i].depth < t.depth
+                    tree_sel = i
+    elif k == "escape"
+        tree_focus = false
+    else
+        tree_focus = false
+        return false
+    true
+
+## Draws the tree down the left side, the selection kept in view.
+fn Workspace.render_tree(self, mut s Screen)
+    n := rows - 1
+    top := (tree_sel - n + 1).max(0)
+    for r in 1..rows
+        s.put(r, 0, " ".repeat(TREE_W), FG, PANE_BG)
+        s.put(r, TREE_W, " ", FG, BG)
+        i := top + r - 1
+        mut text := ""
+        if i < tree.len()
+            t := tree[i]
+            mut bg := PANE_BG
+            if i == tree_sel
+                bg = LINE_BG
+                if tree_focus
+                    bg = SELECT_BG
+            mut fg := FG
+            if t.dir
+                fg = KEYWORD_FG
+            elif not t.name.ends_with(".ail")
+                fg = GUTTER_FG
+            indent := "  ".repeat(t.depth)
+            cs := "{indent}{t.name}".chars()
+            text = cs[..cs.len().min(TREE_W - 1)].join("")
+            s.put(r, 0, " {text}".pad_right(TREE_W, ' '), fg, bg)
+        shown := " {text}".pad_right(TREE_W + 1, ' ')
+        s.text[r] = "{shown}{s.text[r]}"
+    if tree_focus
+        s.cursor_row = 1 + tree_sel - top
+        s.cursor_col = 1
+
+## A click in the tree selects that row and activates it.
+fn Workspace.click_tree(mut self, r int)
+    top := (tree_sel - (rows - 1) + 1).max(0)
+    i := top + r - 1
+    if i >= 0 and i < tree.len()
+        tree_sel = i
+        tree_focus = true
+        activate_tree_row()
 
 # ---- Project search (Ctrl-Shift-F) ----------------------------------------
 
@@ -3707,8 +3959,9 @@ fn Workspace.render_search(self, mut s Screen)
         ed := eds[active]
         r := 1 + ed.text_rows() + 2 + hit_sel - hit_top
         if r < rows and ed.pane == Text
-            s.band(r, SELECT_BG)
-            s.put(r, 1, ed.pane_text[1 + hit_sel - hit_top], FG, SELECT_BG)
+            x := left()
+            s.put(r, x, " ".repeat(cols - x), FG, SELECT_BG)
+            s.put(r, x + 1, ed.pane_text[1 + hit_sel - hit_top], FG, SELECT_BG)
 
 # ---- The file picker (Ctrl-P) ---------------------------------------------
 
@@ -3807,15 +4060,18 @@ fn Workspace.render(self) Screen
     if message != ""
         s.put(0, x + 1, message, STATUS_FG, PANE_BG)
     inner := eds[active].render()
+    x0 := left()
     for sp in inner.spans
-        s.spans.push(Span(row: sp.row + 1, col: sp.col, text: sp.text, fg: sp.fg, bg: sp.bg))
+        s.spans.push(Span(row: sp.row + 1, col: sp.col + x0, text: sp.text, fg: sp.fg, bg: sp.bg))
     for r in 0..inner.text.len()
         if r + 1 < rows
             s.text[r + 1] = inner.text[r]
     s.text[0] = labels.join(" ")
     if inner.cursor_row >= 0
         s.cursor_row = inner.cursor_row + 1
-        s.cursor_col = inner.cursor_col
+        s.cursor_col = inner.cursor_col + x0
+    if tree_open
+        render_tree(mut s)
     render_search(mut s)
     if picking
         render_picker(mut s)
@@ -3873,7 +4129,7 @@ fn Workspace.on_window_event(mut self, ev ui.Event, m ui.Modifiers)
     shift_click := match ev
         Mouse(c, r, button, kind) =>
             if m.shift and not picking and button == "left" and kind == "down" and r > 0
-                eds[active].extend_to(c, r - 1)
+                eds[active].extend_to(c - left(), r - 1)
                 true
             else
                 false
