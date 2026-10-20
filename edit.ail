@@ -187,6 +187,8 @@ struct Editor
     missed Set[int]
     ## Successful saves, so the workspace can check the other tabs.
     saves int
+    ## The last tests-on-save result for the status line, or "" (ADR 0354).
+    tests str
     comp_sel int
 
 fn Editor.new(path str, text str, cols int, rows int) Editor
@@ -229,6 +231,7 @@ fn Editor.new(path str, text str, cols int, rows int) Editor
         rename: RenamePlan(name: "", at: [], semantic: false),
         missed: Set[int](),
         saves: 0,
+        tests: "",
         comp_sel: 0,
         selecting: false,
         anchor_line: 0,
@@ -1464,11 +1467,13 @@ fn Editor.render(self) Screen
     mut flag := ""
     if dirty
         flag = " *"
-    counts := "{diag_count("error")} errors, {diag_count("warning")} warnings"
+    mut counts := "{diag_count("error")} errors, {diag_count("warning")} warnings"
+    if tests != ""
+        counts = "{counts}, {tests}"
     mut left_part := " {path}{flag}  Ln {line + 1}, Col {col + 1}  {counts}"
-    # A long path (a temporary directory on macOS) would push the message
-    # off the line: show the file's name instead.
-    if message != "" and left_part.chars().len() + 4 + message.chars().len() > cols
+    # A long path (a temporary directory on macOS) would push the counts or
+    # the message off the line: show the file's name instead.
+    if left_part.chars().len() + 4 + message.chars().len() > cols
         left_part = " {base_name(path)}{flag}  Ln {line + 1}, Col {col + 1}  {counts}"
     s.put(status_row, 0, left_part, STATUS_FG, STATUS_BG)
     if message != ""
@@ -1855,6 +1860,19 @@ fn Editor.replace_all(mut self)
         set_col(col.min(cur().len()))
     prompt = NoPrompt
     message = "replaced {count}"
+
+## Replaces `q` by `by` on the lines `at` (0-based) as one undo step.
+fn Editor.replace_on(mut self, q str, by str, at List[int])
+    mut out := lines
+    mut changed := false
+    for l in at
+        if l < out.len() and out[l].contains(q)
+            out[l] = out[l].replace(q, by)
+            changed = true
+    if changed
+        snapshot()
+        lines = out
+        set_col(col.min(cur().len()))
 
 ## Where `q` occurs in `cs` at or after `start`, or `none`.
 fn find_in(cs List[char], q List[char], start int) int?
@@ -3292,6 +3310,33 @@ fn Editor.run_extra(mut self, x Extra)
     r := ail_on_buffer(words) else return
     show_output(words[0], r)
 
+## Runs the buffer's tests with `ail test --json` and keeps the counts for
+## the status line, leaving the pane as it is (ADR 0354).
+fn Editor.test_quietly(mut self)
+    r := ail_on_buffer(["test", "--json"]) else return
+    tests = test_counts(r.out)
+
+## `tests P/N` from `ail test --json` output, or `tests: didn't run` when
+## it has no summary (the program doesn't check).
+fn test_counts(out str) str
+    for l in out.lines()
+        j := parse_json(l) else continue
+        if j.get("summary") != none
+            passed := jint(j, "passed")
+            failed := jint(j, "failed")
+            if failed > 0
+                return "tests {failed} FAILED of {passed + failed}"
+            return "tests {passed}/{passed} pass"
+    "tests: didn't run"
+
+@test fn test_counts_read_the_summary()
+    assert_eq(
+        test_counts("\{\"test\":\"a\"}\n\{\"summary\":true,\"passed\":2,\"failed\":1}\n"),
+        "tests 1 FAILED of 3",
+    )
+    assert_eq(test_counts("\{\"summary\":true,\"passed\":2,\"failed\":0}"), "tests 2/2 pass")
+    assert_eq(test_counts(""), "tests: didn't run")
+
 ## Shows a run's output in the pane: a header, then standard output and
 ## standard error. When it doesn't fit, the end is kept, since traps and
 ## failures come last. A click on a line with a location jumps there.
@@ -3523,7 +3568,7 @@ fn key_rows() List[KeyRow]
             "Ctrl-Shift-M",
             "Problems",
             "ctrl+shift+m",
-            "Every diagnostic of the open tabs' programs (`ail check --json`, modules included, buffers as edited), errors first; Up/Down, Enter jumps, opening the file (ADR 0339)",
+            "Every diagnostic of the open tabs' programs (`ail check --json`, modules included, buffers as edited), errors first; Up/Down, Enter jumps, opening the file (ADR 0339); while shown it refreshes on save and 500 ms after typing stops (ADR 0353)",
         ),
         key_row(
             "Ctrl-Shift-I",
@@ -3550,10 +3595,16 @@ fn key_rows() List[KeyRow]
             "Show the file tree (`.ail` files first) and focus it; again hides it. Up/Down select, Enter or Right opens a file or expands a directory, Left collapses, Esc returns to the editor; a click opens (ADR 0293)",
         ),
         key_row(
+            "Ctrl-Shift-U",
+            "Tests on save",
+            "ctrl+shift+u",
+            "Toggle running the tab's tests (`ail test --json`) after each save; the status line shows the pass and fail counts (ADR 0354)",
+        ),
+        key_row(
             "Ctrl-Shift-H",
             "Replace in files",
             "ctrl+shift+h",
-            "Type what to find, Enter, the replacement, Enter: every changed line of the project's `.ail` files is previewed old -> new; Ctrl-Enter applies it to the buffers (files open as tabs, nothing saved, Ctrl-Z undoes per tab), Esc cancels (ADR 0339)",
+            "Type what to find, Enter, the replacement, Enter: every changed line of the project's `.ail` files is previewed old -> new; Space skips or accepts a row, A accepts all; Ctrl-Enter applies the accepted rows to the buffers (files open as tabs, nothing saved, Ctrl-Z undoes per tab), Esc cancels (ADRs 0339, 0353)",
         ),
         key_row(
             "Ctrl-Shift-F",
@@ -3651,6 +3702,7 @@ enum WsKey
     Card
     Problems
     ReplaceInFiles
+    TestOnSave
     Zoom(key str)
 
 fn workspace_key(k str, ctrl bool, shift bool) WsKey?
@@ -3676,6 +3728,7 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
             "i" | "I" => Card
             "m" | "M" => Problems
             "h" | "H" => ReplaceInFiles
+            "u" | "U" => TestOnSave
             _ => none
     match k
         "b" | "B" => Tree
@@ -3745,6 +3798,8 @@ struct Workspace
     ## the replacement, 3 the preview is showing.
     repl_step int
     repl_with str
+    ## Preview rows the person skipped (ADR 0354).
+    repl_skip Set[int]
     hits List[Hit]
     hits_title str
     hit_sel int
@@ -3769,6 +3824,12 @@ struct Workspace
     theme str
     pal Palette
     remember bool
+    ## The problems list refreshes while shown (ADR 0353): after a save,
+    ## and 500 ms after the last edit (`typed_at`, in ms; 0 when none).
+    live_problems bool
+    ## Ctrl-Shift-U: run the tab's tests after each save (ADR 0354).
+    test_on_save bool
+    typed_at int
 
 fn Workspace.new(ed Editor) Workspace
     Workspace(
@@ -3785,6 +3846,7 @@ fn Workspace.new(ed Editor) Workspace
         search: "",
         repl_step: 0,
         repl_with: "",
+        repl_skip: Set[int](),
         hits: [],
         hits_title: "",
         hit_sel: 0,
@@ -3803,6 +3865,9 @@ fn Workspace.new(ed Editor) Workspace
         theme: "dark",
         pal: palette(Map[str, int]()),
         remember: false,
+        live_problems: false,
+        test_on_save: false,
+        typed_at: 0,
     )
 
 ## The file name a tab shows: the path after its last `/`.
@@ -3880,6 +3945,10 @@ fn Workspace.on_event(mut self, ev ui.Event)
         if ev == Key(key: "enter", ctrl: true, alt: false, shift: false)
             apply_replace()
             return
+        if k := pressed(ev)
+            if k == " " or k == "a" or k == "A"
+                mark_rows(k != " ")
+                return
     if browsing
         if k := pressed(ev)
             if hits_key(k)
@@ -3918,6 +3987,12 @@ fn Workspace.on_event(mut self, ev ui.Event)
                     Card => card_view()
                     Problems => problems()
                     ReplaceInFiles => start_replace()
+                    TestOnSave =>
+                        test_on_save = not test_on_save
+                        if test_on_save
+                            eds[active].test_quietly()
+                        else
+                            eds[active].tests = ""
                 return
             saves := eds[active].saves
             eds[active].on_event(ev)
@@ -3925,6 +4000,12 @@ fn Workspace.on_event(mut self, ev ui.Event)
                 check_other_tabs()
                 if hits_title.starts_with("program card")
                     card_view()
+                if live_problems
+                    refresh_problems()
+                if test_on_save
+                    eds[active].test_quietly()
+            elif live_problems and eds[active].dirty
+                typed_at = time.now_ms()
         Resize(_, _) => on_resize(ev)
         Close => quit_all()
         Mouse(c, r, button, kind) =>
@@ -4335,6 +4416,7 @@ fn Workspace.show_list(mut self, title str, found List[Hit])
     hit_sel = 0
     hit_top = 0
     browsing = true
+    live_problems = false
     fill_hits()
 
 ## Writes the visible part of the hits into the active tab's pane, keeping
@@ -4363,6 +4445,9 @@ fn Workspace.jump_to_hit(mut self)
 
 ## Keys while the hits are focused; others go to the editor.
 fn Workspace.hits_key(mut self, k str) bool
+    if hits.len() == 0
+        browsing = false
+        return false
     if k == "up"
         hit_sel = (hit_sel - 1).max(0)
     elif k == "down"
@@ -4682,40 +4767,66 @@ fn Workspace.preview_replace(mut self)
         message = "no match for `{search}`"
         return
     mut preview := List[Hit]()
-    mut touched := Set[str]()
     for h in found
-        touched.add(h.loc.path)
         old := h.text.split(": ")[1..].join(": ")
         preview.push(Hit(
             loc: h.loc,
-            text: "{h.loc.path}:{h.loc.line}:{h.loc.col}: {old} -> {old.replace(search, repl_with)}",
+            text: "[x] {h.loc.path}:{h.loc.line}:{h.loc.col}: {old} -> {old.replace(search, repl_with)}",
         ))
-    show_list(
-        "replace `{search}` with `{repl_with}`: {found.len()} lines in {touched.len()} files; Ctrl-Enter applies",
-        preview,
-    )
+    repl_skip = Set[int]()
+    show_list("", preview)
     repl_step = 3
+    retitle_replace()
 
-## Ctrl-Enter on the preview: replaces in every previewed file's buffer,
-## opening it as a tab; nothing is saved, and Ctrl-Z undoes each tab.
+## The preview's title: what, and how many rows and files are accepted.
+fn Workspace.retitle_replace(mut self)
+    mut touched := Set[str]()
+    for i in 0..hits.len()
+        if not repl_skip.contains(i)
+            touched.add(hits[i].loc.path)
+    n := hits.len() - repl_skip.len()
+    hits_title = "replace `{search}` with `{repl_with}`: {n} of {hits.len()} lines, {touched.len()} files; Space skips, A all, Ctrl-Enter applies"
+    fill_hits()
+
+## Space on a preview row: skip it, or accept it again; `all` (A) accepts
+## every row.
+fn Workspace.mark_rows(mut self, all bool)
+    if all
+        repl_skip = Set[int]()
+    elif repl_skip.contains(hit_sel)
+        repl_skip.remove(hit_sel)
+    else
+        repl_skip.add(hit_sel)
+    for i in 0..hits.len()
+        mut mark := "[x] "
+        if repl_skip.contains(i)
+            mark = "[ ] "
+        hits[i].text = "{mark}{hits[i].text.chars()[4..].join("")}"
+    retitle_replace()
+
+## Ctrl-Enter on the preview: replaces on the accepted rows' lines in
+## each file's buffer, opening it as a tab; nothing is saved, and Ctrl-Z
+## undoes each tab.
 fn Workspace.apply_replace(mut self)
     back := eds[active].path
     mut done := Set[str]()
-    for h in hits
-        p := h.loc.path
-        if done.contains(p)
+    for i in 0..hits.len()
+        p := hits[i].loc.path
+        if repl_skip.contains(i) or done.contains(p)
             continue
         done.add(p)
+        mut at_lines := List[int]()
+        for j in i..hits.len()
+            if hits[j].loc.path == p and not repl_skip.contains(j)
+                at_lines.push(hits[j].loc.line - 1)
         mut at := -1
-        for i in 0..eds.len()
-            if eds[i].path == p or eds[i].path == "./{p}"
-                at = i
+        for e in 0..eds.len()
+            if eds[e].path == p or eds[e].path == "./{p}"
+                at = e
         if at < 0
             open(p)
             at = active
-        eds[at].query = search
-        eds[at].input = repl_with
-        eds[at].replace_all()
+        eds[at].replace_on(search, repl_with, at_lines)
     open(back)
     browsing = false
     repl_step = 0
@@ -4748,10 +4859,9 @@ fn problem_hits(root str, err str, mut seen Set[str]) List[Hit]
         hits.push(Hit(loc: at, text: row))
     hits
 
-## Ctrl-Shift-M: every diagnostic of the programs of the open tabs (each
-## checked whole, modules included, buffers as edited), errors first, as
-## a list Enter jumps from (ADR 0339).
-fn Workspace.problems(mut self)
+## Every diagnostic of the programs of the open tabs (each checked whole,
+## modules included, buffers as edited), errors first.
+fn Workspace.collect_problems(mut self) List[Hit]
     mut seen := Set[str]()
     mut errors := List[Hit]()
     mut others := List[Hit]()
@@ -4762,12 +4872,59 @@ fn Workspace.problems(mut self)
                 errors.push(h)
             else
                 others.push(h)
-    if errors.len() + others.len() == 0
+    errors.extend(others)
+    errors
+
+## The list's title: the counts by severity.
+fn problems_title(found List[Hit]) str
+    mut errors := 0
+    for h in found
+        if h.text.contains(": error[")
+            errors += 1
+    "problems: {errors} errors, {found.len() - errors} others"
+
+## What identifies a diagnostic across edits: its file and message, not
+## its position, which moves as lines are added above it.
+fn problem_key(h Hit) str
+    "{h.loc.path} {h.text.split(": ")[1..].join(": ")}"
+
+## Ctrl-Shift-M: the problems as a list Enter jumps from (ADR 0339),
+## kept live while shown (ADR 0353).
+fn Workspace.problems(mut self)
+    found := collect_problems()
+    if found.len() == 0
         message = "no problems in {eds.len()} open file(s)"
         return
-    mut found := errors
-    found.extend(others)
-    show_list("problems: {errors.len()} errors, {others.len()} others", found)
+    show_list(problems_title(found), found)
+    live_problems = true
+    typed_at = 0
+
+## Rebuilds the shown problems list from the buffers, keeping the
+## selection on the same diagnostic when it still exists and the focus
+## where it is (ADR 0353).
+fn Workspace.refresh_problems(mut self)
+    typed_at = 0
+    if eds[active].pane != Text or not hits_title.starts_with("problems")
+        live_problems = false
+        return
+    mut keep := ""
+    if hit_sel < hits.len()
+        keep = problem_key(hits[hit_sel])
+    found := collect_problems()
+    hits = found
+    hits_title = problems_title(found)
+    mut sel := hit_sel.min(found.len() - 1).max(0)
+    for i in 0..found.len()
+        if problem_key(found[i]) == keep
+            sel = i
+    hit_sel = sel
+    fill_hits()
+
+## Called while the window waits: refreshes the live problems list once
+## 500 ms have passed since the last edit.
+fn Workspace.idle(mut self, now int)
+    if live_problems and typed_at > 0 and now - typed_at >= 500
+        refresh_problems()
 
 @test fn sessions_round_trip()
     mut a := Editor.new("src/a,b.ail", "x\nyz", 40, 10)
@@ -4963,6 +5120,14 @@ fn Workspace.window(mut self) ! ui.UiError
             w.set_font_size(font)
             font = w.font_size()
         draw_themed(mut w, render(), pal)
+        if live_problems and typed_at > 0
+            # Wait for an event without blocking, so the idle refresh runs.
+            if ev := w.poll_event()
+                on_window_event(ev, w.modifiers())
+            else
+                idle(time.now_ms())
+                time.sleep_ms(25)
+            continue
         on_window_event(w.next_event(), w.modifiers())
         while not quit
             ev := w.poll_event() else break
@@ -5014,7 +5179,7 @@ fn font_flag(flags List[str]) int
 ## `--check`, `--outline`, `--explain`; `--at=LINE:COL` (1-based) moves the
 ## cursor; `--type=TEXT` types; `--key=SPEC` presses a key such as `f2`,
 ## `enter`, `ctrl+space` or `shift+f5` (`ctrl+`, `alt+`, `shift+`
-## prefixes). Keys go through the workspace, as in the window.
+## prefixes); `--idle` acts as if the window had waited a second. Keys go through the workspace, as in the window.
 fn print_screen(ed Editor, flags List[str])
     mut ws := Workspace.new(ed)
     for f in flags
@@ -5036,6 +5201,8 @@ fn print_screen(ed Editor, flags List[str])
                 ws.on_event(press("{c}"))
         elif spec := f.strip_prefix("--key=")
             ws.on_event(key_event(spec))
+        elif f == "--idle"
+            ws.idle(time.now_ms() + 1000)
     for row in ws.render().text
         print(row)
 
