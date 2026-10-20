@@ -68,12 +68,13 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | F6 | Run the buffer's tests (`ail test`), shown like F5 |
 | Shift-F5 | Run with every trace event (`ail run --trace=all`): calls with arguments, returns, contracts, and a trap with each frame's locals; Up/Down, Enter jumps to an event (ADR 0312) |
 | Ctrl-Shift-E | Each function's error set and every return, `?` and `else` that fails or handles, from `ail check --errors`; Up/Down, Enter jumps (ADR 0312) |
-| Ctrl-Shift-M | Every diagnostic of the open tabs' programs (`ail check --json`, modules included, buffers as edited), errors first; Up/Down, Enter jumps, opening the file (ADR 0339) |
+| Ctrl-Shift-M | Every diagnostic of the open tabs' programs (`ail check --json`, modules included, buffers as edited), errors first; Up/Down, Enter jumps, opening the file (ADR 0339); while shown it refreshes on save and 500 ms after typing stops (ADR 0353) |
 | Ctrl-Shift-I | The program card (`ail api --card`) of the file's program, its modules included: entry point, tests, and every declaration with effects, contracts and error sets; Up/Down, Enter jumps to a declaration; refreshed on save (ADR 0331) |
 | Ctrl-Shift-C | Run the tests with line coverage (`ail test --coverage=lines`) and mark the lines they never ran in the gutter, until the next edit (ADR 0313) |
 | Ctrl-Shift-P | Command palette: every command here with its key; type part of its name, Up/Down, Enter runs it |
 | Ctrl-B | Show the file tree (`.ail` files first) and focus it; again hides it. Up/Down select, Enter or Right opens a file or expands a directory, Left collapses, Esc returns to the editor; a click opens (ADR 0293) |
-| Ctrl-Shift-H | Type what to find, Enter, the replacement, Enter: every changed line of the project's `.ail` files is previewed old -> new; Ctrl-Enter applies it to the buffers (files open as tabs, nothing saved, Ctrl-Z undoes per tab), Esc cancels (ADR 0339) |
+| Ctrl-Shift-U | Toggle running the tab's tests (`ail test --json`) after each save; the status line shows the pass and fail counts (ADR 0354) |
+| Ctrl-Shift-H | Type what to find, Enter, the replacement, Enter: every changed line of the project's `.ail` files is previewed old -> new; Space skips or accepts a row, A accepts all; Ctrl-Enter applies the accepted rows to the buffers (files open as tabs, nothing saved, Ctrl-Z undoes per tab), Esc cancels (ADRs 0339, 0353) |
 | Ctrl-Shift-F | Search every `.ail` file under the directory (open tabs as edited); the matches fill the pane, Up/Down select, Enter jumps, Esc closes (ADR 0292) |
 | F4 | Jump to the next match of the last project search |
 | Ctrl-P | Open a file: type part of its path (letters in order), Up/Down, Enter |
