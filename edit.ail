@@ -1802,7 +1802,7 @@ fn go_or_select(d Dir, shift bool) Command
 
 ## The command for a key from `std.ui` (`Event.Key`), or `none`.
 fn key_command(key str, ctrl bool, alt bool, shift bool) Command?
-    if ctrl and shift and (key == "f" or key == "F")
+    if alt and shift and (key == "f" or key == "F")
         return Format
     if ctrl
         return match key
@@ -2479,7 +2479,7 @@ ADD_REFS_JSON := "\{\"api\":1,\"symbol\":\"fn:add\",\"refs\":[\{\"file\":\"t.ail
     ed.apply(Newline)
     assert_eq(ed.line, 1)
     assert_eq(key_command("g", true, false, false), GoToLine)
-    assert_eq(key_command("f", true, false, true), Format)
+    assert_eq(key_command("f", false, true, true), Format)
 
 ## The color of the last run drawn over a cell.
 fn fg_at(s Screen, row int, col int) int
@@ -2712,6 +2712,44 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     ws.on_event(Key(key: "w", ctrl: true, alt: false, shift: false))
     assert(ws.quit)
 
+@test fn every_palette_row_names_a_key_that_does_something()
+    mut names := Set[str]()
+    for r in key_rows()
+        if r.spec == ""
+            continue
+        assert(not names.contains(r.name))
+        names.add(r.name)
+        match key_event(r.spec)
+            Key(k, ctrl, alt, shift) =>
+                assert(
+                    key_command(
+                        k,
+                        ctrl,
+                        alt,
+                        shift,
+                    ) != none or extra_key(k, ctrl, alt, shift) != none or workspace_key(k, ctrl, shift) != none,
+                )
+            Resize(_, _) | Close | Mouse(_, _, _, _) | Scroll(_) => assert(false)
+    assert_eq(key_table()[0], "| Key | Does |")
+
+@test fn the_palette_filters_and_runs_a_command()
+    mut ws := Workspace.new(typed("x := 1", []))
+    ws.on_event(key_event("ctrl+shift+p"))
+    assert(ws.picking and ws.commanding)
+    for k in ["t", "o", "g", "c"]
+        ws.on_event(press(k))
+    assert_eq(ws.choices().len(), 1)
+    assert(ws.render().text[1].contains("command: togc"))
+    ws.on_event(press("enter"))
+    assert(not ws.picking)
+    assert_eq(ws.eds[0].lines[0], "# x := 1")
+    # Escape closes it; Ctrl-P is the file picker again.
+    ws.on_event(key_event("ctrl+shift+p"))
+    ws.on_event(press("escape"))
+    assert(not ws.picking and not ws.commanding)
+    ws.on_event(key_event("ctrl+p"))
+    assert(ws.picking and not ws.commanding)
+
 @test fn quitting_asks_once_for_unsaved_tabs()
     mut ws := Workspace.new(typed("", keys("x")))
     ws.on_event(Close)
@@ -2933,6 +2971,268 @@ fn Editor.pane_location(self, i int) Loc?
         return none
     output_location(pane_text[i], path)
 
+# ---- Keys and the command palette (Ctrl-Shift-P) ------------------------
+
+## One row of the key table: the keys as the README shows them, the
+## command's name in the palette, the key it presses (`ctrl+shift+f`
+## form; empty for rows that aren't one command), and what it does. The
+## README's table is `--keys` output and the palette is this list, so the
+## two can't drift (ADR 0291).
+struct KeyRow
+    keys str
+    name str
+    spec str
+    does str
+
+fn key_row(shown str, name str, spec str, does str) KeyRow
+    KeyRow(keys: shown, name: name, spec: spec, does: does)
+
+## Every key, in the README's order.
+fn key_rows() List[KeyRow]
+    [
+        key_row(
+            "Arrows, Home, End, PageUp, PageDown",
+            "",
+            "",
+            "Move. Home goes to the indentation, then column 1",
+        ),
+        key_row("Ctrl-Left, Ctrl-Right", "", "", "Move by word"),
+        key_row(
+            "Shift with any move",
+            "",
+            "",
+            "Select; typing, Backspace or Delete replaces the selection",
+        ),
+        key_row("Ctrl-Home", "Go to the start of the file", "ctrl+home", "Start of the file"),
+        key_row("Ctrl-End", "Go to the end of the file", "ctrl+end", "End of the file"),
+        key_row("Ctrl-A", "Select all", "ctrl+a", "Select all"),
+        key_row("Ctrl-C", "Copy", "ctrl+c", "Copy (in the window, also to the system clipboard)"),
+        key_row("Ctrl-X", "Cut", "ctrl+x", "Cut (in the window, also to the system clipboard)"),
+        key_row("Ctrl-V", "Paste", "ctrl+v", "Paste (in the window, from the system clipboard)"),
+        key_row(
+            "Enter",
+            "",
+            "",
+            "New line, indented like this one, one level deeper after a block opener (`fn`, `if`, `match`, `x => `, `else err`, ...)",
+        ),
+        key_row("Tab", "", "", "Spaces to the next multiple of 4 (AIL has no tabs, lex.block.1)"),
+        key_row("Backspace", "", "", "In indentation, removes one level"),
+        key_row(
+            "`(` `[` `\{` `\"`",
+            "",
+            "",
+            "Insert the closing pair; typing the closer steps over it; Backspace in an empty pair deletes both",
+        ),
+        key_row(
+            "Ctrl-Space",
+            "Complete",
+            "ctrl+space",
+            "Complete the word: after `.`, fields, variants and methods; otherwise locals, the file's declarations (with signatures), keywords and words in the buffer. Up/Down choose, Enter or Tab accepts, Escape closes",
+        ),
+        key_row(
+            "F12",
+            "Go to definition",
+            "f12",
+            "Go to the definition of the name under the cursor, locals included (`ail api --refs`, else the `--symbols` index)",
+        ),
+        key_row(
+            "Ctrl-I",
+            "Show type",
+            "ctrl+i",
+            "Show the type of the expression under the cursor, and the signature and doc comment of what it names (`ail api --type`)",
+        ),
+        key_row(
+            "F2",
+            "Rename",
+            "f2",
+            "Rename the name under the cursor: through `ail api --refs` (declarations and locals), else every whole word; the prompt shows the count and how they were found, Enter applies, Ctrl-Z undoes (ADR 0244)",
+        ),
+        key_row(
+            "Alt-Shift-F",
+            "Format",
+            "alt+shift+f",
+            "Format with `ail fmt` (also on save, when the program has no errors)",
+        ),
+        key_row(
+            "Ctrl-/",
+            "Toggle comment",
+            "ctrl+/",
+            "Comment or uncomment the line or selected lines",
+        ),
+        key_row("Ctrl-D", "Duplicate line", "ctrl+d", "Duplicate the line or selected lines"),
+        key_row("Alt-Up", "Move line up", "alt+up", "Move the line or selected lines up"),
+        key_row("Alt-Down", "Move line down", "alt+down", "Move the line or selected lines down"),
+        key_row("Ctrl-G", "Go to line", "ctrl+g", "Go to a line number"),
+        key_row("Ctrl-Z", "Undo", "ctrl+z", "Undo"),
+        key_row("Ctrl-Y", "Redo", "ctrl+y", "Redo"),
+        key_row(
+            "Ctrl-F",
+            "Find",
+            "ctrl+f",
+            "Find as you type; Enter or F3 finds the next match, Escape stops",
+        ),
+        key_row("F3", "Find next", "f3", "Find the next match"),
+        key_row(
+            "Ctrl-R",
+            "Replace",
+            "ctrl+r",
+            "Replace: after Ctrl-F, type the replacement; Enter replaces this match and finds the next, Ctrl-Enter replaces all (one undo step)",
+        ),
+        key_row("Ctrl-S", "Save", "ctrl+s", "Format, save, then check"),
+        key_row(
+            "Ctrl-K",
+            "Check",
+            "ctrl+k",
+            "Check: `ail check --json`; spans are marked, the pane lists them",
+        ),
+        key_row(
+            "Ctrl-.",
+            "Apply fix",
+            "ctrl+.",
+            "Apply the first fix of the diagnostic under the cursor",
+        ),
+        key_row(
+            "F1",
+            "Explain diagnostic",
+            "f1",
+            "Explain the diagnostic under the cursor (`ail explain RULE`)",
+        ),
+        key_row(
+            "Ctrl-O",
+            "Outline",
+            "ctrl+o",
+            "Outline (`ail api --text`); Up/Down select, Enter jumps",
+        ),
+        key_row("Escape", "", "", "Close the pane; stop selecting or finding"),
+        key_row(
+            "F5",
+            "Run file",
+            "f5",
+            "Run the buffer (`ail run`); the output fills the pane (its end, when long), Esc closes it, and a click on a `FILE:LINE:COL` or `at LINE:COL` jumps there, opening the file in a tab if needed",
+        ),
+        key_row("F6", "Test file", "f6", "Run the buffer's tests (`ail test`), shown like F5"),
+        key_row(
+            "Ctrl-Shift-P",
+            "",
+            "",
+            "Command palette: every command here with its key; type part of its name, Up/Down, Enter runs it",
+        ),
+        key_row(
+            "Ctrl-P",
+            "Open file",
+            "ctrl+p",
+            "Open a file: type part of its path (letters in order), Up/Down, Enter",
+        ),
+        key_row("Ctrl-Tab", "Next tab", "ctrl+tab", "Next tab; a click on a tab selects it"),
+        key_row("Ctrl-Shift-Tab", "Previous tab", "ctrl+shift+tab", "Previous tab"),
+        key_row(
+            "Ctrl-W",
+            "Close tab",
+            "ctrl+w",
+            "Close the tab; with unsaved changes, press it twice",
+        ),
+        key_row("Ctrl-+ (or Ctrl-=)", "Larger font", "ctrl+=", "Larger font (ADR 0243)"),
+        key_row("Ctrl--", "Smaller font", "ctrl+-", "Smaller font"),
+        key_row("Ctrl-0", "Default font size", "ctrl+0", "Default font size"),
+        key_row(
+            "Ctrl-Q",
+            "Quit",
+            "ctrl+q",
+            "Quit; with unsaved changes in any tab, press it twice. Closing the window counts as Ctrl-Q",
+        ),
+        key_row(
+            "Mouse",
+            "",
+            "",
+            "Click places the caret, drag or Shift-click selects, the wheel scrolls, a click on a diagnostic or an output location jumps to it",
+        ),
+    ]
+
+## The README's key table (`--keys`).
+fn key_table() List[str]
+    mut out := ["| Key | Does |", "|---|---|"]
+    for r in key_rows()
+        out.push("| {r.keys} | {r.does} |")
+    out
+
+## The key event a spec such as `ctrl+shift+f`, `f2` or `ctrl+space` names.
+fn key_event(spec str) ui.Event
+    mut parts := spec.split("+")
+    mut key := parts.pop() else ""
+    if key == "space"
+        key = " "
+    Key(
+        key: key,
+        ctrl: parts.contains("ctrl"),
+        alt: parts.contains("alt"),
+        shift: parts.contains("shift"),
+    )
+
+## Keys the workspace handles itself, before the active tab sees them.
+enum WsKey
+    NextTab
+    PreviousTab
+    CloseTab
+    QuitAll
+    OpenFile
+    Palette
+    Zoom(key str)
+
+fn workspace_key(k str, ctrl bool, shift bool) WsKey?
+    if not ctrl
+        return none
+    if k == "tab"
+        if shift
+            return PreviousTab
+        return NextTab
+    if k == "=" or k == "+" or k == "-" or k == "0"
+        return Zoom(k)
+    if shift
+        return match k
+            "p" | "P" => Palette
+            _ => none
+    match k
+        "w" | "W" => CloseTab
+        "q" | "Q" => QuitAll
+        "p" | "P" => OpenFile
+        _ => none
+
+## The palette's rows matching what is typed: those that run a command.
+fn Workspace.commands(self) List[KeyRow]
+    mut out := List[KeyRow]()
+    for r in key_rows()
+        if r.spec != "" and fuzzy(r.name, query)
+            out.push(r)
+    out
+
+fn Workspace.start_palette(mut self)
+    picking = true
+    commanding = true
+    query = ""
+    pick_sel = 0
+
+## What the open list shows: commands with their keys, or file paths.
+fn Workspace.choices(self) List[str]
+    if not commanding
+        return matches()
+    mut out := List[str]()
+    for r in commands()
+        out.push("{r.name.pad_right(28, ' ')} {r.keys}")
+    out
+
+## Enter in the open list: runs the command, or opens the file.
+fn Workspace.choose(mut self)
+    picking = false
+    if commanding
+        found := commands()
+        commanding = false
+        if pick_sel < found.len()
+            on_event(key_event(found[pick_sel].spec))
+        return
+    found := matches()
+    if pick_sel < found.len()
+        open(found[pick_sel])
+
 # ---- Tabs ---------------------------------------------------------------
 
 ## Several files, one tab each, and the Ctrl-P file picker. The editor in
@@ -2943,6 +3243,8 @@ struct Workspace
     cols int
     rows int
     picking bool
+    ## The open list is the command palette, not the file picker.
+    commanding bool
     query str
     files List[str]
     pick_sel int
@@ -2959,6 +3261,7 @@ fn Workspace.new(ed Editor) Workspace
         cols: ed.cols,
         rows: ed.rows + 1,
         picking: false,
+        commanding: false,
         query: "",
         files: [],
         pick_sel: 0,
@@ -3031,24 +3334,16 @@ fn Workspace.on_event(mut self, ev ui.Event)
         message = ""
     match ev
         Key(k, ctrl, _, shift) =>
-            if ctrl and k == "tab"
+            if wk := workspace_key(k, ctrl, shift)
                 n := eds.len()
-                if shift
-                    active = (active + n - 1) % n
-                else
-                    active = (active + 1) % n
-                return
-            if ctrl and (k == "w" or k == "W")
-                close_tab()
-                return
-            if ctrl and (k == "q" or k == "Q")
-                quit_all()
-                return
-            if ctrl and (k == "p" or k == "P")
-                start_picking()
-                return
-            if ctrl and (k == "=" or k == "+" or k == "-" or k == "0")
-                zoom(k)
+                match wk
+                    NextTab => active = (active + 1) % n
+                    PreviousTab => active = (active + n - 1) % n
+                    CloseTab => close_tab()
+                    QuitAll => quit_all()
+                    OpenFile => start_picking()
+                    Palette => start_palette()
+                    Zoom(z) => zoom(z)
                 return
             eds[active].on_event(ev)
         Resize(_, _) => on_resize(ev)
@@ -3231,6 +3526,7 @@ fn Workspace.matches(self) List[str]
 
 fn Workspace.start_picking(mut self)
     picking = true
+    commanding = false
     query = ""
     pick_sel = 0
     files = list_files(".", 4, 2000)
@@ -3242,11 +3538,10 @@ fn Workspace.pick_event(mut self, ev ui.Event)
                 return
             if k == "escape"
                 picking = false
+                commanding = false
             elif k == "enter"
-                found := matches()
-                if pick_sel < found.len()
-                    open(found[pick_sel])
-                picking = false
+                choose()
+                return
             elif k == "up"
                 pick_sel = (pick_sel - 1).max(0)
             elif k == "down"
@@ -3264,7 +3559,7 @@ fn Workspace.pick_event(mut self, ev ui.Event)
             picking = false
             on_event(ev)
         Mouse(_, _, _, _) | Scroll(_) => return
-    pick_sel = pick_sel.min((matches().len() - 1).max(0))
+    pick_sel = pick_sel.min((choices().len() - 1).max(0))
 
 ## The screen: the tab bar, the active editor below it, and the picker over
 ## it when open.
@@ -3300,10 +3595,13 @@ fn Workspace.render(self) Screen
 fn Workspace.render_picker(self, mut s Screen)
     w := (cols - 4).min(70).max(10)
     x := (cols - w) / 2
-    found := matches()
+    found := choices()
     shown := found.len().min(12)
+    mut head := " open: "
+    if commanding
+        head = " command: "
     s.put(1, x, " ".repeat(w), FG, SELECT_BG)
-    s.put(1, x, " open: {query}", STATUS_FG, SELECT_BG)
+    s.put(1, x, "{head}{query}", STATUS_FG, SELECT_BG)
     for i in 0..shown
         mut bg := PANE_BG
         if i == pick_sel
@@ -3311,9 +3609,9 @@ fn Workspace.render_picker(self, mut s Screen)
         s.put(2 + i, x, " ".repeat(w), FG, bg)
         s.put(2 + i, x + 1, found[i], FG, bg)
     if found.len() == 0
-        s.put(2, x, " no file matches".pad_right(w, ' '), GUTTER_FG, PANE_BG)
+        s.put(2, x, " nothing matches".pad_right(w, ' '), GUTTER_FG, PANE_BG)
     s.cursor_row = 1
-    s.cursor_col = x + 7 + query.chars().len()
+    s.cursor_col = x + head.chars().len() + query.chars().len()
 
 ## The event loop: wait for an event, apply it and any others already
 ## pending, then draw once. The title shows the file and its unsaved mark.
@@ -3427,7 +3725,11 @@ fn bench(mut ed Editor)
 fn main() !
     args := env.args()
     if args.len() == 0
-        print("usage: ail run tools/edit/edit.ail [--font N] [--print [--check] [--outline] [--explain] [--at=L:C] [--type=TEXT] [--key=KEY]...] FILE")
+        print("usage: ail run tools/edit/edit.ail [--font N] [--keys] [--print [--check] [--outline] [--explain] [--at=L:C] [--type=TEXT] [--key=KEY]...] FILE")
+        return
+    if args.contains("--keys")
+        for l in key_table()
+            print(l)
         return
     path := args[args.len() - 1]
     mut text := ""

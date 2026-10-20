@@ -14,31 +14,42 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 ./ail run tools/edit/edit.ail --print --outline FILE   # ...with the outline
 ./ail run tools/edit/edit.ail --print --at=11:15 --key=ctrl+i FILE  # move, press keys, type (--type=TEXT)
 ./ail run tools/edit/edit.ail --bench FILE             # time a render and an edit
+./ail run tools/edit/edit.ail --keys                   # the key table below
 ./ail test tools/edit/edit.ail                         # the headless tests
 ```
 
 ## Keys
+
+The table is the output of `--keys`, and a test checks that they match.
+The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 
 | Key | Does |
 |---|---|
 | Arrows, Home, End, PageUp, PageDown | Move. Home goes to the indentation, then column 1 |
 | Ctrl-Left, Ctrl-Right | Move by word |
 | Shift with any move | Select; typing, Backspace or Delete replaces the selection |
-| Ctrl-A, Ctrl-C, Ctrl-X, Ctrl-V | Select all, copy, cut, paste (in the window, also the system clipboard) |
-| Ctrl-Home, Ctrl-End | Start, end of the file |
+| Ctrl-Home | Start of the file |
+| Ctrl-End | End of the file |
+| Ctrl-A | Select all |
+| Ctrl-C | Copy (in the window, also to the system clipboard) |
+| Ctrl-X | Cut (in the window, also to the system clipboard) |
+| Ctrl-V | Paste (in the window, from the system clipboard) |
 | Enter | New line, indented like this one, one level deeper after a block opener (`fn`, `if`, `match`, `x => `, `else err`, ...) |
 | Tab | Spaces to the next multiple of 4 (AIL has no tabs, lex.block.1) |
 | Backspace | In indentation, removes one level |
-| Ctrl-Space | Complete the word: after `.`, fields, variants and methods; otherwise the file's declarations (with signatures), keywords and words in the buffer. Up/Down choose, Enter or Tab accepts, Escape closes |
+| `(` `[` `{` `"` | Insert the closing pair; typing the closer steps over it; Backspace in an empty pair deletes both |
+| Ctrl-Space | Complete the word: after `.`, fields, variants and methods; otherwise locals, the file's declarations (with signatures), keywords and words in the buffer. Up/Down choose, Enter or Tab accepts, Escape closes |
 | F12 | Go to the definition of the name under the cursor, locals included (`ail api --refs`, else the `--symbols` index) |
 | Ctrl-I | Show the type of the expression under the cursor, and the signature and doc comment of what it names (`ail api --type`) |
-| Ctrl-Shift-F | Format with `ail fmt` (also on save, when the program has no errors) |
-| `(` `[` `{` `"` | Insert the closing pair; typing the closer steps over it; Backspace in an empty pair deletes both |
+| F2 | Rename the name under the cursor: through `ail api --refs` (declarations and locals), else every whole word; the prompt shows the count and how they were found, Enter applies, Ctrl-Z undoes (ADR 0244) |
+| Alt-Shift-F | Format with `ail fmt` (also on save, when the program has no errors) |
 | Ctrl-/ | Comment or uncomment the line or selected lines |
 | Ctrl-D | Duplicate the line or selected lines |
-| Alt-Up, Alt-Down | Move the line or selected lines |
+| Alt-Up | Move the line or selected lines up |
+| Alt-Down | Move the line or selected lines down |
 | Ctrl-G | Go to a line number |
-| Ctrl-Z, Ctrl-Y | Undo, redo |
+| Ctrl-Z | Undo |
+| Ctrl-Y | Redo |
 | Ctrl-F | Find as you type; Enter or F3 finds the next match, Escape stops |
 | F3 | Find the next match |
 | Ctrl-R | Replace: after Ctrl-F, type the replacement; Enter replaces this match and finds the next, Ctrl-Enter replaces all (one undo step) |
@@ -47,15 +58,19 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 | Ctrl-. | Apply the first fix of the diagnostic under the cursor |
 | F1 | Explain the diagnostic under the cursor (`ail explain RULE`) |
 | Ctrl-O | Outline (`ail api --text`); Up/Down select, Enter jumps |
-| Escape | Close the explanation or the outline; stop selecting or finding |
-| Ctrl-Q | Quit; with unsaved changes in any tab, press it twice. Closing the window counts as Ctrl-Q |
-| F5, F6 | Run the buffer (`ail run`), or its tests (`ail test`); the output fills the pane (its end, when long), Esc closes it, and a click on a `FILE:LINE:COL` or `at LINE:COL` jumps there, opening the file in a tab if needed |
+| Escape | Close the pane; stop selecting or finding |
+| F5 | Run the buffer (`ail run`); the output fills the pane (its end, when long), Esc closes it, and a click on a `FILE:LINE:COL` or `at LINE:COL` jumps there, opening the file in a tab if needed |
+| F6 | Run the buffer's tests (`ail test`), shown like F5 |
+| Ctrl-Shift-P | Command palette: every command here with its key; type part of its name, Up/Down, Enter runs it |
 | Ctrl-P | Open a file: type part of its path (letters in order), Up/Down, Enter |
-| Ctrl-Tab, Ctrl-Shift-Tab | Next, previous tab; a click on a tab selects it |
+| Ctrl-Tab | Next tab; a click on a tab selects it |
+| Ctrl-Shift-Tab | Previous tab |
 | Ctrl-W | Close the tab; with unsaved changes, press it twice |
-| F2 | Rename the name under the cursor: through `ail api --refs` (declarations and locals), else every whole word; the prompt shows the count and how they were found, Enter applies, Ctrl-Z undoes (ADR 0244) |
-| Ctrl-+ (or Ctrl-=), Ctrl--, Ctrl-0 | Larger, smaller, default font size (ADR 0243) |
-| Mouse | Click places the caret, drag or Shift-click selects, the wheel scrolls, a click on a diagnostic jumps to it |
+| Ctrl-+ (or Ctrl-=) | Larger font (ADR 0243) |
+| Ctrl-- | Smaller font |
+| Ctrl-0 | Default font size |
+| Ctrl-Q | Quit; with unsaved changes in any tab, press it twice. Closing the window counts as Ctrl-Q |
+| Mouse | Click places the caret, drag or Shift-click selects, the wheel scrolls, a click on a diagnostic or an output location jumps to it |
 
 ## macOS sanity check
 
@@ -103,7 +118,7 @@ imports resolve as they will on save.
   `ail api --symbols` output), quit confirmation.
 - Window front end on `std.ui` (ADR 0177), tested on Linux under Xvfb:
   typing, Ctrl-K, Ctrl-. fixes, Ctrl-S, Ctrl-Space completion with
-  signatures, member completion after `.`, F12, Ctrl-Shift-F, Ctrl-/,
+  signatures, member completion after `.`, F12, Alt-Shift-F, Ctrl-/,
   bracket pairing, drag selection, wheel, Ctrl-C to and from the system
   clipboard, Ctrl-P opening a second tab, F5 running it (ADR 0241), Ctrl-Q.
   Without a display, `edit.ail FILE` prints one screen instead.
