@@ -1,0 +1,87 @@
+## The editor's color themes (ADR 0295). A theme maps a color kind of the
+## editor to 0xRRGGBB; a kind it leaves out keeps the dark default. The
+## kinds are those `edit.ail` names in `FG_KINDS` and `BG_KINDS`.
+
+## The theme names, in the order Ctrl-Shift-T cycles through them.
+pub NAMES := ["dark", "light", "solarized", "high-contrast"]
+
+## The theme called `name`, or `none` for an unknown name.
+pub fn named(name str) Map[str, int]?
+    if name == "dark"
+        return Map[str, int]()
+    if name == "light"
+        return LIGHT
+    if name == "solarized"
+        return SOLARIZED
+    if name == "high-contrast"
+        return HIGH_CONTRAST
+    none
+
+LIGHT := {
+    "bg": 0xffffff,
+    "fg": 0x1f1f1f,
+    "line_bg": 0xf0f0f0,
+    "gutter_fg": 0x237893,
+    "status_bg": 0x007acc,
+    "status_fg": 0xffffff,
+    "pane_bg": 0xf3f3f3,
+    "keyword": 0x0000ff,
+    "type": 0x267f99,
+    "string": 0xa31515,
+    "number": 0x098658,
+    "comment": 0x008000,
+    "attr": 0xaf00db,
+    "error_bg": 0xf8d7da,
+    "warn_bg": 0xfff3cd,
+    "select_bg": 0xadd6ff,
+    "bracket_bg": 0xc8e6df,
+    "occur_bg": 0xe4e4e4,
+    "error_fg": 0xcd3131,
+    "warn_fg": 0x9a6700,
+}
+
+SOLARIZED := {
+    "bg": 0x002b36,
+    "fg": 0x93a1a1,
+    "line_bg": 0x073642,
+    "gutter_fg": 0x586e75,
+    "status_bg": 0x268bd2,
+    "status_fg": 0xfdf6e3,
+    "pane_bg": 0x073642,
+    "keyword": 0x859900,
+    "type": 0xb58900,
+    "string": 0x2aa198,
+    "number": 0xd33682,
+    "comment": 0x657b83,
+    "attr": 0x6c71c4,
+    "error_bg": 0x4a1c1c,
+    "warn_bg": 0x3d3a10,
+    "select_bg": 0x274642,
+    "bracket_bg": 0x1e4d4d,
+    "occur_bg": 0x0e3a46,
+    "error_fg": 0xdc322f,
+    "warn_fg": 0xcb4b16,
+}
+
+HIGH_CONTRAST := {
+    "bg": 0x000000,
+    "fg": 0xffffff,
+    "line_bg": 0x1a1a1a,
+    "gutter_fg": 0xffffff,
+    "status_bg": 0x1aebff,
+    "status_fg": 0x000000,
+    "pane_bg": 0x0c0c0c,
+    "keyword": 0x4fc1ff,
+    "type": 0x4ec9b0,
+    "string": 0xffa07a,
+    "number": 0xb5cea8,
+    "comment": 0x7ca668,
+    "attr": 0xd7a6ff,
+    "error_bg": 0x6b0000,
+    "warn_bg": 0x4d4a00,
+    "select_bg": 0x0f4a85,
+    "bracket_bg": 0x00594d,
+    "occur_bg": 0x333333,
+    "error_fg": 0xff6b6b,
+    "warn_fg": 0xffd700,
+}
