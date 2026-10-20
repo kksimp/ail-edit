@@ -8,6 +8,7 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 
 ```sh
 ./ail run tools/edit/edit.ail FILE                     # the editor, in a window
+./ail run tools/edit/edit.ail --font 15 FILE           # ...with a smaller font (10 to 40)
 ./ail run tools/edit/edit.ail --print FILE             # print one screen as text
 ./ail run tools/edit/edit.ail --print --check FILE     # ...after Ctrl-K
 ./ail run tools/edit/edit.ail --print --outline FILE   # ...with the outline
@@ -51,6 +52,7 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 | Ctrl-P | Open a file: type part of its path (letters in order), Up/Down, Enter |
 | Ctrl-Tab, Ctrl-Shift-Tab | Next, previous tab; a click on a tab selects it |
 | Ctrl-W | Close the tab; with unsaved changes, press it twice |
+| Ctrl-+ (or Ctrl-=), Ctrl--, Ctrl-0 | Larger, smaller, default font size (ADR 0243) |
 | Mouse | Click places the caret, drag or Shift-click selects, the wheel scrolls, a click on a diagnostic jumps to it |
 
 The `ail` it runs is `$AIL`, else `./ail` when started from the repository

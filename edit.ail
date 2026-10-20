@@ -18,6 +18,8 @@ LINE_BG := 0x2a2a2a
 GUTTER_FG := 0x858585
 STATUS_BG := 0x007acc
 STATUS_FG := 0xffffff
+## The font sizes Ctrl-+ and Ctrl-- step through: those std.ui has (std.ui.15).
+FONT_SIZES := [10, 12, 13, 14, 15, 18, 20, 24, 26, 28, 30, 36, 40]
 PANE_BG := 0x252526
 KEYWORD_FG := 0x569cd6
 TYPE_FG := 0x4ec9b0
@@ -2407,6 +2409,19 @@ fn fg_at(s Screen, row int, col int) int
     ws.on_event(Close)
     assert(ws.quit)
 
+@test fn ctrl_plus_and_minus_step_the_font_size()
+    mut ws := Workspace.new(typed("", []))
+    ws.on_event(Key(key: "=", ctrl: true, alt: false, shift: false))
+    assert_eq(ws.font, 24)
+    ws.on_event(Key(key: "-", ctrl: true, alt: false, shift: false))
+    ws.on_event(Key(key: "-", ctrl: true, alt: false, shift: false))
+    assert_eq(ws.font, 18)
+    ws.on_event(Key(key: "0", ctrl: true, alt: false, shift: false))
+    assert_eq(ws.font, 20)
+    assert_eq(ws.eds[0].lines, [""])
+    assert_eq(font_flag(["--font", "13"]), 13)
+    assert_eq(font_flag(["--font"]), 20)
+
 # ---- Front ends ---------------------------------------------------------
 
 # ---- Window front end (std.ui) -----------------------------------------
@@ -2555,6 +2570,8 @@ struct Workspace
     quit_armed bool
     quit bool
     message str
+    ## The font size, as a cell height in pixels (std.ui.15).
+    font int
 
 fn Workspace.new(ed Editor) Workspace
     Workspace(
@@ -2569,6 +2586,7 @@ fn Workspace.new(ed Editor) Workspace
         quit_armed: false,
         quit: false,
         message: "",
+        font: 20,
     )
 
 ## The file name a tab shows: the path after its last `/`.
@@ -2625,7 +2643,11 @@ fn Workspace.on_event(mut self, ev ui.Event)
     if picking
         pick_event(ev)
         return
-    if ev != Close
+    # A message stays up through a resize, which a font change causes.
+    resize := match ev
+        Resize(_, _) => true
+        Key(_, _, _, _) | Close | Mouse(_, _, _, _) | Scroll(_) => false
+    if ev != Close and not resize
         quit_armed = false
         message = ""
     match ev
@@ -2646,6 +2668,9 @@ fn Workspace.on_event(mut self, ev ui.Event)
             if ctrl and (k == "p" or k == "P")
                 start_picking()
                 return
+            if ctrl and (k == "=" or k == "+" or k == "-" or k == "0")
+                zoom(k)
+                return
             eds[active].on_event(ev)
         Resize(c, r) =>
             cols = c
@@ -2662,6 +2687,23 @@ fn Workspace.on_event(mut self, ev ui.Event)
         Scroll(_) => eds[active].on_event(ev)
     if eds[active].quit
         close_tab()
+
+## Ctrl-+ (or Ctrl-=) and Ctrl-- step the font size; Ctrl-0 resets it.
+fn Workspace.zoom(mut self, k str)
+    if k == "0"
+        font = 20
+        return
+    mut at := FONT_SIZES.len() - 1
+    for i in 0..FONT_SIZES.len()
+        if FONT_SIZES[i] >= font
+            at = i
+            break
+    if k == "-"
+        at = (at - 1).max(0)
+    elif FONT_SIZES[at] == font
+        at = (at + 1).min(FONT_SIZES.len() - 1)
+    font = FONT_SIZES[at]
+    message = "font size {font}"
 
 ## The columns each tab's label covers on the tab bar.
 fn Workspace.tab_labels(self) List[str]
@@ -2826,6 +2868,9 @@ fn Workspace.window(mut self) ! ui.UiError
         if t != title
             w.set_title(t)
             title = t
+        if font != w.font_size()
+            w.set_font_size(font)
+            font = w.font_size()
         draw(mut w, render())
         on_window_event(w.next_event(), w.modifiers())
         while not quit
@@ -2851,9 +2896,17 @@ fn Workspace.on_window_event(mut self, ev ui.Event, m ui.Modifiers)
 fn window_main(mut ed Editor, flags List[str])
     ed.index()
     mut ws := Workspace.new(ed)
+    ws.font = font_flag(flags)
     ws.window() else err
         print("edit: no window ({err.kind}: {err.message}); printing the screen instead")
         print_screen(mut ed, flags)
+
+## `--font N`: the font size to start with; 20 when absent or not a number.
+fn font_flag(flags List[str]) int
+    at := flags.index_of("--font") else return 20
+    if at + 1 >= flags.len()
+        return 20
+    flags[at + 1].to_int() else 20
 
 ## `--print`: render one screen to standard output instead of opening a
 ## window, after the commands named by `--check`, `--outline`, `--explain`.
@@ -2890,7 +2943,7 @@ fn bench(mut ed Editor)
 fn main() !
     args := env.args()
     if args.len() == 0
-        print("usage: ail run tools/edit/edit.ail [--print [--check] [--outline] [--explain]] FILE")
+        print("usage: ail run tools/edit/edit.ail [--font N] [--print [--check] [--outline] [--explain]] FILE")
         return
     path := args[args.len() - 1]
     mut text := ""
