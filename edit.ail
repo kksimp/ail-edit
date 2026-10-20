@@ -1471,9 +1471,9 @@ fn Editor.render(self) Screen
     if tests != ""
         counts = "{counts}, {tests}"
     mut left_part := " {path}{flag}  Ln {line + 1}, Col {col + 1}  {counts}"
-    # A long path (a temporary directory on macOS) would push the message
-    # off the line: show the file's name instead.
-    if message != "" and left_part.chars().len() + 4 + message.chars().len() > cols
+    # A long path (a temporary directory on macOS) would push the counts or
+    # the message off the line: show the file's name instead.
+    if left_part.chars().len() + 4 + message.chars().len() > cols
         left_part = " {base_name(path)}{flag}  Ln {line + 1}, Col {col + 1}  {counts}"
     s.put(status_row, 0, left_part, STATUS_FG, STATUS_BG)
     if message != ""
