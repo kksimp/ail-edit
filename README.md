@@ -41,7 +41,7 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | `(` `[` `{` `"` | Insert the closing pair; typing the closer steps over it; Backspace in an empty pair deletes both |
 | Ctrl-Space | Complete the word: after `.`, fields, variants and methods; otherwise locals, the file's declarations (with signatures), keywords and words in the buffer. Up/Down choose, Enter or Tab accepts, Escape closes |
 | F12 | Go to the definition of the name under the cursor, locals included (`ail api --refs`, else the `--symbols` index) |
-| Ctrl-I | Show the type of the expression under the cursor, and the signature and doc comment of what it names (`ail api --type`) |
+| Ctrl-I | Info on the name under the cursor: its type (`ail api --type`), signature, contracts, effects, error set, doc comment and number of uses (`--refs`) (ADR 0312) |
 | F2 | Rename the name under the cursor: through `ail api --refs` (declarations and locals), else every whole word; the prompt shows the count and how they were found, Enter applies, Ctrl-Z undoes (ADR 0244) |
 | Alt-Shift-F | Format with `ail fmt` (also on save, when the program has no errors) |
 | Ctrl-/ | Comment or uncomment the line or selected lines |
@@ -62,6 +62,9 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Escape | Close the pane; stop selecting or finding |
 | F5 | Run the buffer (`ail run`); the output fills the pane (its end, when long), Esc closes it, and a click on a `FILE:LINE:COL` or `at LINE:COL` jumps there, opening the file in a tab if needed |
 | F6 | Run the buffer's tests (`ail test`), shown like F5 |
+| Shift-F5 | Run with every trace event (`ail run --trace=all`): calls with arguments, returns, contracts, and a trap with each frame's locals; Up/Down, Enter jumps to an event (ADR 0312) |
+| Ctrl-Shift-E | Each function's error set and every return, `?` and `else` that fails or handles, from `ail check --errors`; Up/Down, Enter jumps (ADR 0312) |
+| Ctrl-Shift-C | Run the tests with line coverage (`ail test --coverage=lines`) and mark the lines they never ran in the gutter, until the next edit (ADR 0313) |
 | Ctrl-Shift-P | Command palette: every command here with its key; type part of its name, Up/Down, Enter runs it |
 | Ctrl-B | Show the file tree (`.ail` files first) and focus it; again hides it. Up/Down select, Enter or Right opens a file or expands a directory, Left collapses, Esc returns to the editor; a click opens (ADR 0293) |
 | Ctrl-Shift-F | Search every `.ail` file under the directory (open tabs as edited); the matches fill the pane, Up/Down select, Enter jumps, Esc closes (ADR 0292) |
@@ -76,29 +79,6 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-Shift-T | Next theme: dark, light, solarized, high-contrast; remembered for the next start |
 | Ctrl-Q | Quit; with unsaved changes in any tab, press it twice. Closing the window counts as Ctrl-Q |
 | Mouse | Click places the caret, drag or Shift-click selects, the wheel scrolls, a click on a diagnostic or an output location jumps to it |
-
-## Themes
-
-`dark` (the default), `light`, `solarized` and `high-contrast` live in
-[themes/themes.ail](themes/themes.ail) as maps from a color kind to
-`0xRRGGBB` (ADR 0295): `bg`, `fg`, `line_bg`, `gutter_fg`, `status_bg`,
-`status_fg`, `pane_bg`, `keyword`, `type`, `string`, `number`, `comment`,
-`attr`, `error_bg`, `warn_bg`, `select_bg`, `bracket_bg`, `occur_bg`,
-`error_fg` and `warn_fg`. A kind a theme leaves out keeps the dark color.
-To add a theme, add a map and its name to `NAMES` and `named`.
-
-`--theme NAME` picks one for this run. Ctrl-Shift-T moves to the next and
-writes `theme NAME` to `~/.ail-edit` (ADR 0296), which the next start
-reads; `--theme` wins over it. An unknown name keeps `dark` and the tab bar
-lists the names.
-
-Mac check for themes: run
-`./ail run tools/edit/edit.ail --theme light examples/hello.ail`. Expect
-a white background, `fn` in blue, the string in dark red, and a blue
-status line with white text. Press Cmd-Shift-T: the tab bar says `theme
-solarized` and the background turns dark teal. Quit with Cmd-Q and run
-`./ail run tools/edit/edit.ail examples/hello.ail`: it opens in solarized.
-Cmd-Shift-T twice more returns to `dark`.
 
 ## macOS sanity check
 
