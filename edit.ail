@@ -156,15 +156,6 @@ fn Editor.set_col(mut self, c int)
     col = c
     goal = c
 
-## `xs[..from]`, then `mid`, then `xs[to..]`.
-fn splice(xs List[str], from int, to int, mid List[str]) List[str]
-    mut out := xs[..from]
-    for s in mid
-        out.push(s)
-    for s in xs[to..]
-        out.push(s)
-    out
-
 ## Replaces the text from (l1, c1) up to (l2, c2), all 0-based, with `s`,
 ## which may hold newlines, and puts the cursor at the end of the new text.
 fn Editor.replace(mut self, l1 int, c1 int, l2 int, c2 int, s str)
@@ -173,16 +164,19 @@ fn Editor.replace(mut self, l1 int, c1 int, l2 int, c2 int, s str)
 
 ## `replace` without an undo snapshot.
 fn Editor.edit(mut self, l1 int, c1 int, l2 int, c2 int, s str)
-    before := lines[l1].chars()[..c1].join("")
-    after := lines[l2].chars()[c2..].join("")
+    before := lines[l1].slice(0, c1)
+    after := lines[l2].slice(c2, lines[l2].len())
     mut parts := s.split("\n")
     end := parts.len() - 1
-    mut end_col := parts[end].chars().len()
+    mut end_col := parts[end].len()
     if end == 0
         end_col += c1
     parts[0] = "{before}{parts[0]}"
     parts[end] = "{parts[end]}{after}"
-    lines = splice(lines, l1, l2 + 1, parts)
+    tail := lines[l2 + 1..]
+    lines = lines[..l1]
+    lines.extend(parts)
+    lines.extend(tail)
     line = l1 + end
     set_col(end_col)
 
@@ -216,8 +210,7 @@ fn opens_block(s str) bool
     n >= 2 and (words[n - 1] == "else" or words[n - 2] == "else" or words[n - 2] == ":=" and (words[n - 1] == "match" or words[n - 1] == "if")) or t.contains(":= if ") or t.contains(":= match ")
 
 fn Editor.newline(mut self)
-    cs := cur()
-    head := cs[..col].join("")
+    head := lines[line].slice(0, col)
     mut n := indent_of(head).min(col)
     if opens_block(head)
         n += INDENT
@@ -225,18 +218,17 @@ fn Editor.newline(mut self)
 
 fn Editor.backspace(mut self)
     if col > 0
-        cs := cur()
-        head := cs[..col].join("")
+        head := lines[line].slice(0, col)
         mut n := 1
         if head.trim() == "" and col % INDENT == 0
             n = INDENT
         replace(line, col - n, line, col, "")
     elif line > 0
-        prev := lines[line - 1].chars().len()
+        prev := lines[line - 1].len()
         replace(line - 1, prev, line, 0, "")
 
 fn Editor.delete(mut self)
-    if col < cur().len()
+    if col < lines[line].len()
         replace(line, col, line, col + 1, "")
     elif line + 1 < lines.len()
         replace(line, col, line + 1, 0, "")
@@ -284,11 +276,11 @@ fn Editor.selection(self) Range?
 fn Editor.selected_text(self) str
     r := selection() else return ""
     if r.line == r.end_line
-        return lines[r.line].chars()[r.col..r.end_col].join("")
-    mut parts := [lines[r.line].chars()[r.col..].join("")]
+        return lines[r.line].slice(r.col, r.end_col)
+    mut parts := [lines[r.line].slice(r.col, lines[r.line].len())]
     for l in r.line + 1..r.end_line
         parts.push(lines[l])
-    parts.push(lines[r.end_line].chars()[..r.end_col].join(""))
+    parts.push(lines[r.end_line].slice(0, r.end_col))
     parts.join("\n")
 
 ## Copies the selection to the editor's clipboard; false if there is none.
@@ -347,17 +339,17 @@ fn Editor.pane_rows(self) int
 
 fn Editor.move_to_line(mut self, l int)
     line = l.max(0).min(lines.len() - 1)
-    col = goal.min(cur().len())
+    col = goal.min(lines[line].len())
 
 fn Editor.go(mut self, d Dir)
-    n := cur().len()
+    n := lines[line].len()
     match d
         Left =>
             if col > 0
                 set_col(col - 1)
             elif line > 0
                 line -= 1
-                set_col(cur().len())
+                set_col(lines[line].len())
         Right =>
             if col < n
                 set_col(col + 1)
@@ -373,7 +365,7 @@ fn Editor.go(mut self, d Dir)
             set_col(0)
         Bottom =>
             line = lines.len() - 1
-            set_col(cur().len())
+            set_col(lines[line].len())
         Home =>
             ind := indent_of(lines[line])
             if col == ind
@@ -412,7 +404,7 @@ fn Editor.scroll(mut self)
         left = col - w + 1
 
 fn Editor.gutter_width(self) int
-    "{lines.len()}".chars().len().max(3) + 1
+    "{lines.len()}".len().max(3) + 1
 
 # ---- Syntax highlighting ------------------------------------------------
 
@@ -543,15 +535,12 @@ fn Screen.band(mut self, row int, bg int)
 fn Screen.put(mut self, row int, col int, s str, fg int, bg int)
     if row < 0 or row >= rows or col >= cols
         return
-    cs := s.chars()
-    shown := cs[..cs.len().min(cols - col)].join("")
+    shown := s.slice(0, s.len().min(cols - col))
     spans.push(Span(row: row, col: col, text: shown, fg: fg, bg: bg))
-    have := text[row].chars()
-    mut pad := ""
-    if have.len() < col
-        pad = " ".repeat(col - have.len())
-    old_tail := have[(col + shown.chars().len()).min(have.len())..].join("")
-    text[row] = "{have[..col.min(have.len())].join("")}{pad}{shown}{old_tail}"
+    have := text[row]
+    pad := " ".repeat((col - have.len()).max(0))
+    old_tail := have.slice((col + shown.len()).min(have.len()), have.len())
+    text[row] = "{have.slice(0, col.min(have.len()))}{pad}{shown}{old_tail}"
 
 ## The background of character `c` (0-based) of line `l` (0-based): a
 ## diagnostic's span if one covers it, else `bg`.
@@ -622,7 +611,7 @@ fn Editor.render(self) Screen
     # A diagnostic at the end of a line shows as one marked cell.
     for d in diags
         r := d.line - 1 - top
-        if r >= 0 and r < h and d.col - 1 >= lines[d.line - 1].chars().len()
+        if r >= 0 and r < h and d.col - 1 >= lines[d.line - 1].len()
             c := gw + d.col - 1 - left
             if c >= gw and c < cols
                 s.put(r, c, " ", FG, diag_bg([d], d.line - 1, d.col - 1, BG))
@@ -635,7 +624,7 @@ fn Editor.render(self) Screen
     left_part := " {path}{flag}  Ln {line + 1}, Col {col + 1}  {counts}"
     s.put(status_row, 0, left_part, STATUS_FG, STATUS_BG)
     if message != ""
-        s.put(status_row, left_part.chars().len() + 2, "| {message}", STATUS_FG, STATUS_BG)
+        s.put(status_row, left_part.len() + 2, "| {message}", STATUS_FG, STATUS_BG)
     render_pane(mut s, status_row + 1)
     if line >= top and line < top + h
         s.cursor_row = line - top
@@ -829,8 +818,7 @@ fn Editor.search_key(mut self, cmd Command) bool
             query = "{query}{t}"
             find(false)
         Backspace =>
-            q := query.chars()
-            query = q[..(q.len() - 1).max(0)].join("")
+            query = query.slice(0, (query.len() - 1).max(0))
             find(false)
         Newline | FindNext => find(true)
         Escape =>
@@ -926,7 +914,7 @@ fn key_command(key str, ctrl bool, alt bool, shift bool) Command?
         "f1" => Explain
         "f3" => FindNext
         _ =>
-            if key.chars().len() == 1
+            if key.len() == 1
                 return Insert(key)
             none
 
@@ -993,7 +981,7 @@ fn parse_outline(text str) List[OutlineItem]
         t := l.trim()
         words := t.split(" ")
         n := words[0].to_int() else continue
-        rest := l.chars()[7.min(l.chars().len())..].join("")
+        rest := l.slice(7.min(l.len()), l.len())
         if rest.trim().starts_with("##")
             continue
         out.push(OutlineItem(line: n, text: rest))
@@ -1422,7 +1410,7 @@ fn bench(mut ed Editor)
     mut cells := 0
     for _ in 0..20
         for sp in ed.render().spans
-            cells += sp.text.chars().len()
+            cells += sp.text.len()
     ms := (time.now_ms() - start).to_float() / 20.0
     print("{ed.lines.len()} lines, {ed.cols}x{ed.rows} screen: {ms:.1} ms per render ({cells / 20} cells drawn)")
     t := time.now_ms()
