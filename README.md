@@ -45,6 +45,7 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | `(` `[` `{` `"` | Insert the closing pair; typing the closer steps over it; Backspace in an empty pair deletes both |
 | Ctrl-Space | Complete the word: after `.`, fields, variants and methods; otherwise locals, the file's declarations (with signatures), keywords and words in the buffer. Up/Down choose, Enter or Tab accepts, Escape closes |
 | F12 | Go to the definition of the name under the cursor, locals included (`ail api --refs`, else the `--symbols` index) |
+| Shift-F12 | Every place `ail api --refs` finds for the name under the cursor, its declaration included, in this file and others; Up/Down, Enter jumps, Esc closes (ADR 0489) |
 | Ctrl-I | Info on the name under the cursor: its type (`ail api --type`), signature, contracts, effects, error set, doc comment and number of uses (`--refs`) (ADR 0312) |
 | F2 | Rename the name under the cursor: through `ail api --refs` (declarations and locals), else every whole word; the prompt shows the count and how they were found, Enter applies, Ctrl-Z undoes (ADR 0244) |
 | Alt-Shift-F | Format with `ail fmt` (also on save, when the program has no errors) |
@@ -56,6 +57,7 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-Z | Undo |
 | Ctrl-Y | Redo |
 | Ctrl-F | Find as you type; Enter or F3 finds the next match, Escape stops |
+| Alt-R | Toggles regex search for the find bar (std.regex syntax: `\d{4}`, `(a|b)+`); while finding, the query is re-searched (ADR 0490) |
 | F3 | Find the next match |
 | Ctrl-R | Replace: after Ctrl-F, type the replacement; Enter replaces this match and finds the next, Ctrl-Enter replaces all (one undo step) |
 | Ctrl-S | Format, save, then check |
