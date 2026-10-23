@@ -2461,8 +2461,6 @@ DIAG_JSON := "\{\"api\":1,\"severity\":\"error\",\"rule\":\"expr.name.1\",\"file
     assert(ed.quit_armed)
     ed.on_event(Close)
     assert(ed.quit)
-    mut w := ui.Window(handle: 0)
-    draw(mut w, ed.render())
 
 API_SRC := "struct P\n    x int\n\n## Adds.\nfn add(a int, b int) int\n    a + b\n\nfn main()\n    p := P(x: 1)\n    print(add(p.x, 2))"
 API_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"items\":[\{\"kind\":\"struct\",\"name\":\"P\",\"id\":\"type:P\",\"line\":1,\"col\":8,\"doc\":null,\"signature\":\"struct P\",\"error\":false,\"fields\":[\{\"kind\":\"field\",\"name\":\"x\",\"id\":\"field:P.x\",\"line\":2,\"col\":5,\"doc\":null,\"signature\":\"x int\",\"type\":\"int\"}],\"methods\":[]},\{\"kind\":\"fn\",\"name\":\"add\",\"id\":\"fn:add\",\"line\":5,\"col\":4,\"doc\":\"Adds.\",\"signature\":\"fn add(a int, b int) int\",\"params\":[\{\"name\":\"a\",\"type\":\"int\",\"mut\":false},\{\"name\":\"b\",\"type\":\"int\",\"mut\":false}],\"returns\":\"int\",\"effects\":[]},\{\"kind\":\"fn\",\"name\":\"main\",\"id\":\"fn:main\",\"line\":8,\"col\":4,\"doc\":null,\"signature\":\"fn main()\",\"params\":[],\"returns\":null,\"effects\":[\"io\"]}],\"references\":[\{\"id\":\"type:P\",\"line\":9,\"col\":10},\{\"id\":\"field:P.x\",\"line\":9,\"col\":12},\{\"id\":\"fn:add\",\"line\":10,\"col\":11},\{\"id\":\"field:P.x\",\"line\":10,\"col\":17}]}"
