@@ -1384,7 +1384,9 @@ fn Editor.diag_here(self) Diag?
                 and (col + 1 < d.end_col or d.end_line - 1 > line)
                 return d
             found.push(d)
-    found.pop()
+    if found.len() == 0
+        return none
+    found[found.len() - 1]
 
 fn Editor.render(self) Screen
     mut s := Screen.new(cols, rows)
@@ -1967,7 +1969,7 @@ fn key_command(key str, ctrl bool, alt bool, shift bool) Command?
             "x" | "X" => Cut
             "v" | "V" => Paste
             "." => Fix
-            "o" | "O" => Outline
+            "o" | "O" => Command.Outline
             "r" | "R" => Replace
             "g" | "G" => GoToLine
             "d" | "D" => DuplicateLine
