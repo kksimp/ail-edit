@@ -4594,13 +4594,59 @@ fn json_pairs(j Json) str
         out.push("{m.key} = {jtext(m.value)}")
     out.join(", ")
 
+## A native trap is text on standard error (trace.run.1): `FILE:L:C: trap[RULE]: MESSAGE`, then
+## one `  at L:C in NAME(ARGS); LOCALS` line per frame, the values shown by `--values` (ADR 0886).
+fn trap_text_hits(path str, l str) List[Hit]
+    mut hits := List[Hit]()
+    if l.contains(": trap[")
+        parts := l.split(": trap[")
+        place := parts[0].split(":")
+        if place.len() < 3
+            return hits
+        at := Loc(
+            path: path,
+            line: place[place.len() - 2].to_int() else 0,
+            col: place[place.len() - 1].to_int() else 0,
+        )
+        rest := parts[1].split("]: ")
+        message := if rest.len() > 1 then rest[1] else ""
+        hits.push(Hit(loc: at, text: "trap[{rest[0]}] {message}  {at.line}:{at.col}"))
+    elif l.starts_with("  at ") and l.contains(" in ")
+        body := l.slice(5, l.len())
+        head := body.split(" in ")[0].split(":")
+        if head.len() != 2
+            return hits
+        floc := Loc(path: path, line: head[0].to_int() else 0, col: head[1].to_int() else 0)
+        frame := body.slice(body.split(" in ")[0].len() + 4, body.len())
+        mut locals := ""
+        mut call := frame
+        if i := frame.find("); ")
+            call = frame.slice(0, i + 1)
+            locals = frame.slice(i + 3, frame.len())
+        open := call.find("(") else call.len()
+        name := call.slice(0, open)
+        mut args := ""
+        if open < call.len() - 1
+            args = call.slice(open + 1, call.len() - 1)
+        if args == ".."
+            args = ""
+        mut row := "  in {name} {floc.line}:{floc.col}"
+        if args != ""
+            row = "{row}  args: {args}"
+        if locals != ""
+            row = "{row}  locals: {locals}"
+        hits.push(Hit(loc: floc, text: row))
+    hits
+
 ## The rows of `ail run --trace=all --json` (standard error): calls indented
 ## by depth, returns, contracts, and a trap with every frame's locals; then
 ## the program's output. Rows with a position jump there (ADR 0312).
 fn trace_hits(path str, err str, out str) List[Hit]
     mut hits := List[Hit]()
     for l in err.lines()
-        j := parse_json(l) else continue
+        j := parse_json(l) else
+            hits.extend(trap_text_hits(path, l))
+            continue
         at := Loc(path: path, line: jint(j, "line"), col: jint(j, "col"))
         pad := "  ".repeat((jint(j, "depth") - 1).max(0))
         kind := jstr(j, "trace")
@@ -4682,7 +4728,7 @@ fn failure_hits(path str, out str) List[Hit]
 ## Shift-F5: runs the buffer with every trace event; the events fill the
 ## pane and take Up/Down and Enter.
 fn Workspace.trace_run(mut self)
-    r := eds[active].ail_on_buffer(["run", "--trace=all", "--json"]) else return
+    r := eds[active].ail_on_buffer(["run", "--trace=all", "--json", "--values"]) else return
     show_list("trace (exit {r.status})", trace_hits(eds[active].path, r.err, r.out))
 
 ## Ctrl-Shift-E: the file's failure paths from `ail check --errors`.
