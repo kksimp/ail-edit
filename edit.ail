@@ -42,7 +42,7 @@ OCCUR_BG := 0x343a40
 ERROR_FG := 0xf48771
 WARN_FG := 0xcca700
 
-## The color kinds a theme can change (tools/edit/themes, ADR 0295). OP_FG
+## The color kinds a theme can change (themes, ADR 0295). OP_FG
 ## is FG, so it follows "fg".
 FG_KINDS := {
     "fg": FG,
@@ -2881,8 +2881,8 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     assert_eq(s.text[1].trim(), "1 x")
     ws.on_event(Mouse(col: 9, row: 0, button: "left", kind: "down"))
     assert_eq(ws.active, 1)
-    assert(fuzzy("tools/edit/edit.ail", "EdA"))
-    assert(not fuzzy("tools/edit/edit.ail", "zz"))
+    assert(fuzzy("edit.ail", "EdA"))
+    assert(not fuzzy("edit.ail", "zz"))
     ws.files = ["a.ail", "dir/b.ail", "dir/c.ail"]
     ws.picking = true
     ws.on_event(Key(key: "c", ctrl: false, alt: false, shift: false))
@@ -5398,7 +5398,7 @@ fn bench(mut ed Editor)
 fn main() !
     args := env.args()
     if args.len() == 0
-        print("usage: ail run tools/edit/edit.ail [--font N] [--keys] [--print [--screen] [--check] [--outline] [--explain] [--at=L:C] [--type=TEXT] [--key=KEY]...] FILE")
+        print("usage: ail run edit.ail [--font N] [--keys] [--print [--screen] [--check] [--outline] [--explain] [--at=L:C] [--type=TEXT] [--key=KEY]...] FILE")
         return
     if args.contains("--keys")
         for l in key_table()

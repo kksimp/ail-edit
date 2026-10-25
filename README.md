@@ -1,27 +1,31 @@
-# edit: an AIL code editor, written in AIL
+# ail-edit: an AIL code editor, written in AIL
 
-`tools/edit/edit.ail` is a code editor for AIL programs, written in AIL
-([ADR 0180](../../docs/decisions/0180-editor-written-in-ail.md)). Its core
+License: AGPL-3.0 (see `LICENSE`). Moved from kksimp/ail (`tools/edit`) with its history.
+
+Needs the AIL toolchain: clone [kksimp/ail](https://github.com/kksimp/ail) next to this repo at the commit in `.ail-version`. Commands below use `../ail/ail`; `tools/check.sh` runs check, fmt and the tests against that pin. Builds and tests run on a dev machine, not in a container.
+
+`edit.ail` is a code editor for AIL programs, written in AIL
+([ADR 0180](https://github.com/kksimp/ail/blob/main/docs/decisions/0180-editor-written-in-ail.md)). Its core
 is headless: an `Editor` value, `Command`s that change it, and a pure
 `render` to a `Screen` of colored text runs
-([ADR 0181](../../docs/decisions/0181-editor-screen-as-text-runs.md)).
+([ADR 0181](https://github.com/kksimp/ail/blob/main/docs/decisions/0181-editor-screen-as-text-runs.md)).
 
 ```sh
-./ail run tools/edit/edit.ail FILE                     # the editor, in a window
-./ail run tools/edit/edit.ail --font 15 FILE           # ...with a smaller font (10 to 40)
-./ail run tools/edit/edit.ail --theme light FILE       # ...in a theme (see Themes)
-./ail run tools/edit/edit.ail --print FILE             # print one screen as text
-./ail run tools/edit/edit.ail --print --check FILE     # ...after Ctrl-K
-./ail run tools/edit/edit.ail --print --outline FILE   # ...with the outline
-./ail run tools/edit/edit.ail --print --at=11:15 --key=ctrl+i FILE  # move, press keys, type (--type=TEXT)
-./ail run tools/edit/edit.ail --bench FILE             # time a render and an edit
-./ail run tools/edit/edit.ail --keys                   # the key table below
-./ail test tools/edit/edit.ail                         # the headless tests
+../ail/ail run edit.ail FILE                     # the editor, in a window
+../ail/ail run edit.ail --font 15 FILE           # ...with a smaller font (10 to 40)
+../ail/ail run edit.ail --theme light FILE       # ...in a theme (see Themes)
+../ail/ail run edit.ail --print FILE             # print one screen as text
+../ail/ail run edit.ail --print --check FILE     # ...after Ctrl-K
+../ail/ail run edit.ail --print --outline FILE   # ...with the outline
+../ail/ail run edit.ail --print --at=11:15 --key=ctrl+i FILE  # move, press keys, type (--type=TEXT)
+../ail/ail run edit.ail --bench FILE             # time a render and an edit
+../ail/ail run edit.ail --keys                   # the key table below
+../ail/ail test edit.ail                         # the headless tests
 ```
 
 The window remembers its open tabs and cursors per working directory in
 `~/.ail-edit` and reopens them on the next start there
-([ADR 0339](../../docs/decisions/0339-editor-problems-and-sessions.md)).
+([ADR 0339](https://github.com/kksimp/ail/blob/main/docs/decisions/0339-editor-problems-and-sessions.md)).
 
 ## Keys
 
@@ -97,7 +101,7 @@ Ctrl (ADR 0179), and laptop keyboards may need fn for F1–F12. Don't save
 (Ctrl-S): the steps edit `examples/hello.ail` and quit without saving.
 
 ```sh
-./ail run tools/edit/edit.ail examples/hello.ail
+../ail/ail run edit.ail examples/hello.ail
 ```
 
 | # | Do | Expect |
@@ -116,7 +120,7 @@ Ctrl (ADR 0179), and laptop keyboards may need fn for F1–F12. Don't save
 | 12 | Scroll with the trackpad in the second tab | The text scrolls about three lines per notch |
 | 13 | Ctrl-Q (twice if it asks about unsaved tabs) | The editor quits without saving |
 
-Also try `./ail run tools/edit/edit.ail --font 13 examples/hello.ail`: the
+Also try `../ail/ail run edit.ail --font 13 examples/hello.ail`: the
 window opens with small text. Report the step number of anything that
 differs.
 
@@ -127,7 +131,7 @@ imports resolve as they will on save.
 
 ## Status (2026-10-20)
 
-- Works headless, tested (33 `@test`s, run by `./ail selftest`): editing,
+- Works headless, tested (33 `@test`s, run by `../ail/ail selftest`): editing,
   auto-indent, undo and redo, moves, highlighting, scrolling, selection and
   the clipboard, mouse and wheel, tabs and the file picker, run output,
   find and replace, go to line, bracket matching and pairing, comment
