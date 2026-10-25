@@ -12,6 +12,7 @@ use std.regex
 use std.time
 use std.ui
 use std.ui.widgets
+use std.screen.cells as scells
 use themes
 
 # Colors, 0xRRGGBB.
@@ -5367,7 +5368,12 @@ fn print_screen(ed Editor, flags List[str])
             ws.on_event(key_event(spec))
         elif f == "--idle"
             ws.idle(time.now_ms() + 1000)
-    for row in ws.render().text
+    shown := ws.render()
+    if flags.contains("--screen")
+        runs := [widgets.Run(col: sp.col, row: sp.row, text: sp.text, fg: sp.fg, bg: sp.bg, bold: false) for sp in shown.spans]
+        print(scells.of_cells(shown.cols, shown.rows, runs, shown.cursor_col, shown.cursor_row).describe(0.0, 0.0, shown.cols.to_float(), shown.rows.to_float(), 3000))
+        return
+    for row in shown.text
         print(row)
 
 ## `--bench`: the time to render one screen, averaged over 20 renders at
@@ -5392,7 +5398,7 @@ fn bench(mut ed Editor)
 fn main() !
     args := env.args()
     if args.len() == 0
-        print("usage: ail run tools/edit/edit.ail [--font N] [--keys] [--print [--check] [--outline] [--explain] [--at=L:C] [--type=TEXT] [--key=KEY]...] FILE")
+        print("usage: ail run tools/edit/edit.ail [--font N] [--keys] [--print [--screen] [--check] [--outline] [--explain] [--at=L:C] [--type=TEXT] [--key=KEY]...] FILE")
         return
     if args.contains("--keys")
         for l in key_table()
