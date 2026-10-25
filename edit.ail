@@ -5370,8 +5370,15 @@ fn print_screen(ed Editor, flags List[str])
             ws.idle(time.now_ms() + 1000)
     shown := ws.render()
     if flags.contains("--screen")
-        runs := [widgets.Run(col: sp.col, row: sp.row, text: sp.text, fg: sp.fg, bg: sp.bg, bold: false) for sp in shown.spans]
-        print(scells.of_cells(shown.cols, shown.rows, runs, shown.cursor_col, shown.cursor_row).describe(0.0, 0.0, shown.cols.to_float(), shown.rows.to_float(), 3000))
+        runs := [
+            widgets.Run(col: sp.col, row: sp.row, text: sp.text, fg: sp.fg, bg: sp.bg, bold: false)
+            for sp in shown.spans
+        ]
+        print(
+            scells
+                .of_cells(shown.cols, shown.rows, runs, shown.cursor_col, shown.cursor_row)
+                .describe(0.0, 0.0, shown.cols.to_float(), shown.rows.to_float(), 3000),
+        )
         return
     for row in shown.text
         print(row)
