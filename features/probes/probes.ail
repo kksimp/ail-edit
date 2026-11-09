@@ -183,19 +183,19 @@ fn probe_json(j Json) Hit
 pub fn probe_hits(err str) List[Hit]
     mut out := List[Hit]()
     for l in err.lines()
-        if j := parse_json(l)
-            if jstr(j, "trace") == "probe"
-                out.push(probe_json(j))
+        j := parse_json(l) else
+            if rest := l.strip_prefix("probe: ")
+                sp := rest.find(" ") else rest.len()
+                at := rest.slice(0, sp)
+                parts := at.split(":")
+                out.push(Hit(
+                    at: at,
+                    values: rest.slice((sp + 1).min(rest.len()), rest.len()),
+                    line: (parts[parts.len() - 1].to_int() else 0),
+                ))
             continue
-        if rest := l.strip_prefix("probe: ")
-            sp := rest.find(" ") else rest.len()
-            at := rest.slice(0, sp)
-            parts := at.split(":")
-            out.push(Hit(
-                at: at,
-                values: rest.slice((sp + 1).min(rest.len()), rest.len()),
-                line: (parts[parts.len() - 1].to_int() else 0),
-            ))
+        if jstr(j, "trace") == "probe"
+            out.push(probe_json(j))
     out
 
 ## The panel rows of a probe: one per hit, numbered, jumping to the probed line.
@@ -247,23 +247,23 @@ fn write_json(j Json) Write
 pub fn watch_writes(err str) List[Write]
     mut out := List[Write]()
     for l in err.lines()
-        if j := parse_json(l)
-            if jstr(j, "trace") == "watch"
-                out.push(write_json(j))
+        j := parse_json(l) else
+            if rest := l.strip_prefix("watch: ")
+                eq := rest.find(" = ") else continue
+                at := rest.rfind(" at ") else continue
+                place := rest.slice(at + 4, rest.len()).split(" ")[0].split(":")
+                if place.len() < 2
+                    continue
+                out.push(Write(
+                    name: rest.slice(0, eq),
+                    value: rest.slice(eq + 3, at),
+                    line: (place[place.len() - 2].to_int() else 0),
+                    col: (place[place.len() - 1].to_int() else 0),
+                    note: "",
+                ))
             continue
-        if rest := l.strip_prefix("watch: ")
-            eq := rest.find(" = ") else continue
-            at := rest.rfind(" at ") else continue
-            place := rest.slice(at + 4, rest.len()).split(" ")[0].split(":")
-            if place.len() < 2
-                continue
-            out.push(Write(
-                name: rest.slice(0, eq),
-                value: rest.slice(eq + 3, at),
-                line: (place[place.len() - 2].to_int() else 0),
-                col: (place[place.len() - 1].to_int() else 0),
-                note: "",
-            ))
+        if jstr(j, "trace") == "watch"
+            out.push(write_json(j))
     out
 
 pub fn watch_rows(writes List[Write]) List[Row]
@@ -336,32 +336,32 @@ fn text_frame(l str) Frame?
 pub fn trap_of(err str) Trap
     mut t := Trap(rule: "", message: "", line: 0, col: 0, frames: [])
     for l in err.lines()
-        if j := parse_json(l)
-            if jstr(j, "severity") == "trap"
-                t.rule = jstr(j, "rule")
-                t.message = jstr(j, "message")
-                t.line = jint(j, "line")
-                t.col = jint(j, "col")
-                for f in jarr(j, "stack")
-                    t.frames.push(Frame(
-                        fn_name: jstr(f, "fn"),
-                        line: jint(f, "line"),
-                        col: jint(f, "col"),
-                        args: pairs(f.get("args") else Json.Null),
-                        locals: pairs(f.get("locals") else Json.Null),
-                    ))
+        j := parse_json(l) else
+            if l.contains(": trap[")
+                parts := l.split(": trap[")
+                place := parts[0].split(":")
+                rest := parts[1].split("]: ")
+                if place.len() >= 3
+                    t.rule = rest[0]
+                    t.message = if rest.len() > 1 then rest[1] else ""
+                    t.line = (place[place.len() - 2].to_int() else 0)
+                    t.col = (place[place.len() - 1].to_int() else 0)
+            elif f := text_frame(l)
+                t.frames.push(f)
             continue
-        if l.contains(": trap[")
-            parts := l.split(": trap[")
-            place := parts[0].split(":")
-            rest := parts[1].split("]: ")
-            if place.len() >= 3
-                t.rule = rest[0]
-                t.message = if rest.len() > 1 then rest[1] else ""
-                t.line = (place[place.len() - 2].to_int() else 0)
-                t.col = (place[place.len() - 1].to_int() else 0)
-        elif f := text_frame(l)
-            t.frames.push(f)
+        if jstr(j, "severity") == "trap"
+            t.rule = jstr(j, "rule")
+            t.message = jstr(j, "message")
+            t.line = jint(j, "line")
+            t.col = jint(j, "col")
+            for f in jarr(j, "stack")
+                t.frames.push(Frame(
+                    fn_name: jstr(f, "fn"),
+                    line: jint(f, "line"),
+                    col: jint(f, "col"),
+                    args: pairs(f.get("args") else Json.Null),
+                    locals: pairs(f.get("locals") else Json.Null),
+                ))
     t
 
 fn frame_text(f Frame) str

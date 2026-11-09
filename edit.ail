@@ -4768,7 +4768,7 @@ fn Workspace.probe_key(mut self, spec str)
         r := eds[active].ail_on_buffer(probes.trace_args()) else return
         probe_view = probes.tree_of(r.err, r.out)
         probe_view.on = true
-        show_list(probe_view.title(), hits_of(path, probe_view.found_rows()))
+        show_list(probe_view.title(), hits_of(path, probe_view.rows()))
     elif spec == "sanitize" or spec == "race"
         race := spec == "race"
         r := eds[active].ail_on_buffer(probes.sanitize_args(race)) else return
