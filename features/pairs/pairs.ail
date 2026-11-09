@@ -1,0 +1,44 @@
+## Bracket pair colors (editor plan S2): the nesting depth of every bracket
+## on a line, skipping brackets inside strings, characters and comments.
+
+pub struct Scan
+    ## Per character: 0 for anything but a bracket, else its depth (1 and up).
+    pub levels List[int]
+    ## The depth after the line, to start the next one with.
+    pub depth int
+
+SQ := "'"
+
+## Scans one line that starts at nesting `depth`.
+pub fn scan(line str, depth int) Scan
+    cs := line.chars()
+    single := SQ.chars()[0]
+    mut levels := List[int]()
+    mut d := depth
+    mut quote := ' '
+    mut i := 0
+    while i < cs.len()
+        c := cs[i]
+        mut lvl := 0
+        if quote != ' '
+            if c == '\\'
+                levels.push(0)
+                i += 1
+            elif c == quote
+                quote = ' '
+        elif c == '#'
+            while i < cs.len()
+                levels.push(0)
+                i += 1
+            break
+        elif c == '"' or c == single
+            quote = c
+        elif c == '(' or c == '[' or c == '{'
+            d += 1
+            lvl = d
+        elif c == ')' or c == ']' or c == '}'
+            lvl = d.max(1)
+            d = (d - 1).max(0)
+        levels.push(lvl)
+        i += 1
+    Scan(levels: levels, depth: d)
