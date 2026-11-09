@@ -1,0 +1,13 @@
+struct Cart
+    total int
+
+fn add(mut c Cart, n int)
+    c.total += n
+
+fn pay(n int) int
+    n + 1
+
+fn main()
+    mut c := Cart(total: 0)
+    add(mut c, pay(1))
+    print(c.total)

@@ -20,6 +20,7 @@ use window as win
 use features.diff as sdiff
 use features.tests as ttree
 use features.taskpanel as tp
+use features.ask
 
 # Colors, 0xRRGGBB.
 BG := 0x1e1e1e
@@ -2946,7 +2947,7 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
                 assert(
                     key_command(k, ctrl, alt, shift) != none
                         or extra_key(k, ctrl, alt, shift) != none
-                        or workspace_key(k, ctrl, shift) != none,
+                        or workspace_key(k, ctrl, alt, shift) != none,
                 )
             Resize(_, _) | Close | Mouse(_, _, _, _) | Scroll(_) => assert(false)
     assert_eq(key_table()[0], "| Key | Does |")
@@ -2968,6 +2969,45 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     assert(not ws.picking and not ws.commanding)
     ws.on_event(key_event("ctrl+p"))
     assert(ws.picking and not ws.commanding)
+
+@test fn the_ask_bar_types_and_shows_its_prompt()
+    mut ws := Workspace.new(typed("fn main()\n    print(1)", []))
+    ws.on_event(key_event("ctrl+shift+a"))
+    assert(ws.askbar.open)
+    for k in ["w", "h", "o"]
+        ws.on_event(press(k))
+    assert(ws.render().text[0].contains(" ask: who"))
+    ws.on_event(press("escape"))
+    assert(not ws.askbar.open)
+    ws.on_event(key_event("ctrl+t"))
+    assert(ws.render().text[0].starts_with(" go to symbol: "))
+    ws.on_event(press("enter"))
+    assert(not ws.askbar.open)
+
+@test fn ask_rows_become_jumpable_hits()
+    got := ask_hits([
+        ask.Site(file: "", line: 0, col: 0, id: "fn:f", kind: "head", text: "fn:f  (1)"),
+        ask.Site(
+            file: "a.ail",
+            line: 3,
+            col: 2,
+            id: "fn:g",
+            kind: "site",
+            text: "  a.ail:3:2: fn:g  call",
+        ),
+    ])
+    assert_eq(got.len(), 2)
+    assert_eq(got[0].loc.line, 0)
+    assert_eq(got[1].loc, Loc(path: "a.ail", line: 3, col: 2))
+    assert_eq(got[1].text, "  a.ail:3:2: fn:g  call")
+
+@test fn the_token_meter_sits_on_the_status_row()
+    mut ws := Workspace.new(typed("fn main()\n    print(1)", []))
+    ws.askbar.counted("", 0, 42)
+    row := ws.render().text[1 + ws.eds[0].text_rows()]
+    assert(row.ends_with(" tok 42 "))
+    ws.askbar.selected(7)
+    assert(ws.render().text[1 + ws.eds[0].text_rows()].ends_with(" tok 42 (sel 7) "))
 
 @test fn project_search_fills_the_pane_and_jumps()
     hits := search_text("a.ail", "fn main()\n    total := 1\n    print(total)", "total")
@@ -3827,6 +3867,36 @@ fn key_rows() List[KeyRow]
             "Search every `.ail` file under the directory (open tabs as edited); the matches fill the pane, Up/Down select, Enter jumps, Esc closes (ADR 0292)",
         ),
         key_row(
+            "Ctrl-Shift-A",
+            "Ask",
+            "ctrl+shift+a",
+            "Ask the program a question in plain words (`ail ask`: who writes F, who reads F, what calls f, what does f call, which effects reach f, who uses T); the answers fill the pane, Up/Down select, Enter jumps (api.ask.1-6)",
+        ),
+        key_row(
+            "Alt-Shift-H",
+            "Call hierarchy",
+            "alt+shift+h",
+            "The callers and callees of the function under the cursor, three levels down (`ail ask`); Up/Down, Enter jumps to a call",
+        ),
+        key_row(
+            "Ctrl-T",
+            "Go to symbol",
+            "ctrl+t",
+            "Type part of a declaration's text: matches in every `.ail` file under the directory (`ail api --text`); Up/Down, Enter jumps",
+        ),
+        key_row(
+            "palette",
+            "Count tokens",
+            "",
+            "Count the tokens of the buffer and of the selection (`ail api --tokens`) and say so in the message",
+        ),
+        key_row(
+            "palette",
+            "Toggle token meter",
+            "",
+            "Show or hide the file's token count at the right of the status row (shown by default; refreshed on save)",
+        ),
+        key_row(
             "F4",
             "Next search result",
             "f4",
@@ -3929,10 +3999,15 @@ enum WsKey
     TaskPanel
     AffectedTests
     TaskVerify
+    AskBar
+    Symbols
+    Hierarchy
     Zoom(key str)
     Diff(kind str)
 
-fn workspace_key(k str, ctrl bool, shift bool) WsKey?
+fn workspace_key(k str, ctrl bool, alt bool, shift bool) WsKey?
+    if alt and shift and (k == "h" or k == "H")
+        return Hierarchy
     if not ctrl
         if k == "f4" and not shift
             return NextHit
@@ -3971,12 +4046,14 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
             "z" | "Z" => TestTool("shrink")
             "x" | "X" => TestTool("contracts")
             "k" | "K" => TaskPanel
+            "a" | "A" => AskBar
             _ => none
     match k
         "b" | "B" => Tree
         "w" | "W" => CloseTab
         "q" | "Q" => QuitAll
         "p" | "P" => OpenFile
+        "t" | "T" => Symbols
         _ => none
 
 ## The palette's rows matching what is typed: those that run a command
@@ -4032,6 +4109,8 @@ fn Workspace.run_command(mut self, name str)
         "Apply test update" => test_tool("apply")
         "Record tests" => test_tool("record")
         "Trace replay" => test_tool("trace")
+        "Count tokens" => token_report()
+        "Toggle token meter" => askbar.toggle()
         _ => message = "no command `{name}`"
 
 # ---- Tabs ---------------------------------------------------------------
@@ -4094,6 +4173,8 @@ struct Workspace
     ## Palette toggles of the window: the minimap and zen mode.
     minimap bool
     zen bool
+    ## The ask bar and the token meter (features/ask, plan S8).
+    askbar ask.Bar
 
 fn Workspace.new(ed Editor) Workspace
     Workspace(
@@ -4134,6 +4215,7 @@ fn Workspace.new(ed Editor) Workspace
         typed_at: 0,
         minimap: false,
         zen: false,
+        askbar: ask.Bar.new(),
     )
 
 ## The file name a tab shows: the path after its last `/`.
@@ -4207,6 +4289,9 @@ fn Workspace.on_event(mut self, ev ui.Event)
     if searching
         search_event(ev)
         return
+    if askbar.open
+        askbar_event(ev)
+        return
     if browsing and repl_step == 3
         if ev == Key(key: "enter", ctrl: true, alt: false, shift: false)
             apply_replace()
@@ -4232,8 +4317,8 @@ fn Workspace.on_event(mut self, ev ui.Event)
         quit_armed = false
         message = ""
     match ev
-        Key(k, ctrl, _, shift) =>
-            if wk := workspace_key(k, ctrl, shift)
+        Key(k, ctrl, alt, shift) =>
+            if wk := workspace_key(k, ctrl, alt, shift)
                 n := eds.len()
                 match wk
                     NextTab => active = (active + 1) % n
@@ -4259,6 +4344,9 @@ fn Workspace.on_event(mut self, ev ui.Event)
                     TaskPanel => task_panel()
                     AffectedTests => eds[active].affected_tests()
                     TaskVerify => task_action("verify")
+                    AskBar => askbar.start(0)
+                    Symbols => askbar.start(1)
+                    Hierarchy => show_hierarchy()
                     TestOnSave =>
                         test_on_save = not test_on_save
                         if test_on_save
@@ -4302,6 +4390,8 @@ fn Workspace.on_event(mut self, ev ui.Event)
         Scroll(_) => eds[active].on_event(ev)
     if eds[active].quit
         close_tab()
+        return
+    askbar_refresh()
 
 ## After a save, checks every other open tab too, since a change can break
 ## a file that uses it; each tab's label shows its counts (ADR 0293).
@@ -5494,6 +5584,156 @@ fn Workspace.refresh_problems(mut self)
     hit_sel = sel
     fill_hits()
 
+# ---- Ask bar, call hierarchy, symbols, tokens (features/ask, plan S8) -------
+
+## The rows of an answer as hits; heading rows have line 0 and don't jump.
+fn ask_hits(rows List[ask.Site]) List[Hit]
+    mut out := List[Hit]()
+    for s in rows
+        out.push(Hit(loc: Loc(path: s.file, line: s.line, col: s.col), text: s.text))
+    out
+
+## The file `ail` should read for the active tab: the saved file, or a copy
+## beside it when the buffer has unsaved changes (so imports still resolve).
+fn Workspace.ask_source(mut self) str?
+    ed := eds[active]
+    if not ed.dirty
+        return ed.path
+    file := "{ed.path}.edit-check.ail"
+    fs.write_text(file, ed.text()) else err
+        message = "can't write {err.path}: {err.kind}"
+        return none
+    file
+
+fn Workspace.ask_release(mut self, file str)
+    if file != eds[active].path
+        fs.remove(file) else err
+            message = "can't remove {err.path}: {err.kind}"
+
+fn Workspace.askbar_event(mut self, ev ui.Event)
+    match ev
+        Key(k, ctrl, _, _) =>
+            if ctrl
+                return
+            if askbar.key(k) == "run"
+                askbar_run()
+        Close => quit_all()
+        Resize(_, _) => on_resize(ev)
+        Mouse(_, _, _, _) | Scroll(_) => return
+
+## Enter in the bar: asks the question, or searches the symbols.
+fn Workspace.askbar_run(mut self)
+    q := askbar.text.trim()
+    if q == ""
+        return
+    if askbar.mode == 1
+        go_symbols(q)
+        return
+    if eds[active].path == ""
+        message = "ask needs a saved file"
+        return
+    file := ask_source() else return
+    got := ask.query(ail_command(), file, eds[active].path, q)
+    ask_release(file)
+    if got.problem != ""
+        message = got.problem
+        return
+    if not ask.has_sites(got.rows)
+        message = "no answers for `{q}`"
+        return
+    show_list("ask `{q}`", ask_hits(got.rows))
+
+## Declarations matching `q` in every `.ail` file under the directory.
+fn Workspace.go_symbols(mut self, q str)
+    mut found := List[ask.Site]()
+    for f in list_files(tree_root, 4, 300)
+        if not f.ends_with(".ail") or f.ends_with(".edit-check.ail")
+            continue
+        r := proc.run(ail_command(), ["api", "--text", f]) else continue
+        for s in ask.symbol_rows(r.out, f, q)
+            if found.len() < 200
+                found.push(s)
+    if found.len() == 0
+        message = "no declaration matches `{q}`"
+        return
+    show_list("symbols `{q}`: {found.len()}", ask_hits(found))
+
+## Ctrl-Shift-Y: callers, then callees, of the function under the cursor.
+fn Workspace.show_hierarchy(mut self)
+    name := eds[active].word_here()
+    if name == "" or eds[active].path == ""
+        message = "call hierarchy: put the cursor on a function name in a saved file"
+        return
+    file := ask_source() else return
+    cmd := ail_command()
+    path := eds[active].path
+    callers := ask.hierarchy(cmd, file, path, name, true, 3)
+    callees := ask.hierarchy(cmd, file, path, name, false, 3)
+    ask_release(file)
+    mut found := List[Hit]()
+    found.push(Hit(loc: Loc(path: "", line: 0, col: 0), text: "-- who calls {name}"))
+    for h in ask_hits(callers)
+        found.push(h)
+    found.push(Hit(loc: Loc(path: "", line: 0, col: 0), text: "-- what {name} calls"))
+    for h in ask_hits(callees)
+        found.push(h)
+    show_list("call hierarchy of `{name}`", found)
+
+## The tokens of `text`, through a temporary file beside `path`.
+fn Workspace.count_text(mut self, path str, text str) int
+    file := "{path}.edit-tokens.ail"
+    fs.write_text(file, text) else err
+        message = "can't write {err.path}: {err.kind}"
+        return -1
+    mut n := -1
+    if t := ask.tokens_of(ail_command(), file)
+        n = t
+    fs.remove(file) else err
+        message = "can't remove {err.path}: {err.kind}"
+    n
+
+## Ctrl-Shift-K: counts the buffer as edited and the selection.
+fn Workspace.token_report(mut self)
+    ed := eds[active]
+    whole := count_text(ed.path, ed.text())
+    if whole < 0
+        return
+    mut picked := -1
+    sel := ed.selected_text()
+    if sel != ""
+        picked = count_text(ed.path, sel)
+    askbar.counted(ed.path, ed.saves, whole)
+    askbar.selected(picked)
+    if picked >= 0
+        message = "tokens: {whole} in the file, {picked} selected"
+    else
+        message = "tokens: {whole} in the file"
+
+## After an event: counts the saved file again when the tab or the save
+## count changed. Files that don't exist yet aren't counted.
+fn Workspace.askbar_refresh(mut self)
+    ed := eds[active]
+    if not askbar.stale(ed.path, ed.saves)
+        return
+    mut n := -1
+    if ed.path != "" and fs.exists(ed.path)
+        if t := ask.tokens_of(ail_command(), ed.path)
+            n = t
+    askbar.counted(ed.path, ed.saves, n)
+
+## The prompt on the tab bar while the bar is open, and the token count at
+## the right end of the status row.
+fn Workspace.render_askbar(self, mut s Screen)
+    if askbar.open
+        head := askbar.prompt()
+        s.put(0, 0, "{head}{askbar.text} ".pad_right(cols, ' '), STATUS_FG, SELECT_BG)
+        s.cursor_row = 0
+        s.cursor_col = head.chars().len() + askbar.text.chars().len()
+        return
+    seg := askbar.segment()
+    if seg != ""
+        s.put(1 + eds[active].text_rows(), cols - seg.chars().len(), seg, STATUS_FG, STATUS_BG)
+
 ## Called while the window waits: refreshes the live problems list once
 ## 500 ms have passed since the last edit.
 fn Workspace.idle(mut self, now int)
@@ -5627,6 +5867,7 @@ fn Workspace.render(self) Screen
     if tree_open
         render_tree(mut s)
     render_search(mut s)
+    render_askbar(mut s)
     if picking
         render_picker(mut s)
     s
