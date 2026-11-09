@@ -314,8 +314,22 @@ pub fn minimap_ops(f Frame, m Metrics) List[app.Op]
             break
         w := (f.lens[i].to_float() * 0.9).min(MAP_W - 6.0)
         if w > 0.0
-            out.push(app.Op.Shade(x: x + 3.0, y: y, w: w, h: (pitch - 0.4).max(1.0), color: c.fg, alpha: 0.35))
-    out.push(app.Op.Shade(x: x, y: y0 + f.bar.top.to_float() * pitch, w: MAP_W, h: f.bar.visible.to_float() * pitch, color: c.select_bg, alpha: 0.3))
+            out.push(app.Op.Shade(
+                x: x + 3.0,
+                y: y,
+                w: w,
+                h: (pitch - 0.4).max(1.0),
+                color: c.fg,
+                alpha: 0.35,
+            ))
+    out.push(app.Op.Shade(
+        x: x,
+        y: y0 + f.bar.top.to_float() * pitch,
+        w: MAP_W,
+        h: f.bar.visible.to_float() * pitch,
+        color: c.select_bg,
+        alpha: 0.3,
+    ))
     out
 
 ## The whole canvas, back to front.

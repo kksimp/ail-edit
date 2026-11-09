@@ -3741,7 +3741,12 @@ fn key_rows() List[KeyRow]
             "ctrl+q",
             "Quit; with unsaved changes in any tab, press it twice. Closing the window counts as Ctrl-Q",
         ),
-        key_row("Palette", "Toggle minimap", "", "Show or hide the minimap beside the text (window)"),
+        key_row(
+            "Palette",
+            "Toggle minimap",
+            "",
+            "Show or hide the minimap beside the text (window)",
+        ),
         key_row("Palette", "Toggle zen mode", "", "Hide the tab strip and status bar (window)"),
         key_row(
             "Mouse",
