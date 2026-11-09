@@ -100,8 +100,9 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-Shift-T | Next theme: dark, light, solarized, high-contrast; remembered for the next start |
 | Ctrl-, | Settings list: Up/Down, Enter changes the value (theme, font size, reopen tabs, welcome screen, git marks) and saves it to `~/.ail-edit`; Esc closes |
 | Ctrl-Shift-N | Type a name, Enter: `ail new NAME` creates `NAME/` with `ail.pkg` and `main.ail`, and opens `main.ail` |
-| Palette only | Type `NEWKEY as COMMAND` (a palette name or a key, e.g. `ctrl+alt+t as Next theme`), Enter: saved as `bind.NEWKEY` in `~/.ail-edit`; the original key keeps working |
-| Palette only | The welcome screen with the recent projects; any key dismisses it |
+| palette | Type `NEWKEY as COMMAND` (a palette name or a key, e.g. `ctrl+alt+t as Next theme`), Enter: saved as `bind.NEWKEY` in `~/.ail-edit`; the original key keeps working |
+| palette | The welcome screen with the recent projects; any key dismisses it |
+| palette | Opens the file picker: type a path, and Enter on a path nothing matches creates that file |
 | Ctrl-Q | Quit; with unsaved changes in any tab, press it twice. Closing the window counts as Ctrl-Q |
 | Mouse | Click places the caret, drag or Shift-click selects, the wheel scrolls, a click on a diagnostic or an output location jumps to it |
 

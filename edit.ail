@@ -2910,8 +2910,6 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
             continue
         assert(not names.contains(r.name))
         names.add(r.name)
-        if r.spec.starts_with("cmd:")
-            continue
         match key_event(r.spec)
             Key(k, ctrl, alt, shift) =>
                 assert(
@@ -3836,16 +3834,22 @@ fn key_rows() List[KeyRow]
             "Type a name, Enter: `ail new NAME` creates `NAME/` with `ail.pkg` and `main.ail`, and opens `main.ail`",
         ),
         key_row(
-            "Palette only",
+            "palette",
             "Rebind a key",
-            "cmd:rebind",
+            "",
             "Type `NEWKEY as COMMAND` (a palette name or a key, e.g. `ctrl+alt+t as Next theme`), Enter: saved as `bind.NEWKEY` in `~/.ail-edit`; the original key keeps working",
         ),
         key_row(
-            "Palette only",
+            "palette",
             "Welcome screen",
-            "cmd:welcome",
+            "",
             "The welcome screen with the recent projects; any key dismisses it",
+        ),
+        key_row(
+            "palette",
+            "New file",
+            "",
+            "Opens the file picker: type a path, and Enter on a path nothing matches creates that file",
         ),
         key_row(
             "Ctrl-Q",
@@ -4027,7 +4031,15 @@ fn Workspace.new_file(mut self, path str)
 ## `key_rows()` and one arm here, which a slice adds for its own command.
 fn Workspace.run_command(mut self, name str)
     match name
+        "Rebind a key" => start_mode("bind", "rebind: ")
+        "Welcome screen" => welcome = true
+        "New file" => start_new_file()
         _ => message = "no command `{name}`"
+
+## The "New file" palette row: the file picker, with a hint.
+fn Workspace.start_new_file(mut self)
+    start_picking()
+    message = "type a path; Enter on a path nothing matches creates the file"
 
 # ---- Tabs ---------------------------------------------------------------
 
