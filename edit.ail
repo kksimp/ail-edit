@@ -16,6 +16,7 @@ use std.screen.cells as scells
 use themes
 use features.diff as sdiff
 use features.tests as ttree
+use features.taskpanel as tp
 
 # Colors, 0xRRGGBB.
 BG := 0x1e1e1e
@@ -192,6 +193,8 @@ struct Editor
     missed Set[int]
     ## Lines that differ from git HEAD (Ctrl-Shift-G, S5), 0-based; cleared by an edit.
     git_marks Set[int]
+    ## Lines of declarations the edit since the base revision affects (S4), 0-based; cleared by an edit.
+    impact Set[int]
     ## Successful saves, so the workspace can check the other tabs.
     saves int
     ## The last tests-on-save result for the status line, or "" (ADR 0354).
@@ -239,6 +242,7 @@ fn Editor.new(path str, text str, cols int, rows int) Editor
         rename: RenamePlan(name: "", at: [], semantic: false),
         missed: Set[int](),
         git_marks: Set[int](),
+        impact: Set[int](),
         saves: 0,
         tests: "",
         comp_sel: 0,
@@ -265,6 +269,7 @@ fn Editor.snapshot(mut self)
     diags = []
     missed = Set[int]()
     git_marks = Set[int]()
+    impact = Set[int]()
 
 fn Editor.set_col(mut self, c int)
     col = c
@@ -1425,6 +1430,8 @@ fn Editor.render(self) Screen
             s.put(r, 0, "{num.pad_left(gw - 1, ' ')}!", ERROR_FG, bg)
         elif git_marks.contains(l)
             s.put(r, 0, "{num.pad_left(gw - 1, ' ')}+", COMMENT_FG, bg)
+        elif impact.contains(l)
+            s.put(r, 0, "{num.pad_left(gw - 1, ' ')}~", WARN_FG, bg)
         else
             s.put(r, 0, "{num.pad_left(gw - 1, ' ')} ", GUTTER_FG, bg)
         cs := lines[l].chars()
@@ -3782,6 +3789,24 @@ fn key_rows() List[KeyRow]
             "As replay, with every trace event (`ail test --trace=all --bundle`) (S6)",
         ),
         key_row(
+            "Ctrl-Shift-K",
+            "Task panel",
+            "ctrl+shift+k",
+            "The open `ail task` (`.ail-task`): goal, base, last verify, and the impact since the base (`ail ask --affected --json`): changed and affected declarations, affected tests, changed effects; Up/Down, Enter jumps; V verifies, F finishes, X aborts (`ail task`). After each save, affected declarations are marked `~` in the gutter until the next edit (S4)",
+        ),
+        key_row(
+            "F8",
+            "Affected tests",
+            "f8",
+            "Run only the tests the changes since the base can reach (`ail test --affected`, since the open task's base, else `HEAD`); the saved file is compared, so save first (S4)",
+        ),
+        key_row(
+            "F7",
+            "Task verify",
+            "f7",
+            "Run `ail task verify` (check, then the affected tests) and show the answer: result, failing stage, last lines, next step (S4)",
+        ),
+        key_row(
             "Ctrl-Shift-H",
             "Replace in files",
             "ctrl+shift+h",
@@ -3886,6 +3911,9 @@ enum WsKey
     ReplaceInFiles
     TestOnSave
     TestTool(mode str)
+    TaskPanel
+    AffectedTests
+    TaskVerify
     Zoom(key str)
     Diff(kind str)
 
@@ -3897,6 +3925,10 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
             return Trace
         if k == "f6" and shift
             return TestTool("one")
+        if k == "f7" and not shift
+            return TaskVerify
+        if k == "f8" and not shift
+            return AffectedTests
         if k == "f12" and shift
             return References
         return none
@@ -3923,6 +3955,7 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
             "y" | "Y" => TestTool("replay")
             "z" | "Z" => TestTool("shrink")
             "x" | "X" => TestTool("contracts")
+            "k" | "K" => TaskPanel
             _ => none
     match k
         "b" | "B" => Tree
@@ -4201,6 +4234,9 @@ fn Workspace.on_event(mut self, ev ui.Event)
                     Problems => problems()
                     References => show_references()
                     ReplaceInFiles => start_replace()
+                    TaskPanel => task_panel()
+                    AffectedTests => eds[active].affected_tests()
+                    TaskVerify => task_action("verify")
                     TestOnSave =>
                         test_on_save = not test_on_save
                         if test_on_save
@@ -4212,6 +4248,7 @@ fn Workspace.on_event(mut self, ev ui.Event)
             eds[active].on_event(ev)
             if eds[active].saves != saves
                 check_other_tabs()
+                eds[active].impact_refresh()
                 if hits_title.starts_with("program card")
                     card_view()
                 if live_problems
@@ -4662,6 +4699,9 @@ fn Workspace.hits_key(mut self, k str) bool
     if hits.len() == 0
         browsing = false
         return false
+    if hits_title.starts_with("task") and tp.action_for(k) != ""
+        task_action(tp.action_for(k))
+        return true
     if k == "up"
         hit_sel = (hit_sel - 1).max(0)
     elif k == "down"
@@ -4962,6 +5002,114 @@ fn Editor.coverage(mut self)
             message = "coverage: lines {jint(j, "lines_hit")}/{jint(j, "lines")}, functions {jint(j, "functions_hit")}/{jint(j, "functions")}; unrun lines are marked; an edit clears them"
             return
     message = "no coverage: does the file have @test functions? (exit {r.status})"
+
+# ---- The task panel and impact gutter (S4, features/taskpanel) ---------------
+
+## The open task, from `.ail-task` in the working directory (task.state.1).
+fn task_job() tp.Job
+    text := fs.read_text(".ail-task") else return tp.parse_job("")
+    tp.parse_job(text)
+
+## `ail ask FILE --affected --json` against `rev` (api.impact.3-4).
+fn impact_of(file str, rev str) tp.Impact
+    r := proc.run(ail_command(), [
+        "ask",
+        file,
+        "--affected",
+        "--rev",
+        rev,
+        "--json",
+    ]) else return tp.parse_impact("")
+    tp.parse_impact(r.out)
+
+## After a save: marks the affected declarations in the gutter. Nothing is
+## marked when the file can't be compared (no git revision, or errors).
+fn Editor.impact_refresh(mut self)
+    if dirty
+        return
+    job := task_job()
+    mut rev := "HEAD"
+    if job.open and job.program == path
+        rev = job.rev
+    imp := impact_of(path, rev)
+    mut ids := List[str]()
+    mut at := List[int]()
+    for sym in symbols
+        ids.push(sym.id)
+        at.push(sym.line)
+    impact = tp.marked_lines(ids, at, imp)
+
+## Ctrl-Shift-Y: only the tests the changes can reach (test.affected.1).
+fn Editor.affected_tests(mut self)
+    if dirty
+        message = "affected tests compare the saved file: save first"
+        return
+    job := task_job()
+    mut args := ["test", path, "--affected"]
+    if job.open and job.program == path
+        args.push("--since")
+        args.push(job.rev)
+    r := proc.run(ail_command(), args) else err
+        message = "can't run {err.cmd}: {err.kind}"
+        return
+    show_output("test --affected", r)
+
+## The panel's task and impact: the open task's program, else the active tab.
+fn Workspace.task_impact(self, job tp.Job) tp.Impact
+    if job.open
+        return impact_of(job.program, job.rev)
+    if eds[active].dirty
+        return tp.parse_impact("")
+    impact_of(eds[active].path, "HEAD")
+
+## `--print --task-json`: the panel for agents (plan D4).
+fn Workspace.task_json(self) str
+    job := task_job()
+    tp.panel_json(job, task_impact(job))
+
+## Ctrl-Shift-K: the task panel as a list; a row with a declaration jumps to it.
+fn Workspace.task_panel(mut self)
+    job := task_job()
+    ed := eds[active]
+    mut found := List[Hit]()
+    for r in tp.panel_rows(job, task_impact(job))
+        mut loc := Loc(path: "", line: 0, col: 0)
+        for sym in ed.symbols
+            if r.id != "" and sym.id == r.id
+                loc = Loc(path: ed.path, line: sym.line, col: 1)
+        found.push(Hit(loc: loc, text: r.text))
+    show_list("task", found)
+
+## V, F or X in the panel: `ail task verify|finish|abort`, answer shown as rows.
+fn Workspace.task_action(mut self, sub str)
+    mut args := ["task", sub]
+    if sub != "abort"
+        args.push("--json")
+    r := proc.run(ail_command(), args) else err
+        message = "can't run {err.cmd}: {err.kind}"
+        return
+    mut found := List[Hit]()
+    for l in tp.answer_rows("{r.out}{r.err}")
+        found.push(Hit(loc: Loc(path: "", line: 0, col: 0), text: l))
+    show_list("task {sub}", found)
+
+@test fn the_task_panel_has_its_keys_and_marks_the_gutter()
+    kk := workspace_key("k", true, true) else Zoom("")
+    assert(kk == TaskPanel)
+    ky := workspace_key("f8", false, false) else Zoom("")
+    assert(ky == AffectedTests)
+    kv := workspace_key("f7", false, false) else Zoom("")
+    assert(kv == TaskVerify)
+    mut ed := typed("fn a()\n    1\n", [])
+    ed.impact = Set[int]()
+    ed.impact.add(0)
+    mut mark := ""
+    for sp in ed.render().spans
+        if sp.row == 0 and sp.col == 0
+            mark = sp.text
+    assert(mark.ends_with("~"))
+    ed.apply(Insert("x"))
+    assert_eq(ed.impact.len(), 0)
 
 # ---- The program card (Ctrl-Shift-I) --------------------------------------
 
@@ -5607,6 +5755,9 @@ fn print_screen(ed Editor, flags List[str])
             ws.on_event(key_event(spec))
         elif f == "--idle"
             ws.idle(time.now_ms() + 1000)
+        elif f == "--task-json"
+            print(ws.task_json())
+            return
     shown := ws.render()
     if flags.contains("--screen")
         runs := [
