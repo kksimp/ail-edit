@@ -18,6 +18,7 @@ use std.screen.cells as scells
 use themes
 use window as win
 use features.diff as sdiff
+use features.semantic as sem
 use features.tests as ttree
 use features.taskpanel as tp
 
@@ -45,6 +46,11 @@ WARN_BG := 0x4d4a1d
 SELECT_BG := 0x264f78
 BRACKET_BG := 0x3b514d
 OCCUR_BG := 0x343a40
+## Colors of the semantic layer (slice S3): functions, constants, fields, variants.
+FN_FG := 0xdcdcaa
+CONST_FG := 0x4fc1ff
+FIELD_FG := 0x9cdcfe
+VARIANT_FG := 0xd7ba7d
 ERROR_FG := 0xf48771
 WARN_FG := 0xcca700
 
@@ -60,6 +66,10 @@ FG_KINDS := {
     "number": NUMBER_FG,
     "comment": COMMENT_FG,
     "attr": ATTR_FG,
+    "fn": FN_FG,
+    "const": CONST_FG,
+    "field": FIELD_FG,
+    "variant": VARIANT_FG,
     "error_fg": ERROR_FG,
     "warn_fg": WARN_FG,
 }
@@ -203,6 +213,8 @@ struct Editor
     ## The last tests-on-save result for the status line, or "" (ADR 0354).
     tests str
     comp_sel int
+    ## The semantic layer (Ctrl-Shift-L): kind colors, code lens, inlay hints, pending fix preview.
+    layer sem.State
 
 fn Editor.new(path str, text str, cols int, rows int) Editor
     mut lines := text.split("\n")
@@ -249,6 +261,7 @@ fn Editor.new(path str, text str, cols int, rows int) Editor
         saves: 0,
         tests: "",
         comp_sel: 0,
+        layer: sem.State.new(),
         selecting: false,
         anchor_line: 0,
         anchor_col: 0,
@@ -851,10 +864,19 @@ fn Editor.auto_complete_members(mut self)
     if completing
         message = ""
 
-## After a `(`, shows the signature of the function or method before it.
+## Shows the signature popup for the call the cursor is inside: after a
+## `(`, while typing its arguments, and on Ctrl-Shift-Space. It walks back
+## to the call's unmatched `(`, finds the function or method named before
+## it in the `--symbols` index, and marks the current argument; the rows add
+## the contracts, effects and error set from the same index entry. Closed
+## when the cursor leaves the call.
 fn Editor.signature_help(mut self)
+    layer.sig = sem.View(rows: [], from: 0, to: 0)
     cs := cur()
-    mut b := col - 1
+    call := sem.call_at(cs, col)
+    if call.open < 0
+        return
+    mut b := call.open
     while b > 0 and cs[b - 1] == ' '
         b -= 1
     mut a := b
@@ -865,7 +887,7 @@ fn Editor.signature_help(mut self)
     name := cs[a..b].join("")
     for sym in symbols
         if sym.name == name and (sym.kind == "fn" or sym.kind == "method")
-            message = sym.signature
+            layer.sig = sem.sig_view(sym.signature, sym.facts, call.arg, a > 0 and cs[a - 1] == '.')
             return
 
 fn Editor.open_completion(mut self)
@@ -1440,7 +1462,9 @@ fn Editor.render(self) Screen
         cs := lines[l].chars()
         if left >= cs.len()
             continue
-        fgs := line_colors(cs, starts_inside)
+        mut fgs := line_colors(cs, starts_inside)
+        if layer.level > 0
+            fgs = sem.recolor(cs, fgs, layer.kinds, layer_colors())
         end := cs.len().min(left + w)
         marks := word_marks(cs, here)
         mut bgs := List[int]()
@@ -1464,6 +1488,8 @@ fn Editor.render(self) Screen
         mark_bracket(mut s, b.end_line, b.end_col)
     if completing
         render_popup(mut s)
+    elif layer.sig.rows.len() > 0
+        render_sig(mut s)
     # A diagnostic at the end of a line shows as one marked cell, and the
     # first diagnostic of each line shows its message after the line.
     mut shown := Set[int]()
@@ -1486,6 +1512,8 @@ fn Editor.render(self) Screen
             x := (gw + n - left + 3).max(gw)
             if x < cols
                 s.put(r, x, "-- {d.message}", fg, line_bg)
+    if layer.level > 0 or layer.hints_on
+        render_ghosts(mut s, h, gw, shown)
     status_row := h
     s.band(status_row, STATUS_BG)
     mut flag := ""
@@ -1516,6 +1544,30 @@ fn Editor.mark_bracket(self, mut s Screen, l int, c int)
 
 ## The completion popup: below the cursor (above it near the bottom), at
 ## the start of the word, at most 8 entries around the selected one.
+## The signature popup: above the cursor's line (below it near the top),
+## the current argument on a selected background.
+fn Editor.render_sig(self, mut s Screen)
+    v := layer.sig
+    mut width := 0
+    for row in v.rows
+        width = width.max(row.chars().len() + 2)
+    width = width.min(cols).max(1)
+    n := v.rows.len()
+    x := gutter_width().min((cols - width).max(0))
+    mut y := line - top - n
+    if y < 0
+        y = line - top + 1
+    for k in 0..n
+        bg := PANE_BG
+        s.put(y + k, x, " ".repeat(width), FG, bg)
+        if k == 0
+            cs := v.rows[0].chars()
+            s.put(y, x + 1, cs[..v.from].join(""), FG, bg)
+            s.put(y, x + 1 + v.from, cs[v.from..v.to].join(""), FG, SELECT_BG)
+            s.put(y, x + 1 + v.to, cs[v.to..].join(""), FG, bg)
+        else
+            s.put(y + k, x + 1, v.rows[k], GUTTER_FG, bg)
+
 fn Editor.render_popup(self, mut s Screen)
     n := completions.len().min(8)
     cs := cur()
@@ -1713,6 +1765,7 @@ fn Editor.apply(mut self, cmd Command)
             pane = Diags
             message = ""
             selecting = false
+            layer.sig = sem.View(rows: [], from: 0, to: 0)
         Quit =>
             if dirty and not quit_armed
                 quit_armed = true
@@ -1723,6 +1776,8 @@ fn Editor.apply(mut self, cmd Command)
             cols = c
             rows = r
         Format | Rename | Save | Check | Explain | Outline => return
+    if layer.sig.rows.len() > 0
+        signature_help()
     scroll()
 
 ## Up, Down and Enter in the outline pane; true if `cmd` was one of them.
@@ -2134,6 +2189,7 @@ fn Editor.save(mut self)
     dirty = false
     saves += 1
     check()
+    refresh_layer()
     message = "saved; {message}"
 
 fn Editor.explain(mut self)
@@ -2148,6 +2204,7 @@ fn Editor.explain(mut self)
         pane_text.push("help: {d.help}")
     for l in r.out.lines()
         pane_text.push(l)
+    explain_extras(d)
     pane = Text
     message = "explain {d.rule}; Esc closes"
 
@@ -2188,6 +2245,10 @@ fn Editor.run(mut self, cmd Command)
             apply(cmd)
         scroll()
         return
+    if cmd == Fix
+        layer_key("f")
+        scroll()
+        return
     if cmd == Save or cmd == Check or cmd == Explain or cmd == Outline or cmd == Format
         prompt = NoPrompt
         completing = false
@@ -2204,6 +2265,274 @@ fn Editor.run(mut self, cmd Command)
     else
         apply(cmd)
     scroll()
+
+# ---- Semantic layer (slice S3) ------------------------------------------
+
+## How many `ail api --locals` questions one refresh may ask.
+HINT_QUERIES := 30
+
+fn layer_colors() sem.Colors
+    sem.Colors(
+        plain: FG,
+        type_fg: TYPE_FG,
+        fn_fg: FN_FG,
+        const_fg: CONST_FG,
+        field_fg: FIELD_FG,
+        variant_fg: VARIANT_FG,
+    )
+
+## The effects of a declaration's facts (`effects: io, fs`), or "".
+fn effects_text(facts List[str]) str
+    for f in facts
+        if e := f.strip_prefix("effects: ")
+            return e
+    ""
+
+## Whether the declaration on 1-based line `n` is a test.
+fn Editor.test_at(self, n int) bool
+    i := n - 1
+    if i < 0 or i >= lines.len()
+        return false
+    lines[i].contains("@test") or i > 0 and lines[i - 1].trim() == "@test"
+
+## The index of the next line after `l` that holds code, or -1.
+fn Editor.next_code_line(self, l int) int
+    mut m := l + 1
+    while m < lines.len()
+        t := lines[m].trim()
+        if t != "" and not t.starts_with("#")
+            return m
+        m += 1
+    -1
+
+## Rebuilds what the layer shows from `ail api`: kind colors and the code
+## lens from `--symbols`, and at level 2 the inlay hints.
+fn Editor.refresh_layer(mut self)
+    if layer.level == 0 and not layer.hints_on
+        return
+    index()
+    mut names := List[str]()
+    mut kinds := List[str]()
+    mut decls := List[sem.Decl]()
+    for sym in symbols
+        names.push(sym.name)
+        kinds.push(sym.kind)
+        decls.push(sem.Decl(
+            id: sym.id,
+            kind: sym.kind,
+            line: sym.line,
+            effects: effects_text(sym.facts),
+            test: test_at(sym.line),
+        ))
+    mut uses := Map[str, int]()
+    for r in refs
+        uses[r.id] = (uses.get(r.id) else 0) + 1
+    layer.kinds = sem.kind_index(names, kinds)
+    layer.lens = sem.lens_rows(decls, uses)
+    layer.hints = Map[int, str]()
+    if layer.hints_on
+        compute_hints()
+
+## Inlay hints for the bindings on the visible lines: a local is in scope
+## from the line after its binding, so `--locals` is asked at the next code
+## line. Bottom to top, so one answer also holds the bindings above it in
+## the same block; at most HINT_QUERIES questions.
+fn Editor.compute_hints(mut self)
+    mut found := Map[int, str]()
+    mut answers := List[Json]()
+    mut cands := List[int]()
+    last := (top + text_rows()).min(lines.len())
+    for l in top..last
+        if sem.binding_name(lines[l]) != ""
+            cands.push(l)
+    mut asked := 0
+    mut i := cands.len() - 1
+    while i >= 0
+        l := cands[i]
+        i -= 1
+        name := sem.binding_name(lines[l])
+        mut hit := ""
+        for old in answers
+            hit = sem.hint_in(old, name, l + 1)
+            if hit != ""
+                break
+        if hit == "" and asked < HINT_QUERIES
+            m := next_code_line(l)
+            if m >= 0
+                asked += 1
+                if ans := api_at("--locals", text(), m + 1, indent_of(lines[m]) + 1)
+                    answers.push(ans)
+                    hit = sem.hint_in(ans, name, l + 1)
+        if hit != ""
+            found[l] = hit
+    layer.hints = found
+
+## The layer's text after each visible line, where no diagnostic message is.
+fn Editor.render_ghosts(self, mut s Screen, h int, gw int, shown Set[int])
+    for r in 0..h
+        l := top + r
+        if l >= lines.len()
+            break
+        if shown.contains(l + 1)
+            continue
+        t := sem.ghost(layer, l)
+        if t == ""
+            continue
+        mut bg := BG
+        if l == line
+            bg = LINE_BG
+        x := (gw + lines[l].len() - left + 2).max(gw)
+        s.put(r, x, t, GUTTER_FG, bg)
+
+## The layer's commands: "l" cycles the kind colors and code lens (palette),
+## "h" toggles inlay hints (Alt-I), "x" is fix-all (Ctrl-Shift-.), "y" is
+## the `ail fix` preview (palette), "f" previews the first fix (Ctrl-.).
+fn Editor.layer_key(mut self, k str)
+    layer.pending = false
+    layer.proposed = []
+    if k == "l"
+        if layer.level == 0
+            layer.level = 1
+        else
+            layer.level = 0
+        refresh_layer()
+        if layer.level == 0
+            message = "semantic layer: off"
+        else
+            message = "semantic layer: kind colors and code lens"
+    elif k == "h"
+        layer.hints_on = not layer.hints_on
+        layer.hints = Map[int, str]()
+        refresh_layer()
+        if layer.hints_on
+            message = "inlay hints: on (refreshed on save)"
+        else
+            message = "inlay hints: off"
+    elif k == "f"
+        fix_preview()
+    elif k == "x"
+        fix_all_preview()
+    else
+        ail_fix_preview()
+
+## The edits of a diagnostic's first fix, for the semantic module.
+fn sem_edits(fix List[TextEdit]) List[sem.Edit]
+    mut out := List[sem.Edit]()
+    for e in fix
+        out.push(sem.Edit(
+            line: e.line,
+            col: e.col,
+            end_line: e.end_line,
+            end_col: e.end_col,
+            text: e.text,
+        ))
+    out
+
+## Shows `title` and the changes from the buffer to `next`; Enter applies
+## them, any other key cancels.
+fn Editor.propose(mut self, title str, next List[str])
+    diff := sem.diff_rows(lines, next, (pane_rows() - 2).max(1))
+    layer.pending = true
+    layer.proposed = next
+    pane_text = [title]
+    for row in diff
+        pane_text.push(row)
+    pane = Text
+    message = "Enter applies, any other key cancels"
+
+## Ctrl-.: the first fix of the diagnostic under the cursor, as a preview.
+fn Editor.fix_preview(mut self)
+    d := diag_here() else
+        message = "no diagnostic here"
+        return
+    if d.fix.len() == 0
+        message = "no fix for {d.rule}"
+        return
+    propose("fix: {d.fix_title}", sem.apply_edits(lines, reversed_edits(d.fix)))
+
+fn Editor.fix_all_preview(mut self)
+    mut fixes := List[sem.Fix]()
+    for d in diags
+        if d.fix.len() > 0
+            fixes.push(sem.Fix(rule: d.rule, title: d.fix_title, edits: sem_edits(d.fix)))
+    if fixes.len() == 0
+        message = "no fixes: Ctrl-K checks, and not every diagnostic has one"
+        return
+    plan := sem.fix_all(fixes)
+    propose("fix all: {plan.titles.len()} fixes", sem.apply_edits(lines, plan.edits))
+
+## `ail fix` on a copy of the buffer: the text it leaves, or none.
+fn Editor.fixed_text(mut self) str?
+    file := "{path}.edit-fix.ail"
+    fs.write_text(file, text()) else err
+        message = "can't write {err.path}: {err.kind}"
+        return none
+    r := proc.run(ail_command(), ["fix", file]) else err
+        message = "can't run {err.cmd}: {err.kind}"
+        return none
+    mut out := ""
+    if r.status < 2
+        out = fs.read_text(file) else ""
+    fs.remove(file) else err
+        message = "can't remove {err.path}: {err.kind}"
+    if out == ""
+        return none
+    out
+
+fn Editor.ail_fix_preview(mut self)
+    fixed := fixed_text() else
+        if message == ""
+            message = "ail fix gave no result"
+        return
+    mut next := fixed.split("\n")
+    if next.len() > 1 and next[next.len() - 1] == ""
+        next.pop()
+    if next == lines
+        message = "ail fix: nothing to fix"
+        return
+    propose("ail fix", next)
+
+## While a preview is pending: Enter applies it, any other key cancels it
+## (and is handled as usual). True if the event was used up.
+fn Editor.layer_confirm(mut self, ev ui.Event) bool
+    match ev
+        Key(k, ctrl, alt, shift) =>
+            if k == "enter" and not ctrl and not alt
+                snapshot()
+                lines = layer.proposed
+                line = line.min(lines.len() - 1)
+                set_col(col.min(cur().len()))
+                layer.pending = false
+                layer.proposed = []
+                pane = Diags
+                scroll()
+                message = "applied; Ctrl-K checks again"
+                return true
+            layer.pending = false
+            layer.proposed = []
+            pane = Diags
+            false
+        Resize(_, _) | Close | Mouse(_, _, _, _) | Scroll(_) => false
+
+## What F1 adds under a rule's text: its spec chapter, and the first fix as
+## a change.
+fn Editor.explain_extras(mut self, d Diag)
+    spec := sem.spec_line(d.rule)
+    if spec != ""
+        pane_text.push(spec)
+    if d.fix.len() > 0
+        pane_text.push("fix: {d.fix_title}")
+        for row in sem.diff_rows(lines, sem.apply_edits(lines, reversed_edits(d.fix)), 6)
+            pane_text.push(row)
+
+## A fix's edits last to first, as `apply_fix` applies them.
+fn reversed_edits(fix List[TextEdit]) List[sem.Edit]
+    mut out := List[sem.Edit]()
+    mut i := fix.len() - 1
+    while i >= 0
+        out.push(sem_edits([fix[i]])[0])
+        i -= 1
+    out
 
 # ---- Tests (headless) ---------------------------------------------------
 
@@ -2733,7 +3062,7 @@ fn fg_at(s Screen, row int, col int) int
     ed.apply(Backspace)
     for c in ["a", "d", "d", "("]
         ed.apply(Insert(c))
-    assert_eq(ed.message, "fn add(a int, b int) int")
+    assert_eq(ed.layer.sig.rows[0], "fn add(a int, b int) int")
     assert_eq(ed.lines[10], "    add()")
 
 @test fn occurrences_and_inline_messages()
@@ -3128,6 +3457,87 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
         for k in t.keys()
             assert(FG_KINDS.contains(k) or BG_KINDS.contains(k))
 
+@test fn the_semantic_layer_colors_declarations_and_shows_a_lens()
+    mut ed := indexed([])
+    ed.layer.level = 1
+    ed.refresh_layer()
+    assert_eq(ed.layer.lens.get(4) else "", "1 ref")
+    assert_eq(ed.layer.lens.get(7) else "", "0 refs | effects: io")
+    s := ed.render()
+    assert(s.text[4].contains("1 ref"))
+    mut fns := 0
+    mut fields := 0
+    for sp in s.spans
+        if sp.fg == FN_FG and sp.text == "add"
+            fns += 1
+        if sp.fg == FIELD_FG and sp.text == "x"
+            fields += 1
+    assert_eq(fns, 2)
+    assert_eq(fields, 1)
+    ed.layer.level = 0
+    assert(not ed.render().text[4].contains("1 ref"))
+
+@test fn inlay_hints_show_after_the_binding_when_on()
+    mut ed := indexed([])
+    ed.layer.hints_on = true
+    ed.layer.hints[8] = "p: P"
+    assert(ed.render().text[8].contains("p: P"))
+    ed.layer_key("h")
+    assert(not ed.layer.hints_on)
+    assert(not ed.render().text[8].contains("p: P"))
+
+@test fn fix_all_previews_then_applies_in_one_undo_step()
+    mut ed := typed("fn main()\n    prnt(1)", [])
+    ed.diags = parse_diags("{DIAG_JSON}\n")
+    ed.layer_key("x")
+    assert(ed.layer.pending)
+    assert(ed.pane_text.contains("2 -     prnt(1)"))
+    assert(ed.pane_text.contains("2 +     print(1)"))
+    assert_eq(ed.lines[1], "    prnt(1)")
+    ed.on_event(Key(key: "enter", ctrl: false, alt: false, shift: false))
+    assert(not ed.layer.pending)
+    assert_eq(ed.lines[1], "    print(1)")
+    ed.apply(Undo)
+    assert_eq(ed.lines[1], "    prnt(1)")
+
+@test fn any_other_key_cancels_a_pending_preview()
+    mut ed := typed("fn main()\n    prnt(1)", [])
+    ed.diags = parse_diags("{DIAG_JSON}\n")
+    ed.layer_key("x")
+    ed.on_event(Key(key: "down", ctrl: false, alt: false, shift: false))
+    assert(not ed.layer.pending)
+    assert_eq(ed.lines[1], "    prnt(1)")
+
+@test fn explain_adds_the_spec_chapter_and_the_fix_as_a_change()
+    mut ed := typed("fn main()\n    prnt(1)", [])
+    ds := parse_diags("{DIAG_JSON}\n")
+    ed.pane_text = []
+    ed.explain_extras(ds[0])
+    assert(ed.pane_text.contains("spec: docs/spec/05-expressions.md (rule expr.name.1)"))
+    assert(ed.pane_text.contains("2 +     print(1)"))
+
+@test fn the_palette_toggles_the_semantic_layer()
+    mut ws := Workspace.new(indexed([]))
+    ws.run_command("Semantic layer")
+    assert_eq(ws.eds[0].layer.level, 1)
+    assert(ws.eds[0].layer.lens.len() > 0)
+    ws.run_command("Semantic layer")
+    assert_eq(ws.eds[0].layer.level, 0)
+
+@test fn ctrl_dot_previews_the_fix_and_ctrl_shift_dot_previews_fix_all()
+    mut ws := Workspace.new(typed("fn main()\n    prnt(1)", []))
+    ws.eds[0].diags = parse_diags("{DIAG_JSON}\n")
+    ws.eds[0].line = 1
+    ws.on_event(Key(key: ".", ctrl: true, alt: false, shift: false))
+    assert(ws.eds[0].layer.pending)
+    assert_eq(ws.eds[0].lines[1], "    prnt(1)")
+    ws.on_event(Key(key: "escape", ctrl: false, alt: false, shift: false))
+    assert(not ws.eds[0].layer.pending)
+    ws.on_event(Key(key: ".", ctrl: true, alt: false, shift: true))
+    assert(ws.eds[0].layer.pending)
+    ws.on_event(Key(key: "enter", ctrl: false, alt: false, shift: false))
+    assert_eq(ws.eds[0].lines[1], "    print(1)")
+
 @test fn settings_keep_other_lines()
     text := with_setting("font 15\ntheme dark\n", "theme", "light")
     assert_eq(text, "font 15\ntheme light\n")
@@ -3305,6 +3715,8 @@ fn Workspace.next_theme(mut self)
 ## Applies one window event. Closing the window is Ctrl-Q: with unsaved
 ## changes the first close asks and the second quits.
 fn Editor.on_event(mut self, ev ui.Event)
+    if layer.pending and layer_confirm(ev)
+        return
     match ev
         Key(k, ctrl, alt, shift) =>
             if cmd := extra_key(k, ctrl, alt, shift)
@@ -3398,8 +3810,14 @@ fn Editor.scroll_by(mut self, n int)
 enum Extra
     RunFile
     TestFile
+    Hints
+    Signature
 
 fn extra_key(key str, ctrl bool, alt bool, shift bool) Extra?
+    if ctrl and shift and not alt and key == " "
+        return Signature
+    if alt and not ctrl and not shift and (key == "i" or key == "I")
+        return Hints
     if ctrl or alt
         return none
     match key
@@ -3410,9 +3828,19 @@ fn extra_key(key str, ctrl bool, alt bool, shift bool) Extra?
 ## F5 runs the buffer with `ail run`, F6 its tests with `ail test`; the
 ## output goes to the pane. Unsaved changes are run as they are.
 fn Editor.run_extra(mut self, x Extra)
+    if x == Hints
+        layer_key("h")
+        return
+    if x == Signature
+        index()
+        signature_help()
+        if layer.sig.rows.len() == 0
+            message = "not inside a call of a known function"
+        return
     words := match x
         RunFile => ["run"]
         TestFile => ["test"]
+        Hints | Signature => []
     r := ail_on_buffer(words) else return
     show_output(words[0], r)
 
@@ -3648,7 +4076,7 @@ fn key_rows() List[KeyRow]
             "Ctrl-.",
             "Apply fix",
             "ctrl+.",
-            "Apply the first fix of the diagnostic under the cursor",
+            "Preview the first fix of the diagnostic under the cursor as a change; Enter applies it, any other key cancels",
         ),
         key_row(
             "F1",
@@ -3856,6 +4284,36 @@ fn key_rows() List[KeyRow]
             "Next theme: dark, light, solarized, high-contrast; remembered for the next start",
         ),
         key_row(
+            "Ctrl-Shift-.",
+            "Fix all",
+            "ctrl+shift+.",
+            "Preview the first non-overlapping fix of every diagnostic, as `ail lsp`'s fix-all takes them; Enter applies them as one undo step, any other key cancels",
+        ),
+        key_row(
+            "Ctrl-Shift-Space",
+            "Signature help",
+            "ctrl+shift+space",
+            "Signature popup for the call the cursor is inside: the signature with the current argument marked, then its contracts, effects and error set; follows the cursor through the arguments, Esc closes",
+        ),
+        key_row(
+            "Alt-I",
+            "Inlay hints",
+            "alt+i",
+            "Toggle inlay hints: the type of each local binding on the visible lines (`ail api --locals`), refreshed on save",
+        ),
+        key_row(
+            "palette",
+            "Semantic layer",
+            "",
+            "Toggle declarations colored by kind, with a code lens after each: uses, effects, test (Ctrl-Shift-P)",
+        ),
+        key_row(
+            "palette",
+            "Fix with ail fix",
+            "",
+            "Preview what `ail fix` makes of the buffer (fix rounds until none is left); Enter applies it as one undo step, any other key cancels (Ctrl-Shift-P)",
+        ),
+        key_row(
             "Ctrl-Q",
             "Quit",
             "ctrl+q",
@@ -3925,6 +4383,7 @@ enum WsKey
     References
     ReplaceInFiles
     TestOnSave
+    Sem(key str)
     TestTool(mode str)
     TaskPanel
     AffectedTests
@@ -3955,6 +4414,7 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
         return Zoom(k)
     if shift
         return match k
+            "." | ">" => Sem("x")
             "p" | "P" => Palette
             "f" | "F" => Search
             "t" | "T" => Theme
@@ -4028,6 +4488,8 @@ fn Workspace.run_command(mut self, name str)
         "Toggle zen mode" => zen = not zen
         "API diff" => diff_view("api")
         "Git change gutter" => diff_view("gutter")
+        "Semantic layer" => eds[active].layer_key("l")
+        "Fix with ail fix" => eds[active].layer_key("y")
         "Update preview" => test_tool("preview")
         "Apply test update" => test_tool("apply")
         "Record tests" => test_tool("record")
@@ -4243,6 +4705,7 @@ fn Workspace.on_event(mut self, ev ui.Event)
                     OpenFile => start_picking()
                     Palette => start_palette()
                     Zoom(z) => zoom(z)
+                    Sem(z) => eds[active].layer_key(z)
                     Search => start_search()
                     NextHit => next_hit()
                     Tree => toggle_tree()
