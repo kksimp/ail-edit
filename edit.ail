@@ -3880,11 +3880,28 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     assert_eq(ws.message, "theme solarized")
     ws.on_event(Key(key: "T", ctrl: true, alt: false, shift: true))
     ws.on_event(Key(key: "T", ctrl: true, alt: false, shift: true))
-    assert_eq(ws.theme, "dark")
+    assert_eq(ws.theme, "ail-dark")
     for name in themes.NAMES
         t := themes.named(name) else unreachable("listed")
         for k in t.keys()
             assert(FG_KINDS.contains(k) or BG_KINDS.contains(k))
+
+@test fn the_ail_themes_are_complete_and_the_default()
+    assert_eq(DEFAULT_THEME, "ail-dark")
+    assert_eq(themes.NAMES[0], DEFAULT_THEME)
+    mut ws := Workspace.new(typed("", []))
+    assert(ws.set_theme("ail-dark"))
+    assert_eq(ws.pal.bg_of(BG), 0x17181c)
+    assert_eq(ws.pal.bg_of(PANE_BG), ws.pal.bg_of(STATUS_BG))
+    assert(ws.set_theme("ail-light"))
+    assert_eq(ws.pal.bg_of(BG), 0xfbfbfc)
+    assert_eq(ws.pal.fg_of(KEYWORD_FG), 0x2f5fd0)
+    # Both name every color kind the older full themes name.
+    full := themes.named("light") else unreachable("listed")
+    for name in ["ail-dark", "ail-light"]
+        t := themes.named(name) else unreachable("listed")
+        for k in full.keys()
+            assert(t.contains(k))
 
 @test fn the_semantic_layer_colors_declarations_and_shows_a_lens()
     mut ed := indexed([])
@@ -4143,13 +4160,16 @@ fn with_setting(text str, key str, value str) str
     out.push("{key} {value}")
     "{out.join("\n")}\n"
 
-## The theme remembered in `~/.ail-edit`, or "dark".
+## The theme remembered in `~/.ail-edit`, or `DEFAULT_THEME`.
 fn saved_theme() str
-    path := settings_path() else return "dark"
+    path := settings_path() else return DEFAULT_THEME
     if not fs.exists(path)
-        return "dark"
-    text := fs.read_text(path) else return "dark"
-    setting(text, "theme") else "dark"
+        return DEFAULT_THEME
+    text := fs.read_text(path) else return DEFAULT_THEME
+    setting(text, "theme") else DEFAULT_THEME
+
+## The theme used when none is saved (slice E1).
+DEFAULT_THEME := "ail-dark"
 
 ## Remembers `name` in `~/.ail-edit`; a failure only shows a message.
 fn save_theme(name str) str
@@ -7860,6 +7880,10 @@ struct Shell
     hover_y float
     tab_drag int
     tab_drop int
+    ## The caret's blink (530 ms on, 530 ms off): visible now, and solid until
+    ## this time (ms) after any key.
+    caret_on bool
+    solid_until int
 
 fn Shell.new(w Workspace) Shell
     Shell(
@@ -7877,6 +7901,8 @@ fn Shell.new(w Workspace) Shell
         hover_y: -1.0,
         tab_drag: -1,
         tab_drop: -1,
+        caret_on: true,
+        solid_until: 0,
     )
 
 ## The code's font size in points: the workspace's cell height, scaled.
@@ -7927,6 +7953,10 @@ fn Shell.frame(self) win.Frame
         select_bg: p.bg_of(SELECT_BG),
         error_fg: p.fg_of(ERROR_FG),
         warn_fg: p.fg_of(WARN_FG),
+        guide_fg: GUIDE_FG,
+        accent: win.accent_for(p.bg_of(BG)),
+        border: win.mix(p.fg_of(FG), p.bg_of(BG), 0.12),
+        muted: win.mix(p.fg_of(FG), p.bg_of(BG), 0.55),
     )
     runs := [
         win.Run(row: sp.row, col: sp.col, text: sp.text, fg: p.fg_of(sp.fg), bg: p.bg_of(sp.bg))
@@ -7973,6 +8003,7 @@ fn Shell.frame(self) win.Frame
         drag_tab: tab_drag,
         drop_tab: tab_drop,
         hover_act: win.activity_hit(m, hover_x, hover_y),
+        caret_on: caret_on,
     )
 
 ## A key as the workspace takes it.
@@ -8018,6 +8049,20 @@ fn Shell.pointer_down(mut self, ev app.Event)
     held = ev.text == "left"
     ws.on_event(Mouse(col: cell.col, row: cell.row, button: "left", kind: "down"))
 
+## The caret after a blink tick: it flips, except within 500 ms of a key.
+fn Shell.caret_on_now(self) bool
+    if time.now_ms() < solid_until
+        return true
+    not caret_on
+
+## Posts a blink tick every 530 ms until `stop` holds 1.
+fn blinker(inbox app.Inbox, stop Mutex[int])
+    while true
+        time.sleep_ms(530)
+        if stop.get() == 1
+            break
+        inbox.post(app.external("blink", ""))
+
 impl app.App for Shell
     fn update(mut self, ev app.Event)
         match ev.kind
@@ -8027,7 +8072,12 @@ impl app.App for Shell
                     ph = ev.dy
                     cellw = ev.cell_w
                     cellh = ev.cell_h
+            "external" =>
+                if ev.id == "blink"
+                    caret_on = caret_on_now()
             "key" =>
+                solid_until = time.now_ms() + 500
+                caret_on = true
                 press_key(win.key_spec(ev.text, ev.ctrl, ev.meta, ev.alt, ev.shift))
             "paste" =>
                 if ws.picking or ws.searching
@@ -8147,9 +8197,20 @@ fn app_main(mut ed Editor, flags List[str])
     if not ws.set_theme(name)
         ws.message = "no theme `{name}`: try {themes.NAMES.join(", ")}"
     mut sh := Shell.new(ws)
-    app.run(mut sh) else err
+    host := app.host_path() else err
         print("edit: no window ({err.kind}: {err.message}); printing the screen instead")
         print_screen(ed, flags)
+        return
+    inbox := app.new_inbox()
+    stop := Mutex(0)
+    g := TaskGroup()
+    g.add(spawn blinker(inbox, stop))
+    app.run_with(mut sh, host, [], inbox) else err
+        print("edit: no window ({err.kind}: {err.message}); printing the screen instead")
+        stop.set(1)
+        print_screen(ed, flags)
+        return
+    stop.set(1)
 
 ## Opens the window, or prints one screen when there's no display.
 fn window_main(mut ed Editor, flags List[str])

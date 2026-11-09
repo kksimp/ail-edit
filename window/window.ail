@@ -13,6 +13,10 @@ pub SCROLL_W := 12.0
 pub TAB_PAD := 14.0
 pub TAB_CLOSE_W := 22.0
 pub MIN_LINE_H := 14.0
+## A grid row is this many times the mono font's cell height; text is centred in it.
+pub ROW_SCALE := 1.4
+## Space above the first text row, in points.
+pub TOP_PAD := 6.0
 pub MAP_W := 80.0
 ## The activity bar's width, and the keys its three icons press.
 pub ACT_W := 40.0
@@ -30,6 +34,37 @@ pub struct Colors
     pub select_bg int
     pub error_fg int
     pub warn_fg int
+    ## The color of indent-guide cells (`|` marks), drawn as thin lines.
+    pub guide_fg int
+    ## The caret and active-item color, chosen by the background's luma.
+    pub accent int
+    ## `fg` at 12 % over `bg`: hairlines.
+    pub border int
+    ## `fg` at 55 % over `bg`: secondary text.
+    pub muted int
+
+## `top` at `alpha` over `under`, as 0xRRGGBB.
+pub fn mix(top int, under int, alpha float) int
+    mut out := 0
+    for shift in [16, 8, 0]
+        a := top.shr(shift).bit_and(255).to_float()
+        b := under.shr(shift).bit_and(255).to_float()
+        v := (a * alpha + b * (1.0 - alpha)).round().to_int().max(0).min(255)
+        out = out.shl(8).bit_or(v)
+    out
+
+## The brightness of 0xRRGGBB, 0.0 to 1.0.
+pub fn luma(c int) float
+    r := c.shr(16).bit_and(255).to_float()
+    g := c.shr(8).bit_and(255).to_float()
+    b := c.bit_and(255).to_float()
+    (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+
+## The accent for a background: a bright blue on dark, the system blue on light.
+pub fn accent_for(bg int) int
+    if luma(bg) < 0.5
+        return 0x0a84ff
+    0x007aff
 
 ## A run of text on one row of the cell grid.
 pub struct Run
@@ -91,6 +126,8 @@ pub struct Frame
     pub drop_tab int
     ## The hovered activity icon, -1 for none.
     pub hover_act int
+    ## Whether the caret is in the visible half of its blink.
+    pub caret_on bool
 
 ## How grid cells map to points.
 pub struct Metrics
@@ -99,7 +136,10 @@ pub struct Metrics
     ## The mono font size in points, one cell's width and height.
     pub size float
     pub cw float
+    ## A grid row's height (`ROW_SCALE` times the glyph height) and the space
+    ## above a line of text that centres it in the row.
     pub ch float
+    pub pad float
     ## The tab strip's height; grid row 0 is the strip, row 1 starts at `tab_h`.
     pub tab_h float
     ## The grid's left edge: the activity bar's width, 0 in zen mode.
@@ -120,18 +160,31 @@ pub fn metrics(
 ) Metrics
     k := size / 13.0
     cw := (cell_w * k).max(1.0)
-    ch := (cell_h * k).max(MIN_LINE_H)
-    tab_h := (ch * 1.5).ceil()
+    gh := (cell_h * k).max(MIN_LINE_H)
+    ch := (gh * ROW_SCALE).ceil()
+    pad := ((ch - gh) / 2.0).floor()
+    tab_h := (gh * 1.5).ceil()
     right := SCROLL_W + (if minimap then MAP_W else 0.0)
     cols := ((w - x0 - right) / cw).floor().to_int().max(10)
-    rows := (1.0 + ((h - tab_h) / ch).floor()).to_int().max(4)
-    Metrics(w: w, h: h, size: size, cw: cw, ch: ch, tab_h: tab_h, x0: x0, cols: cols, rows: rows)
+    rows := (1.0 + ((h - tab_h - TOP_PAD) / ch).floor()).to_int().max(4)
+    Metrics(
+        w: w,
+        h: h,
+        size: size,
+        cw: cw,
+        ch: ch,
+        pad: pad,
+        tab_h: tab_h,
+        x0: x0,
+        cols: cols,
+        rows: rows,
+    )
 
 ## The top edge of grid row `r`.
 pub fn row_y(m Metrics, r int) float
     if r <= 0
         return 0.0
-    m.tab_h + (r - 1).to_float() * m.ch
+    m.tab_h + TOP_PAD + (r - 1).to_float() * m.ch
 
 ## The grid cell under point (`x`, `y`); row 0 is the tab strip.
 pub struct Cell
@@ -141,7 +194,7 @@ pub struct Cell
 pub fn cell_at(m Metrics, x float, y float) Cell
     mut r := 0
     if y >= m.tab_h
-        r = 1 + ((y - m.tab_h) / m.ch).floor().to_int()
+        r = 1 + ((y - m.tab_h - TOP_PAD) / m.ch).floor().to_int().max(0)
     c := ((x - m.x0) / m.cw).floor().to_int().max(0)
     Cell(col: c, row: r.min(m.rows - 1))
 
@@ -378,6 +431,12 @@ pub fn grid_ops(f Frame, m Metrics) List[app.Op]
     c := f.colors
     mut ops := List[app.Op]()
     ops.push(app.draw_rect(0.0, m.tab_h, m.w, m.h - m.tab_h, c.bg))
+    # The current line's band runs the full width of the text, not just the grid.
+    for r in f.runs
+        if r.row == f.cursor_row and r.col == 0 and r.bg == c.line_bg and r.row != f.status_row
+            w := m.w - m.x0 - SCROLL_W
+            ops.push(app.draw_rect(m.x0, row_y(m, r.row), w, m.ch, c.line_bg))
+            break
     for r in f.runs
         if r.row <= 0 or r.row == f.status_row
             continue
@@ -393,35 +452,49 @@ pub fn grid_ops(f Frame, m Metrics) List[app.Op]
     for r in f.runs
         if r.row <= 0 or r.row == f.status_row
             continue
-        if r.text.trim() != ""
-            ops.push(mono(m.x0 + r.col.to_float() * m.cw, row_y(m, r.row), r.text, r.fg, m.size))
+        if r.text == "|" and r.fg == c.guide_fg
+            # An indent guide: a 1-point line, not a glyph (the cell stays for `--print`).
+            ops.push(app.Op.Shade(
+                x: m.x0 + r.col.to_float() * m.cw,
+                y: row_y(m, r.row),
+                w: 1.0,
+                h: m.ch,
+                color: c.fg,
+                alpha: 0.1,
+            ))
+        elif r.text.trim() != ""
+            x := m.x0 + r.col.to_float() * m.cw
+            ops.push(mono(x, row_y(m, r.row) + m.pad, r.text, r.fg, m.size))
     ops
 
-## The caret, a 2-point bar at the cursor's cell.
+## The caret, a 2-point accent bar at the cursor's cell, while it is in the
+## visible half of its blink.
 pub fn caret_ops(f Frame, m Metrics) List[app.Op]
-    if f.cursor_row <= 0 or f.cursor_col < 0
+    if f.cursor_row <= 0 or f.cursor_col < 0 or not f.caret_on
         return []
     [app.draw_rect(
         m.x0 + f.cursor_col.to_float() * m.cw,
         row_y(m, f.cursor_row),
         2.0,
         m.ch,
-        f.colors.fg,
+        f.colors.accent,
     )]
 
-## The status bar: `status` in sans type on the status color, across the window.
+## The status bar: `status` in sans type on the pane color under a 1-point
+## border line, across the window. A theme that still gives the bar its own
+## loud fill gets muted text, so the text stays readable on the pane.
 pub fn status_ops(f Frame, m Metrics) List[app.Op]
     c := f.colors
     y := row_y(m, f.status_row)
     size := chrome_size(m)
-    [app.draw_rect(0.0, y, m.w, m.ch, c.status_bg), txt(
-        10.0,
-        y + ((m.ch - size) / 2.0).floor() - 1.0,
-        f.status.trim(),
-        c.status_fg,
-        size,
-        false,
-    )]
+    mut fg := c.muted
+    if c.status_bg == c.pane_bg
+        fg = c.status_fg
+    [
+        app.draw_rect(0.0, y, m.w, m.ch, c.pane_bg),
+        app.draw_rect(0.0, y, m.w, 1.0, c.border),
+        txt(10.0, y + ((m.ch - size) / 2.0).floor() - 1.0, f.status.trim(), fg, size, false),
+    ]
 
 ## The scrollbar down the right edge: a track, the thumb for the visible
 ## lines, and a tick for each mark.
@@ -595,6 +668,10 @@ pub fn menu_key(label str) str
         select_bg: 0x264f78,
         error_fg: 0xf48771,
         warn_fg: 0xcca700,
+        guide_fg: 0x404040,
+        accent: accent_for(0x1e1e1e),
+        border: mix(0xd4d4d4, 0x1e1e1e, 0.12),
+        muted: mix(0xd4d4d4, 0x1e1e1e, 0.55),
     )
     f := Frame(
         colors: c,
@@ -621,11 +698,12 @@ pub fn menu_key(label str) str
         drag_tab: -1,
         drop_tab: -1,
         hover_act: 1,
+        caret_on: true,
     )
     m := metrics(640.0, 300.0, 8.0, 16.0, 13.0, false, 0.0)
     o := canvas_ops(f, m)
     assert(o.len() > 10)
-    assert_eq(status_ops(f, m).len(), 2)
+    assert_eq(status_ops(f, m).len(), 3)
     assert_eq(caret_ops(f, m).len(), 1)
     assert(minimap_ops(f, m).len() > 2)
 
@@ -652,3 +730,16 @@ pub fn menu_key(label str) str
     assert_eq(cell_at(m, ACT_W + 8.0 * 2.0 + 1.0, m.tab_h + 1.0).col, 2)
     bare := metrics(800.0, 600.0, 8.0, 16.0, 13.0, false, 0.0)
     assert_eq(activity_hit(bare, 10.0, bare.tab_h + 5.0), -1)
+
+@test fn rows_are_taller_than_glyphs_and_text_is_centred()
+    m := metrics(800.0, 600.0, 8.0, 16.0, 13.0, false, 0.0)
+    assert_eq(m.ch, 23.0)
+    assert_eq(m.pad, 3.0)
+    assert_eq(row_y(m, 1), m.tab_h + TOP_PAD)
+    assert_eq(cell_at(m, 1.0, row_y(m, 2) + 1.0).row, 2)
+
+@test fn mix_and_accent_follow_the_background()
+    assert_eq(mix(0xffffff, 0x000000, 0.5), 0x808080)
+    assert_eq(mix(0x102030, 0xffffff, 1.0), 0x102030)
+    assert_eq(accent_for(0x17181c), 0x0a84ff)
+    assert_eq(accent_for(0xfbfbfc), 0x007aff)
