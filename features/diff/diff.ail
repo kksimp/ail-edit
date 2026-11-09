@@ -7,8 +7,8 @@
 ## One panel row. `id` is the declaration id (`fn:add`) the row is about, or
 ## "" when the row has no place to jump to.
 pub struct Row
-    id str
-    text str
+    pub id str
+    pub text str
 
 fn str_of(j Json, key str) str
     (j.get(key) else Json.Null).as_str() else ""
