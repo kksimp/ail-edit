@@ -2513,6 +2513,13 @@ fn press(k str) ui.Event
 ## `ail api --refs` for `add` in API_SRC: its declaration and one call.
 ADD_REFS_JSON := "\{\"api\":1,\"symbol\":\"fn:add\",\"refs\":[\{\"file\":\"t.ail.edit-query.ail\",\"line\":5,\"col\":4,\"def\":true},\{\"file\":\"t.ail.edit-query.ail\",\"line\":10,\"col\":11,\"def\":false},\{\"file\":\"other.ail\",\"line\":1,\"col\":1,\"def\":false}]}"
 
+@test fn palette_lists_named_rows_and_runs_palette_only_ones()
+    mut ws := Workspace.new(Editor.new("t.ail", "x\n", 40, 10))
+    for r in ws.commands()
+        assert(r.name != "")
+    ws.run_command("nonesuch")
+    assert_eq(ws.message, "no command `nonesuch`")
+
 @test fn references_list_declaration_and_uses()
     found := refs_hits(".", parse_json(REFS_JSON) else Json.Null)
     assert_eq(found.len(), 3)
@@ -3822,11 +3829,12 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
         "p" | "P" => OpenFile
         _ => none
 
-## The palette's rows matching what is typed: those that run a command.
+## The palette's rows matching what is typed: those that run a command
+## (a key, or a palette-only row: spec "" and a name, run by `run_command`).
 fn Workspace.commands(self) List[KeyRow]
     mut out := List[KeyRow]()
     for r in key_rows()
-        if r.spec != "" and fuzzy(r.name, field.text)
+        if r.name != "" and fuzzy(r.name, field.text)
             out.push(r)
     out
 
@@ -3852,11 +3860,21 @@ fn Workspace.choose(mut self)
         found := commands()
         commanding = false
         if list.selected < found.len()
-            on_event(key_event(found[list.selected].spec))
+            row := found[list.selected]
+            if row.spec == ""
+                run_command(row.name)
+            else
+                on_event(key_event(row.spec))
         return
     found := matches()
     if list.selected < found.len()
         open(found[list.selected])
+
+## Palette-only commands: a `key_row("palette", NAME, "", DOES)` in
+## `key_rows()` and one arm here, which a slice adds for its own command.
+fn Workspace.run_command(mut self, name str)
+    match name
+        _ => message = "no command `{name}`"
 
 # ---- Tabs ---------------------------------------------------------------
 
