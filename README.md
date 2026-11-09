@@ -97,6 +97,10 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-Shift-K | The open `ail task` (`.ail-task`): goal, base, last verify, and the impact since the base (`ail ask --affected --json`): changed and affected declarations, affected tests, changed effects; Up/Down, Enter jumps; V verifies, F finishes, X aborts (`ail task`). After each save, affected declarations are marked `~` in the gutter until the next edit (S4) |
 | F8 | Run only the tests the changes since the base can reach (`ail test --affected`, since the open task's base, else `HEAD`); the saved file is compared, so save first (S4) |
 | F7 | Run `ail task verify` (check, then the affected tests) and show the answer: result, failing stage, last lines, next step (S4) |
+| Alt-Shift-C | Copy the selection (else the line) with the diagnostics and card entries on it, cut to a token budget, to the clipboard, for pasting into an agent |
+| Alt-Shift-V | Preview the `ail edit` hunks on the clipboard (else in `.agent-edit`) as a diff; press again to apply them to the buffer (Ctrl-Z undoes), Esc cancels |
+| palette | List the files an agent changed beside the editor and the lines it changed (marked `+` in the gutter until you save); Enter jumps |
+| palette | Show or hide the `+` gutter marks on lines an agent changed |
 | Ctrl-Shift-H | Type what to find, Enter, the replacement, Enter: every changed line of the project's `.ail` files is previewed old -> new; Space skips or accepts a row, A accepts all; Ctrl-Enter applies the accepted rows to the buffers (files open as tabs, nothing saved, Ctrl-Z undoes per tab), Esc cancels (ADRs 0339, 0353) |
 | Ctrl-Shift-F | Search every `.ail` file under the directory (open tabs as edited); the matches fill the pane, Up/Down select, Enter jumps, Esc closes (ADR 0292) |
 | F4 | Jump to the next match of the last project search |
