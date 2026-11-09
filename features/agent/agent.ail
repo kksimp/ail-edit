@@ -146,10 +146,20 @@ pub fn State.poll(mut self, path str, lines List[str], dirty bool) Poll?
     if fresh == lines
         return none
     if dirty
-        return Poll(path: path, lines: lines, reload: false, note: "{path} changed on disk; unsaved edits kept")
+        return Poll(
+            path: path,
+            lines: lines,
+            reload: false,
+            note: "{path} changed on disk; unsaved edits kept",
+        )
     changed := changed_lines(lines, fresh)
     mark(path, changed)
-    Poll(path: path, lines: fresh, reload: true, note: "agent changed {path}: {changed.len()} line(s) marked")
+    Poll(
+        path: path,
+        lines: fresh,
+        reload: true,
+        note: "agent changed {path}: {changed.len()} line(s) marked",
+    )
 
 ## Files of `names` whose stamp differs from the last one seen (new files
 ## count), restamped; for files that are not open in a tab.
@@ -332,7 +342,14 @@ pub fn json_panel(panel str, rows List[str]) str
     small := pack("a.ail", 4, body, ["a.ail:5:1: error[x] bad"], ["fn f()"], 8)
     assert(small.contains("fn f()"))
     assert(not small.contains("diagnostics:"))
-    cut := pack("a.ail", 0, ["aaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbb", "cccccccccccccccccccc"], [], [], 12)
+    cut := pack(
+        "a.ail",
+        0,
+        ["aaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbb", "cccccccccccccccccccc"],
+        [],
+        [],
+        12,
+    )
     assert(cut.contains("cut at the 12 token budget"))
     assert(not cut.contains("cccc"))
 
