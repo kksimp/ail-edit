@@ -11,7 +11,8 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 ([ADR 0181](https://github.com/kksimp/ail/blob/main/docs/decisions/0181-editor-screen-as-text-runs.md)).
 
 ```sh
-../ail/ail run edit.ail FILE                     # the editor, in a window
+../ail/ail run edit.ail FILE                     # the editor, in a std.app window (macOS host: tools/app-host/macos/run.sh edit.ail FILE)
+../ail/ail run edit.ail --grid FILE              # the old std.ui cell-grid window
 ../ail/ail run edit.ail --font 15 FILE           # ...with a smaller font (10 to 40)
 ../ail/ail run edit.ail --theme light FILE       # ...in a theme (see Themes)
 ../ail/ail run edit.ail --print FILE             # print one screen as text
@@ -108,6 +109,8 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-0 | Default font size |
 | Ctrl-Shift-T | Next theme: dark, light, solarized, high-contrast; remembered for the next start |
 | Ctrl-Q | Quit; with unsaved changes in any tab, press it twice. Closing the window counts as Ctrl-Q |
+| Palette | Show or hide the minimap beside the text (window) |
+| Palette | Hide the tab strip and status bar (window) |
 | Mouse | Click places the caret, drag or Shift-click selects, the wheel scrolls, a click on a diagnostic or an output location jumps to it |
 
 ## macOS sanity check
