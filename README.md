@@ -141,7 +141,7 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-+ (or Ctrl-=) | Larger font (ADR 0243) |
 | Ctrl-- | Smaller font |
 | Ctrl-0 | Default font size |
-| Ctrl-Shift-T | Next theme: dark, light, solarized, high-contrast; remembered for the next start |
+| Ctrl-Shift-T | Next theme: ail-dark (the default), ail-light, dark, light, solarized, high-contrast; remembered for the next start |
 | Ctrl-, | Settings list: Up/Down, Enter changes the value (theme, font size, reopen tabs, welcome screen, git marks) and saves it to `~/.ail-edit`; Esc closes |
 | Ctrl-Shift-N | Type a name, Enter: `ail new NAME` creates `NAME/` with `ail.pkg` and `main.ail`, and opens `main.ail` |
 | palette | Type `NEWKEY as COMMAND` (a palette name or a key, e.g. `ctrl+alt+t as Next theme`), Enter: saved as `bind.NEWKEY` in `~/.ail-edit`; the original key keeps working |

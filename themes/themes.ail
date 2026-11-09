@@ -3,10 +3,14 @@
 ## kinds are those `edit.ail` names in `FG_KINDS` and `BG_KINDS`.
 
 ## The theme names, in the order Ctrl-Shift-T cycles through them.
-pub NAMES := ["dark", "light", "solarized", "high-contrast"]
+pub NAMES := ["ail-dark", "ail-light", "dark", "light", "solarized", "high-contrast"]
 
 ## The theme called `name`, or `none` for an unknown name.
 pub fn named(name str) Map[str, int]?
+    if name == "ail-dark"
+        return AIL_DARK
+    if name == "ail-light"
+        return AIL_LIGHT
     if name == "dark"
         return Map[str, int]()
     if name == "light"
@@ -16,6 +20,62 @@ pub fn named(name str) Map[str, int]?
     if name == "high-contrast"
         return HIGH_CONTRAST
     none
+
+## The default theme (slice E1): cool grey panes, blue-leaning syntax colors.
+AIL_DARK := {
+    "bg": 0x17181c,
+    "pane_bg": 0x1d1f24,
+    "line_bg": 0x22252b,
+    "fg": 0xd6d9e0,
+    "gutter_fg": 0x6b7280,
+    "status_bg": 0x1d1f24,
+    "status_fg": 0x9aa1ad,
+    "select_bg": 0x2b4a77,
+    "bracket_bg": 0x33405a,
+    "occur_bg": 0x2a2e37,
+    "keyword": 0x7aa2f7,
+    "type": 0x4fd6be,
+    "string": 0xc3e88d,
+    "number": 0xff9e64,
+    "comment": 0x737c8c,
+    "attr": 0xc099ff,
+    "fn": 0xe0af68,
+    "const": 0xff9e64,
+    "field": 0xa9b8e8,
+    "variant": 0x4fd6be,
+    "error_fg": 0xff6b6b,
+    "warn_fg": 0xe0af68,
+    "error_bg": 0x3a1f24,
+    "warn_bg": 0x38301c,
+}
+
+## The light companion of `ail-dark`.
+AIL_LIGHT := {
+    "bg": 0xfbfbfc,
+    "pane_bg": 0xf2f3f5,
+    "line_bg": 0xeef0f3,
+    "fg": 0x24272e,
+    "gutter_fg": 0x9aa1ad,
+    "status_bg": 0xf2f3f5,
+    "status_fg": 0x5c6370,
+    "select_bg": 0xcfe1ff,
+    "bracket_bg": 0xd9e6d2,
+    "occur_bg": 0xe6e8ec,
+    "keyword": 0x2f5fd0,
+    "type": 0x0f7f73,
+    "string": 0x3b7d1e,
+    "number": 0xb3560b,
+    "comment": 0x7a8290,
+    "attr": 0x7b45c9,
+    "fn": 0x8a5a00,
+    "const": 0xb3560b,
+    "field": 0x3a4a8a,
+    "variant": 0x0f7f73,
+    "error_fg": 0xd12f2f,
+    "warn_fg": 0x9a6700,
+    "error_bg": 0xfde3e3,
+    "warn_bg": 0xfff1c9,
+}
 
 LIGHT := {
     "bg": 0xffffff,
