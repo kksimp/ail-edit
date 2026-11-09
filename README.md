@@ -58,6 +58,16 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-D | Duplicate the line or selected lines |
 | Alt-Up | Move the line or selected lines up |
 | Alt-Down | Move the line or selected lines down |
+| Alt-D | Select the word under the cursor; again, add a caret at its next occurrence. With several carets typing, Enter, Tab, Backspace, Delete, paste and moves act at every caret; Escape or a click drops the extras |
+| Alt-Shift-Up | Add a caret on the line above |
+| Alt-Shift-Down | Add a caret on the line below |
+| Alt-click | Add a caret at the clicked place (window) |
+| Ctrl-Shift-[ | Fold the block the cursor is in (AIL blocks are indentation), or open it; the gutter shows `>` on a folded line. Folds survive edits and undo |
+| Ctrl-Shift-] | Open every fold |
+| F11 | Hide the file tree and the pane |
+| palette | A caret on every occurrence of the selection (or the word here) |
+| palette | Fold every top-level block; Ctrl-Shift-] opens them |
+| Ctrl-\ | Show the next tab beside this one; again closes the split (Ctrl-Tab changes which tab is edited) |
 | Ctrl-G | Go to a line number |
 | Ctrl-Z | Undo |
 | Ctrl-Y | Redo |
@@ -67,7 +77,7 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-R | Replace: after Ctrl-F, type the replacement; Enter replaces this match and finds the next, Ctrl-Enter replaces all (one undo step) |
 | Ctrl-S | Format, save, then check |
 | Ctrl-K | Check: `ail check --json`; spans are marked, the pane lists them |
-| Ctrl-. | Apply the first fix of the diagnostic under the cursor |
+| Ctrl-. | Preview the first fix of the diagnostic under the cursor as a change; Enter applies it, any other key cancels |
 | F1 | Explain the diagnostic under the cursor (`ail explain RULE`) |
 | Ctrl-O | Outline (`ail api --text`); Up/Down select, Enter jumps |
 | Escape | Close the pane; stop selecting or finding |
@@ -116,6 +126,11 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-- | Smaller font |
 | Ctrl-0 | Default font size |
 | Ctrl-Shift-T | Next theme: dark, light, solarized, high-contrast; remembered for the next start |
+| Ctrl-Shift-. | Preview the first non-overlapping fix of every diagnostic, as `ail lsp`'s fix-all takes them; Enter applies them as one undo step, any other key cancels |
+| Ctrl-Shift-Space | Signature popup for the call the cursor is inside: the signature with the current argument marked, then its contracts, effects and error set; follows the cursor through the arguments, Esc closes |
+| Alt-I | Toggle inlay hints: the type of each local binding on the visible lines (`ail api --locals`), refreshed on save |
+| palette | Toggle declarations colored by kind, with a code lens after each: uses, effects, test (Ctrl-Shift-P) |
+| palette | Preview what `ail fix` makes of the buffer (fix rounds until none is left); Enter applies it as one undo step, any other key cancels (Ctrl-Shift-P) |
 | Ctrl-Q | Quit; with unsaved changes in any tab, press it twice. Closing the window counts as Ctrl-Q |
 | Palette | Show or hide the minimap beside the text (window) |
 | Palette | Hide the tab strip and status bar (window) |
