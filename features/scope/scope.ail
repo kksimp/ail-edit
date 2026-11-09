@@ -1,0 +1,97 @@
+## Breadcrumbs and sticky headers (editor plan S2): the declarations that
+## enclose a line, found from indentation alone (lex.block.1), so the editor
+## needs no second analysis.
+
+## Spaces at the start of a line.
+pub fn indent(s str) int
+    mut n := 0
+    for c in s.chars()
+        if c != ' '
+            break
+        n += 1
+    n
+
+## Blank, or only a comment: such lines do not end or start a block.
+pub fn skipped(s str) bool
+    t := s.trim()
+    t == "" or t.starts_with("#")
+
+DECLS := ["fn", "struct", "enum", "trait", "impl"]
+
+## The name a declaration line introduces (`fn Editor.go(self)` gives
+## `Editor.go`), or "" when the line is not a declaration.
+pub fn name_of(s str) str
+    words := s.trim().split(" ")
+    mut i := 0
+    while i < words.len() and (words[i] == "pub" or words[i].starts_with("@"))
+        i += 1
+    if i + 1 >= words.len() or not DECLS.contains(words[i])
+        return ""
+    mut out := ""
+    for c in words[i + 1].chars()
+        if c == '(' or c == '['
+            break
+        out = "{out}{c}"
+    out
+
+## Whether line `l` opens a block: the next real line is indented deeper.
+pub fn opens(lines List[str], l int) bool
+    if skipped(lines[l])
+        return false
+    want := indent(lines[l])
+    mut i := l + 1
+    while i < lines.len()
+        if not skipped(lines[i])
+            return indent(lines[i]) > want
+        i += 1
+    false
+
+## The lines of the headers around line `l`, outermost first; `l` itself
+## comes last when it opens a block.
+pub fn chain(lines List[str], l int) List[int]
+    mut out := List[int]()
+    if l < 0 or l >= lines.len()
+        return out
+    if skipped(lines[l])
+        mut j := l - 1
+        while j >= 0 and skipped(lines[j])
+            j -= 1
+        if j < 0
+            return out
+        return chain(lines, j)
+    mut want := indent(lines[l])
+    if opens(lines, l)
+        out.push(l)
+    mut i := l - 1
+    while i >= 0 and want > 0
+        if not skipped(lines[i]) and indent(lines[i]) < want
+            out.push(i)
+            want = indent(lines[i])
+        i -= 1
+    mut rev := List[int]()
+    mut k := out.len() - 1
+    while k >= 0
+        rev.push(out[k])
+        k -= 1
+    rev
+
+## The breadcrumb text: the declaration names along `chain`, joined by `>`.
+pub fn crumbs(lines List[str], l int) str
+    mut names := List[str]()
+    for h in chain(lines, l)
+        n := name_of(lines[h])
+        if n != ""
+            names.push(n)
+    names.join(" > ")
+
+## The innermost declaration line that encloses the first visible line
+## `top` and starts above it: the header the view keeps on its first row,
+## or `none`.
+pub fn sticky(lines List[str], top int) int?
+    mut found := -1
+    for h in chain(lines, top)
+        if name_of(lines[h]) != "" and h < top
+            found = h
+    if found < 0
+        return none
+    found

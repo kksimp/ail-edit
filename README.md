@@ -65,6 +65,16 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-D | Duplicate the line or selected lines |
 | Alt-Up | Move the line or selected lines up |
 | Alt-Down | Move the line or selected lines down |
+| Alt-D | Select the word under the cursor; again, add a caret at its next occurrence. With several carets typing, Enter, Tab, Backspace, Delete, paste and moves act at every caret; Escape or a click drops the extras |
+| Alt-Shift-Up | Add a caret on the line above |
+| Alt-Shift-Down | Add a caret on the line below |
+| Alt-click | Add a caret at the clicked place (window) |
+| Ctrl-Shift-[ | Fold the block the cursor is in (AIL blocks are indentation), or open it; the gutter shows `>` on a folded line. Folds survive edits and undo |
+| Ctrl-Shift-] | Open every fold |
+| F11 | Hide the file tree and the pane |
+| palette | A caret on every occurrence of the selection (or the word here) |
+| palette | Fold every top-level block; Ctrl-Shift-] opens them |
+| Ctrl-\ | Show the next tab beside this one; again closes the split (Ctrl-Tab changes which tab is edited) |
 | Ctrl-G | Go to a line number |
 | Ctrl-Z | Undo |
 | Ctrl-Y | Redo |
