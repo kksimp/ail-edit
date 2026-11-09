@@ -15,6 +15,7 @@ use std.ui.widgets
 use std.screen.cells as scells
 use themes
 use features.diff as sdiff
+use features.tests as ttree
 
 # Colors, 0xRRGGBB.
 BG := 0x1e1e1e
@@ -3727,6 +3728,60 @@ fn key_rows() List[KeyRow]
             "Toggle running the tab's tests (`ail test --json`) after each save; the status line shows the pass and fail counts (ADR 0354)",
         ),
         key_row(
+            "Ctrl-Shift-J",
+            "Test tree",
+            "ctrl+shift+j",
+            "The tab's tests as a tree (`ail test --json --bundle-failure`): the totals, then `ok` and `FAIL` rows (a property failure with its input) and the bundles written; Up/Down, Enter jumps to a failed test (S6)",
+        ),
+        key_row(
+            "Shift-F6",
+            "Test under the cursor",
+            "shift+f6",
+            "Run the tests and show only the test the caret is in (S6)",
+        ),
+        key_row(
+            "Ctrl-Shift-Y",
+            "Replay failed test",
+            "ctrl+shift+y",
+            "With a FAIL row of the test tree selected, run its bundle again (`ail test --bundle`) from the recording (S6)",
+        ),
+        key_row(
+            "Ctrl-Shift-Z",
+            "Shrink failure",
+            "ctrl+shift+z",
+            "With a FAIL row selected, cut the bundle's recorded texts line by line (`ail replay --shrink`, 20 s budget) and list the smaller `.min` bundle's calls as a trace; Enter jumps to the call's line (S6)",
+        ),
+        key_row(
+            "Ctrl-Shift-X",
+            "Check contracts",
+            "ctrl+shift+x",
+            "Check `requires` and `ensures` with generated inputs (`ail test --contracts --json`); a failure shows the smallest input, Enter jumps to it (S6)",
+        ),
+        key_row(
+            "palette",
+            "Update preview",
+            "",
+            "Preview what `ail test --update` would rewrite (`--dry-run --json`): every stale expectation as old -> new; Enter jumps to it (S6)",
+        ),
+        key_row(
+            "palette",
+            "Apply test update",
+            "",
+            "Run `ail test --update` on the saved file and reload the tab (refused with unsaved changes) (S6)",
+        ),
+        key_row(
+            "palette",
+            "Record tests",
+            "",
+            "Record the failed tests' captured calls (`ail test --record last-test.rec.json`) beside the file (S6)",
+        ),
+        key_row(
+            "palette",
+            "Trace replay",
+            "",
+            "As replay, with every trace event (`ail test --trace=all --bundle`) (S6)",
+        ),
+        key_row(
             "Ctrl-Shift-H",
             "Replace in files",
             "ctrl+shift+h",
@@ -3830,6 +3885,7 @@ enum WsKey
     References
     ReplaceInFiles
     TestOnSave
+    TestTool(mode str)
     Zoom(key str)
     Diff(kind str)
 
@@ -3839,6 +3895,8 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
             return NextHit
         if k == "f5" and shift
             return Trace
+        if k == "f6" and shift
+            return TestTool("one")
         if k == "f12" and shift
             return References
         return none
@@ -3861,6 +3919,10 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
             "u" | "U" => TestOnSave
             "d" | "D" => Diff("diff")
             "v" | "V" => Diff("verify")
+            "j" | "J" => TestTool("tree")
+            "y" | "Y" => TestTool("replay")
+            "z" | "Z" => TestTool("shrink")
+            "x" | "X" => TestTool("contracts")
             _ => none
     match k
         "b" | "B" => Tree
@@ -3916,6 +3978,10 @@ fn Workspace.run_command(mut self, name str)
     match name
         "API diff" => diff_view("api")
         "Git change gutter" => diff_view("gutter")
+        "Update preview" => test_tool("preview")
+        "Apply test update" => test_tool("apply")
+        "Record tests" => test_tool("record")
+        "Trace replay" => test_tool("trace")
         _ => message = "no command `{name}`"
 
 # ---- Tabs ---------------------------------------------------------------
@@ -4129,6 +4195,7 @@ fn Workspace.on_event(mut self, ev ui.Event)
                     Trace => trace_run()
                     FailurePaths => failure_paths()
                     Coverage => eds[active].coverage()
+                    TestTool(m) => test_tool(m)
                     Card => card_view()
                     Diff(w) => diff_view(w)
                     Problems => problems()
@@ -4803,6 +4870,69 @@ fn Workspace.failure_paths(mut self)
         message = "failure paths need a program without errors: Ctrl-K shows them"
         return
     show_list("failure paths", failure_hits(eds[active].path, r.out))
+
+# ---- Test tools (S6) --------------------------------------------------------
+
+## Ctrl-Shift-J and its neighbours (features/tests): runs the tool `mode`
+## names and lists its rows like search hits. Replay, trace and shrink act
+## on the selected FAIL row of the test tree.
+fn Workspace.test_tool(mut self, mode str)
+    mut sel := ""
+    if hit_sel < hits.len()
+        sel = hits[hit_sel].text
+    if mode == "one"
+        name := ttree.test_at(eds[active].lines, eds[active].line) else
+            message = "the caret is not in a test"
+            return
+        sel = name
+    p := ttree.plan(mode, sel, eds[active].dirty)
+    if p.problem != ""
+        message = p.problem
+        return
+    mut st := 0
+    mut so := ""
+    mut se := ""
+    if p.on_file
+        r := eds[active].ail_on_buffer(p.args) else return
+        st = r.status
+        so = r.out
+        se = r.err
+    else
+        r := proc.run(ail_command(), p.args) else e
+            message = "can't run {e.cmd}: {e.kind}"
+            return
+        st = r.status
+        so = r.out
+        se = r.err
+    path := eds[active].path
+    mut found := List[Hit]()
+    for row in ttree.result_rows(mode, path, sel, so, se)
+        found.push(Hit(loc: Loc(path: row.path, line: row.line, col: row.col), text: row.text))
+    if mode == "apply" and st == 0
+        got := fs.read_text(path) else e2
+            message = "updated {path}, but can't reload it"
+            return
+        mut ed := Editor.new(path, got, (cols - left()).max(10), (rows - 1).max(1))
+        ed.index()
+        eds[active] = ed
+    if found.len() == 0
+        message = "{p.title}: no output (exit {st})"
+        return
+    show_list("{p.title}: exit {st}", found)
+
+@test fn test_tool_keys_map_to_modes()
+    assert_eq(workspace_key("j", true, true), TestTool("tree"))
+    assert_eq(workspace_key("z", true, true), TestTool("shrink"))
+    assert_eq(workspace_key("f6", false, true), TestTool("one"))
+    assert_eq(workspace_key("j", true, false), none)
+
+@test fn test_tools_refuse_without_a_failed_row()
+    mut ws := Workspace.new(typed("fn main()\n    print(1)\n", []))
+    ws.test_tool("replay")
+    assert(ws.message.starts_with("select a FAIL row"))
+    ws.eds[0].dirty = true
+    ws.test_tool("apply")
+    assert(ws.message.starts_with("save first"))
 
 ## The lines `ail test --coverage=lines --json` reports as never run,
 ## 0-based, and its summary line.
