@@ -2370,7 +2370,13 @@ fn Editor.layer_key(mut self, k str)
 fn sem_edits(fix List[TextEdit]) List[sem.Edit]
     mut out := List[sem.Edit]()
     for e in fix
-        out.push(sem.Edit(line: e.line, col: e.col, end_line: e.end_line, end_col: e.end_col, text: e.text))
+        out.push(sem.Edit(
+            line: e.line,
+            col: e.col,
+            end_line: e.end_line,
+            end_col: e.end_col,
+            text: e.text,
+        ))
     out
 
 ## Shows `title` and the changes from the buffer to `next`; Enter applies
