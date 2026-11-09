@@ -77,10 +77,10 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-Shift-W | Watch the selected or word-at-cursor variable (`ail run --watch NAME`): each write is a row, its value follows the line |
 | Shift-F7 | Run (`ail run --values`); a trap lists its frames with their values, the innermost frame's follow the trap line |
 | F9 | Jump to the next row of the probe, watch, trace, sanitize or leak list, wrapping |
-| Palette | Run with every trace event as a tree: Left folds a call, Right opens it, `f` cycles the filter (all, calls, effects, contracts, traps) |
-| Palette | `ail sanitize --json`: runs that differ under random schedules, with the replay command |
-| Palette | `ail sanitize --race`: unsynchronised unsafe accesses; Enter jumps to an access |
-| Palette | `ail leak --json`: live memory growth by kind and the roots that hold it |
+| palette | Run with every trace event as a tree: Left folds a call, Right opens it, `f` cycles the filter (all, calls, effects, contracts, traps) |
+| palette | `ail sanitize --json`: runs that differ under random schedules, with the replay command |
+| palette | `ail sanitize --race`: unsynchronised unsafe accesses; Enter jumps to an access |
+| palette | `ail leak --json`: live memory growth by kind and the roots that hold it |
 | Ctrl-Shift-E | Each function's error set and every return, `?` and `else` that fails or handles, from `ail check --errors`; Up/Down, Enter jumps (ADR 0312) |
 | Ctrl-Shift-M | Every diagnostic of the open tabs' programs (`ail check --json`, modules included, buffers as edited), errors first; Up/Down, Enter jumps, opening the file (ADR 0339); while shown it refreshes on save and 500 ms after typing stops (ADR 0353) |
 | Ctrl-Shift-I | The program card (`ail api --card`) of the file's program, its modules included: entry point, tests, and every declaration with effects, contracts and error sets; Up/Down, Enter jumps to a declaration; refreshed on save (ADR 0331) |

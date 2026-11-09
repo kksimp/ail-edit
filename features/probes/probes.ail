@@ -36,12 +36,9 @@ fn pairs(j Json) str
 fn row(line int, col int, text str) Row
     Row(line: line, col: col, text: text)
 
-## The commands the keys and the palette run, by name. `tree`, `sanitize`,
-## `race` and `leak` have no key of their own: their palette rows use the spec
-## `palette+NAME`, which presses the key named NAME (no modifiers).
-pub COMMANDS := ["probe", "watch", "values", "next", "tree", "sanitize", "race", "leak"]
-
-## The probe command a key (without its modifiers) presses, if any.
+## The commands a key presses, by name: `probe`, `watch`, `values` and `next`.
+## The palette-only ones (`tree`, `sanitize`, `race`, `leak`) are run by
+## `Workspace.run_command`.
 pub fn key_spec(k str, ctrl bool, shift bool) str?
     if ctrl and shift
         return match k.to_lower()
@@ -56,8 +53,6 @@ pub fn key_spec(k str, ctrl bool, shift bool) str?
         return none
     if k == "f9"
         return "next"
-    if COMMANDS.contains(k)
-        return k
     none
 
 # ---- The arguments of each command --------------------------------------
@@ -820,7 +815,6 @@ TRACE := "\{\"api\":1,\"trace\":\"call\",\"fn\":\"main\",\"depth\":1,\"args\":\{
     assert_eq(key_spec("w", true, true), "watch")
     assert_eq(key_spec("f7", false, true), "values")
     assert_eq(key_spec("f9", false, false), "next")
-    assert_eq(key_spec("leak", false, false), "leak")
     assert(key_spec("f7", false, false) == none)
     assert(key_spec("p", true, true) == none)
     assert(key_spec("s", false, false) == none)

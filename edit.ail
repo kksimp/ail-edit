@@ -3700,27 +3700,27 @@ fn key_rows() List[KeyRow]
             "Jump to the next row of the probe, watch, trace, sanitize or leak list, wrapping",
         ),
         key_row(
-            "Palette",
+            "palette",
             "Trace tree",
-            "palette+tree",
+            "",
             "Run with every trace event as a tree: Left folds a call, Right opens it, `f` cycles the filter (all, calls, effects, contracts, traps)",
         ),
         key_row(
-            "Palette",
+            "palette",
             "Schedule sanitizer",
-            "palette+sanitize",
+            "",
             "`ail sanitize --json`: runs that differ under random schedules, with the replay command",
         ),
         key_row(
-            "Palette",
+            "palette",
             "Race detector",
-            "palette+race",
+            "",
             "`ail sanitize --race`: unsynchronised unsafe accesses; Enter jumps to an access",
         ),
         key_row(
-            "Palette",
+            "palette",
             "Leak report",
-            "palette+leak",
+            "",
             "`ail leak --json`: live memory growth by kind and the roots that hold it",
         ),
         key_row(
@@ -3953,6 +3953,10 @@ fn Workspace.choose(mut self)
 ## `key_rows()` and one arm here, which a slice adds for its own command.
 fn Workspace.run_command(mut self, name str)
     match name
+        "Trace tree" => probe_key("tree")
+        "Schedule sanitizer" => probe_key("sanitize")
+        "Race detector" => probe_key("race")
+        "Leak report" => probe_key("leak")
         _ => message = "no command `{name}`"
 
 # ---- Tabs ---------------------------------------------------------------
