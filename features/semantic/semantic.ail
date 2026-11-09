@@ -43,10 +43,11 @@ pub struct Colors
     pub variant_fg int
 
 ## The layer's state in one editor. `level` 0 is off, 1 kind colors and
-## code lens, 2 adds inlay hints. `lens` and `hints` are keyed by 0-based
+## code lens; `hints_on` adds inlay hints, whatever the level. `lens` and `hints` are keyed by 0-based
 ## line. A pending preview holds the whole buffer it would make.
 pub struct State
     pub level int
+    pub hints_on bool
     pub kinds Map[str, str]
     pub lens Map[int, str]
     pub hints Map[int, str]
@@ -56,6 +57,7 @@ pub struct State
 pub fn State.new() State
     State(
         level: 0,
+        hints_on: false,
         kinds: Map[str, str](),
         lens: Map[int, str](),
         hints: Map[int, str](),
@@ -348,15 +350,14 @@ pub fn hint_in(j Json, name str, decl_line int) str
 
 # ---- Ghost text ------------------------------------------------------------
 
-## What to show after line `l` (0-based): its code lens and, at level 2,
-## its inlay hint.
+## What to show after line `l` (0-based): its code lens (level 1) and its
+## inlay hint (`hints_on`).
 pub fn ghost(s State, l int) str
-    if s.level == 0
-        return ""
     mut parts := List[str]()
-    if t := s.lens.get(l)
-        parts.push(t)
-    if s.level >= 2
+    if s.level > 0
+        if t := s.lens.get(l)
+            parts.push(t)
+    if s.hints_on
         if h := s.hints.get(l)
             parts.push(h)
     parts.join("   ")
@@ -471,5 +472,7 @@ fn painted(src str, kinds Map[str, str]) List[int]
     assert_eq(ghost(s, 4), "")
     s.level = 1
     assert_eq(ghost(s, 4), "1 ref")
-    s.level = 2
+    s.hints_on = true
     assert_eq(ghost(s, 4), "1 ref   x: int")
+    s.level = 0
+    assert_eq(ghost(s, 4), "x: int")

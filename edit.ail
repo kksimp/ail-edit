@@ -1490,7 +1490,7 @@ fn Editor.render(self) Screen
             x := (gw + n - left + 3).max(gw)
             if x < cols
                 s.put(r, x, "-- {d.message}", fg, line_bg)
-    if layer.level > 0
+    if layer.level > 0 or layer.hints_on
         render_ghosts(mut s, h, gw, shown)
     status_row := h
     s.band(status_row, STATUS_BG)
@@ -2196,6 +2196,10 @@ fn Editor.run(mut self, cmd Command)
             apply(cmd)
         scroll()
         return
+    if cmd == Fix
+        layer_key("f")
+        scroll()
+        return
     if cmd == Save or cmd == Check or cmd == Explain or cmd == Outline or cmd == Format
         prompt = NoPrompt
         completing = false
@@ -2255,7 +2259,7 @@ fn Editor.next_code_line(self, l int) int
 ## Rebuilds what the layer shows from `ail api`: kind colors and the code
 ## lens from `--symbols`, and at level 2 the inlay hints.
 fn Editor.refresh_layer(mut self)
-    if layer.level == 0
+    if layer.level == 0 and not layer.hints_on
         return
     index()
     mut names := List[str]()
@@ -2277,7 +2281,7 @@ fn Editor.refresh_layer(mut self)
     layer.kinds = sem.kind_index(names, kinds)
     layer.lens = sem.lens_rows(decls, uses)
     layer.hints = Map[int, str]()
-    if layer.level >= 2
+    if layer.hints_on
         compute_hints()
 
 ## Inlay hints for the bindings on the visible lines: a local is in scope
@@ -2331,17 +2335,32 @@ fn Editor.render_ghosts(self, mut s Screen, h int, gw int, shown Set[int])
         x := (gw + lines[l].len() - left + 2).max(gw)
         s.put(r, x, t, GUTTER_FG, bg)
 
-## Ctrl-Shift-L, -X and -Y.
+## The layer's commands: "l" cycles the kind colors and code lens (palette),
+## "h" toggles inlay hints (Alt-I), "x" is fix-all (Ctrl-Shift-.), "y" is
+## the `ail fix` preview (palette), "f" previews the first fix (Ctrl-.).
 fn Editor.layer_key(mut self, k str)
     layer.pending = false
     layer.proposed = []
     if k == "l"
-        layer.level = (layer.level + 1) % 3
+        if layer.level == 0
+            layer.level = 1
+        else
+            layer.level = 0
         refresh_layer()
-        message = match layer.level
-            0 => "semantic layer: off"
-            1 => "semantic layer: kind colors and code lens"
-            _ => "semantic layer: kind colors, code lens and inlay hints"
+        if layer.level == 0
+            message = "semantic layer: off"
+        else
+            message = "semantic layer: kind colors and code lens"
+    elif k == "h"
+        layer.hints_on = not layer.hints_on
+        layer.hints = Map[int, str]()
+        refresh_layer()
+        if layer.hints_on
+            message = "inlay hints: on (refreshed on save)"
+        else
+            message = "inlay hints: off"
+    elif k == "f"
+        fix_preview()
     elif k == "x"
         fix_all_preview()
     else
@@ -2365,6 +2384,16 @@ fn Editor.propose(mut self, title str, next List[str])
         pane_text.push(row)
     pane = Text
     message = "Enter applies, any other key cancels"
+
+## Ctrl-.: the first fix of the diagnostic under the cursor, as a preview.
+fn Editor.fix_preview(mut self)
+    d := diag_here() else
+        message = "no diagnostic here"
+        return
+    if d.fix.len() == 0
+        message = "no fix for {d.rule}"
+        return
+    propose("fix: {d.fix_title}", sem.apply_edits(lines, reversed_edits(d.fix)))
 
 fn Editor.fix_all_preview(mut self)
     mut fixes := List[sem.Fix]()
@@ -3388,12 +3417,13 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     ed.layer.level = 0
     assert(not ed.render().text[4].contains("1 ref"))
 
-@test fn inlay_hints_show_after_the_binding_at_level_two()
+@test fn inlay_hints_show_after_the_binding_when_on()
     mut ed := indexed([])
-    ed.layer.level = 2
+    ed.layer.hints_on = true
     ed.layer.hints[8] = "p: P"
     assert(ed.render().text[8].contains("p: P"))
-    ed.layer.level = 1
+    ed.layer_key("h")
+    assert(not ed.layer.hints_on)
     assert(not ed.render().text[8].contains("p: P"))
 
 @test fn fix_all_previews_then_applies_in_one_undo_step()
@@ -3426,11 +3456,27 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     assert(ed.pane_text.contains("spec: docs/spec/05-expressions.md (rule expr.name.1)"))
     assert(ed.pane_text.contains("2 +     print(1)"))
 
-@test fn ctrl_shift_l_cycles_the_layer_through_the_workspace()
+@test fn the_palette_toggles_the_semantic_layer()
     mut ws := Workspace.new(indexed([]))
-    ws.on_event(Key(key: "L", ctrl: true, alt: false, shift: true))
+    ws.run_command("Semantic layer")
     assert_eq(ws.eds[0].layer.level, 1)
     assert(ws.eds[0].layer.lens.len() > 0)
+    ws.run_command("Semantic layer")
+    assert_eq(ws.eds[0].layer.level, 0)
+
+@test fn ctrl_dot_previews_the_fix_and_ctrl_shift_dot_previews_fix_all()
+    mut ws := Workspace.new(typed("fn main()\n    prnt(1)", []))
+    ws.eds[0].diags = parse_diags("{DIAG_JSON}\n")
+    ws.eds[0].line = 1
+    ws.on_event(Key(key: ".", ctrl: true, alt: false, shift: false))
+    assert(ws.eds[0].layer.pending)
+    assert_eq(ws.eds[0].lines[1], "    prnt(1)")
+    ws.on_event(Key(key: "escape", ctrl: false, alt: false, shift: false))
+    assert(not ws.eds[0].layer.pending)
+    ws.on_event(Key(key: ".", ctrl: true, alt: false, shift: true))
+    assert(ws.eds[0].layer.pending)
+    ws.on_event(Key(key: "enter", ctrl: false, alt: false, shift: false))
+    assert_eq(ws.eds[0].lines[1], "    print(1)")
 
 @test fn settings_keep_other_lines()
     text := with_setting("font 15\ntheme dark\n", "theme", "light")
@@ -3704,8 +3750,11 @@ fn Editor.scroll_by(mut self, n int)
 enum Extra
     RunFile
     TestFile
+    Hints
 
 fn extra_key(key str, ctrl bool, alt bool, shift bool) Extra?
+    if alt and not ctrl and not shift and (key == "i" or key == "I")
+        return Hints
     if ctrl or alt
         return none
     match key
@@ -3716,9 +3765,13 @@ fn extra_key(key str, ctrl bool, alt bool, shift bool) Extra?
 ## F5 runs the buffer with `ail run`, F6 its tests with `ail test`; the
 ## output goes to the pane. Unsaved changes are run as they are.
 fn Editor.run_extra(mut self, x Extra)
+    if x == Hints
+        layer_key("h")
+        return
     words := match x
         RunFile => ["run"]
         TestFile => ["test"]
+        Hints => []
     r := ail_on_buffer(words) else return
     show_output(words[0], r)
 
@@ -3954,7 +4007,7 @@ fn key_rows() List[KeyRow]
             "Ctrl-.",
             "Apply fix",
             "ctrl+.",
-            "Apply the first fix of the diagnostic under the cursor",
+            "Preview the first fix of the diagnostic under the cursor as a change; Enter applies it, any other key cancels",
         ),
         key_row(
             "F1",
@@ -4090,22 +4143,28 @@ fn key_rows() List[KeyRow]
             "Next theme: dark, light, solarized, high-contrast; remembered for the next start",
         ),
         key_row(
-            "Ctrl-Shift-L",
-            "Semantic layer",
-            "ctrl+shift+l",
-            "Cycle the semantic layer: off, declarations colored by kind with a code lens after each (uses, effects, test), then inlay hints with the types of local bindings (`ail api --locals`); refreshed on save (slice S3)",
-        ),
-        key_row(
-            "Ctrl-Shift-X",
+            "Ctrl-Shift-.",
             "Fix all",
-            "ctrl+shift+x",
+            "ctrl+shift+.",
             "Preview the first non-overlapping fix of every diagnostic, as `ail lsp`'s fix-all takes them; Enter applies them as one undo step, any other key cancels",
         ),
         key_row(
-            "Ctrl-Shift-Y",
+            "Alt-I",
+            "Inlay hints",
+            "alt+i",
+            "Toggle inlay hints: the type of each local binding on the visible lines (`ail api --locals`), refreshed on save",
+        ),
+        key_row(
+            "palette",
+            "Semantic layer",
+            "",
+            "Toggle declarations colored by kind, with a code lens after each: uses, effects, test (Ctrl-Shift-P)",
+        ),
+        key_row(
+            "palette",
             "Fix with ail fix",
-            "ctrl+shift+y",
-            "Preview what `ail fix` makes of the buffer (fix rounds until none is left); Enter applies it as one undo step, any other key cancels",
+            "",
+            "Preview what `ail fix` makes of the buffer (fix rounds until none is left); Enter applies it as one undo step, any other key cancels (Ctrl-Shift-P)",
         ),
         key_row(
             "Ctrl-Q",
@@ -4191,6 +4250,7 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
         return Zoom(k)
     if shift
         return match k
+            "." | ">" => Sem("x")
             "p" | "P" => Palette
             "f" | "F" => Search
             "t" | "T" => Theme
@@ -4202,9 +4262,6 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
             "u" | "U" => TestOnSave
             "d" | "D" => Diff("diff")
             "v" | "V" => Diff("verify")
-            "l" | "L" => Sem("l")
-            "x" | "X" => Sem("x")
-            "y" | "Y" => Sem("y")
             _ => none
     match k
         "b" | "B" => Tree
@@ -4260,6 +4317,8 @@ fn Workspace.run_command(mut self, name str)
     match name
         "API diff" => diff_view("api")
         "Git change gutter" => diff_view("gutter")
+        "Semantic layer" => eds[active].layer_key("l")
+        "Fix with ail fix" => eds[active].layer_key("y")
         _ => message = "no command `{name}`"
 
 # ---- Tabs ---------------------------------------------------------------
