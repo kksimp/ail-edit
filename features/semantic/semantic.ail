@@ -384,7 +384,11 @@ pub fn lens_rows(decls List[Decl], uses Map[str, int]) Map[int, str]
     mut out := Map[int, str]()
     for d in decls
         mut parts := List[str]()
-        if d.kind == "fn" or d.kind == "method" or d.kind == "struct" or d.kind == "enum" or d.kind == "trait"
+        if d.kind == "fn"
+            or d.kind == "method"
+            or d.kind == "struct"
+            or d.kind == "enum"
+            or d.kind == "trait"
             n := uses.get(d.id) else 0
             if n == 1
                 parts.push("1 ref")
