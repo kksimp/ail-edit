@@ -90,7 +90,7 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-Shift-H | Type what to find, Enter, the replacement, Enter: every changed line of the project's `.ail` files is previewed old -> new; Space skips or accepts a row, A accepts all; Ctrl-Enter applies the accepted rows to the buffers (files open as tabs, nothing saved, Ctrl-Z undoes per tab), Esc cancels (ADRs 0339, 0353) |
 | Ctrl-Shift-F | Search every `.ail` file under the directory (open tabs as edited); the matches fill the pane, Up/Down select, Enter jumps, Esc closes (ADR 0292) |
 | F4 | Jump to the next match of the last project search |
-| Ctrl-P | Open a file: type part of its path (letters in order), Up/Down, Enter |
+| Ctrl-P | Open a file: type part of its path (letters in order), Up/Down, Enter; Enter on a path nothing matches creates that file |
 | Ctrl-Tab | Next tab; a click on a tab selects it |
 | Ctrl-Shift-Tab | Previous tab |
 | Ctrl-W | Close the tab; with unsaved changes, press it twice |

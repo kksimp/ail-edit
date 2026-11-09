@@ -3147,6 +3147,22 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     assert_eq(ws.binds.len(), 1)
     assert(ws.message.starts_with("no command"))
 
+@test fn enter_on_an_unmatched_path_creates_the_file()
+    d := "edit-newfile-test.tmp"
+    fs.make_dir(d) else err
+        assert(false)
+    mut ws := Workspace.new(typed("", []))
+    ws.on_event(key_event("ctrl+p"))
+    for c in "{d}/fresh.ail".chars()
+        ws.on_event(press("{c}"))
+    ws.on_event(press("enter"))
+    assert(fs.exists("{d}/fresh.ail"))
+    assert_eq(ws.eds[ws.active].path, "{d}/fresh.ail")
+    fs.remove("{d}/fresh.ail") else err
+        assert(false)
+    fs.remove(d) else err
+        assert(false)
+
 @test fn new_project_refuses_bad_names()
     mut ws := Workspace.new(typed("", []))
     ws.on_event(key_event("ctrl+shift+n"))
@@ -3788,7 +3804,7 @@ fn key_rows() List[KeyRow]
             "Ctrl-P",
             "Open file",
             "ctrl+p",
-            "Open a file: type part of its path (letters in order), Up/Down, Enter",
+            "Open a file: type part of its path (letters in order), Up/Down, Enter; Enter on a path nothing matches creates that file",
         ),
         key_row("Ctrl-Tab", "Next tab", "ctrl+tab", "Next tab; a click on a tab selects it"),
         key_row("Ctrl-Shift-Tab", "Previous tab", "ctrl+shift+tab", "Previous tab"),
@@ -3994,6 +4010,18 @@ fn Workspace.choose(mut self)
     found := matches()
     if list.selected < found.len()
         open(found[list.selected])
+    elif field.text.trim() != ""
+        new_file(field.text.trim())
+
+## Ctrl-P, Enter on a path nothing matches: creates that file (empty) and
+## opens it (S10).
+fn Workspace.new_file(mut self, path str)
+    if not fs.exists(path)
+        fs.write_text(path, "") else err
+            message = "can't create {err.path}: {err.kind}"
+            return
+    open(path)
+    message = "created {path}"
 
 ## Palette-only commands: a `key_row("palette", NAME, "", DOES)` in
 ## `key_rows()` and one arm here, which a slice adds for its own command.
