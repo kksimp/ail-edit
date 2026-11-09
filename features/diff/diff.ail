@@ -1,0 +1,216 @@
+## Semantic diff panels (S5 of docs/plan-2026-11.md): `ail diff --rev`,
+## `ail api --diff --rev` and `ail verify --diff --rev` turned into panel rows,
+## and `git diff -U0` turned into the lines the gutter marks. Pure functions
+## over the commands' output, so every panel is testable without a repository
+## (rules diff.out.1-9, api.diff.1-5, verify.run.1-5 in docs/spec/22-tools.md).
+
+## One panel row. `id` is the declaration id (`fn:add`) the row is about, or
+## "" when the row has no place to jump to.
+pub struct Row
+    pub id str
+    pub text str
+
+fn str_of(j Json, key str) str
+    (j.get(key) else Json.Null).as_str() else ""
+
+fn num_of(j Json, key str) int
+    ((j.get(key) else Json.Null).as_num() else 0.0).to_int()
+
+fn arr_of(j Json, key str) List[Json]
+    (j.get(key) else Json.Null).as_arr() else List[Json]()
+
+fn text_of(j Json) str
+    if s := j.as_str()
+        return s
+    j.to_text()
+
+## `old -> new` for one changed key.
+fn key_text(m JsonMember) str
+    "{m.key}: {text_of(m.value.get("old") else Json.Null)} -> {text_of(m.value.get("new") else Json.Null)}"
+
+## The rows of one `"change":"api"` object, from `ail diff` or `ail api --diff`.
+fn api_rows(j Json) List[Row]
+    mut out := List[Row]()
+    id := str_of(j, "id")
+    op := str_of(j, "op")
+    why := [text_of(w) for w in arr_of(j, "breaking")]
+    mark := if why.is_empty() then "" else "  breaking: {why.join(", ")}"
+    if op == "added"
+        out.push(Row(id: id, text: "+ {id} {str_of(j, "signature")}{mark}"))
+    elif op == "removed"
+        out.push(Row(id: id, text: "- {id} {str_of(j, "signature")}{mark}"))
+    elif op == "renamed"
+        out.push(Row(id: id, text: "> {str_of(j, "from")} -> {id} (renamed)"))
+    elif op == "changed"
+        out.push(Row(id: id, text: "~ {id}{mark}"))
+        for m in (j.get("keys") else Json.Null).as_obj() else List[JsonMember]()
+            if m.key == "doc" or m.key == "body"
+                out.push(Row(id: id, text: "    {m.key} changed"))
+            else
+                out.push(Row(id: id, text: "    {key_text(m)}"))
+        for l in arr_of(j, "lines")
+            out.push(Row(id: id, text: "    {text_of(l)}"))
+    else
+        out.push(Row(id: "", text: "api: {op} {str_of(j, "reason")}"))
+    out
+
+fn sign_of(j Json) str
+    if str_of(j, "op") == "removed" then "-" else "+"
+
+fn summary_text(j Json) str
+    mut s := "{num_of(j, "added")} added, {num_of(j, "removed")} removed, {num_of(j, "changed")} changed"
+    if (j.get("breaking") else Json.Null) != Json.Null
+        s = "{s}; {num_of(j, "breaking")} breaking"
+    else
+        s = "{s}; diagnostics +{num_of(j, "diagnostics_added")} -{num_of(j, "diagnostics_removed")}; {num_of(j, "tests_changed")} tests changed"
+    s
+
+## The rows of `ail diff --json` or `ail api --diff --json` output: one JSON
+## object per line, the last the summary. Lines that are not JSON are skipped.
+## The summary comes first, so the verdict is the first thing shown.
+pub fn diff_rows(out str) List[Row]
+    mut head := List[Row]()
+    mut body := List[Row]()
+    for l in out.lines()
+        j := parse_json(l) else continue
+        if (j.get("summary") else Json.Null) == Json.Bool(true)
+            head.push(Row(id: "", text: summary_text(j)))
+            continue
+        change := str_of(j, "change")
+        if change == "api"
+            for r in api_rows(j)
+                body.push(r)
+        elif change == "diagnostic"
+            body.push(Row(
+                id: "",
+                text: "{sign_of(j)} {str_of(j, "severity")}[{str_of(j, "rule")}] {str_of(j, "file")}: {str_of(j, "message")}",
+            ))
+        elif change == "test"
+            body.push(Row(
+                id: "",
+                text: "test {str_of(j, "test")}: {str_of(j, "old")} -> {str_of(j, "new")} {str_of(j, "message")}",
+            ))
+    for r in body
+        head.push(r)
+    head
+
+## The four parts of `ail verify --diff --json` (verify.run.1-5): proved,
+## tested, unverified, failures. A declaration id in the proved part carries
+## its id so Enter jumps to it.
+pub fn verify_rows(out str) List[Row]
+    mut rows := List[Row]()
+    for l in out.lines()
+        j := parse_json(l) else continue
+        if (j.get("verify") else Json.Null) == Json.Null
+            continue
+        proved := j.get("proved") else Json.Null
+        changed := arr_of(proved, "changed")
+        rows.push(Row(
+            id: "",
+            text: "proved: check {str_of(proved, "check")}; {changed.len()} changed declarations",
+        ))
+        for c in changed
+            rows.push(Row(id: text_of(c), text: "  {text_of(c)}"))
+        tested := j.get("tested") else Json.Null
+        passed := arr_of(tested, "passed")
+        failed := arr_of(tested, "failed")
+        rows.push(Row(id: "", text: "tested: {passed.len()} passed, {failed.len()} failed"))
+        for p in passed
+            rows.push(Row(id: "", text: "  ok {text_of(p)}"))
+        for f in failed
+            rows.push(Row(id: "", text: "  FAIL {text_of(f)}"))
+        unverified := arr_of(j, "unverified")
+        rows.push(Row(id: "", text: "unverified: {unverified.len()}"))
+        for u in unverified
+            rows.push(Row(id: "", text: "  {text_of(u)}"))
+        failures := arr_of(j, "failures")
+        rows.push(Row(id: "", text: "failures: {failures.len()}"))
+        for f in failures
+            rows.push(Row(id: "", text: "  {text_of(f)}"))
+    rows
+
+struct Hunk
+    start int
+    count int
+
+## The 1-based start and count after the `+` in a `@@ -a,b +c,d @@` header
+## (`git diff -U0`); the count is 1 when it is left out.
+fn new_range(header str) Hunk?
+    for w in header.split(" ")
+        if w.starts_with("+")
+            bits := w.slice(1, w.len()).split(",")
+            start := bits[0].to_int() else return none
+            mut count := 1
+            if bits.len() > 1
+                count = bits[1].to_int() else 1
+            return Hunk(start: start, count: count)
+    none
+
+## The 0-based lines `git diff -U0` shows as added or changed. A pure
+## deletion marks the line after it, where the text went missing.
+pub fn changed_lines(diff str) Set[int]
+    mut out := Set[int]()
+    for l in diff.lines()
+        if not l.starts_with("@@")
+            continue
+        r := new_range(l) else continue
+        if r.count == 0
+            out.add(r.start)
+        else
+            for n in r.start..r.start + r.count
+                out.add(n - 1)
+    out
+
+## How many rows begin with `+`, `-` or `~`: the changes in a report.
+pub fn change_count(rows List[Row]) int
+    mut n := 0
+    for r in rows
+        if r.text.starts_with("+ ")
+            or r.text.starts_with("- ")
+            or r.text.starts_with("~ ")
+            or r.text.starts_with("> ")
+            n += 1
+    n
+
+DIFF_JSON := "\{\"change\":\"api\",\"op\":\"added\",\"id\":\"fn:sub\",\"kind\":\"fn\",\"signature\":\"fn sub(a int, b int) int\"}\n\{\"change\":\"api\",\"op\":\"changed\",\"id\":\"fn:add\",\"kind\":\"fn\",\"keys\":\{\"signature\":\{\"old\":\"fn add(a int) int\",\"new\":\"fn add(a int, b int) int\"},\"body\":\{\"old\":\"x\",\"new\":\"y\"}},\"breaking\":[\"signature changed\"],\"lines\":[\"- a\",\"+ b\"]}\n\{\"change\":\"api\",\"op\":\"renamed\",\"from\":\"fn:old\",\"id\":\"fn:new\"}\n\{\"change\":\"diagnostic\",\"op\":\"added\",\"severity\":\"warning\",\"rule\":\"x.y.1\",\"file\":\"a.ail\",\"line\":3,\"message\":\"m\"}\n\{\"change\":\"test\",\"test\":\"t1\",\"old\":\"pass\",\"new\":\"fail\",\"status\":\"fail\",\"message\":\"boom\"}\n\{\"summary\":true,\"old\":\"o\",\"new\":\"n\",\"added\":1,\"removed\":0,\"changed\":1,\"diagnostics_added\":1,\"diagnostics_removed\":0,\"tests_changed\":1}\nnot json\n"
+
+@test fn semantic_diff_rows()
+    rows := diff_rows(DIFF_JSON)
+    assert_eq(rows[0].text, "1 added, 0 removed, 1 changed; diagnostics +1 -0; 1 tests changed")
+    assert_eq(rows[1].id, "fn:sub")
+    assert_eq(rows[1].text, "+ fn:sub fn sub(a int, b int) int")
+    assert_eq(rows[2].text, "~ fn:add  breaking: signature changed")
+    assert_eq(rows[3].text, "    signature: fn add(a int) int -> fn add(a int, b int) int")
+    assert_eq(rows[4].text, "    body changed")
+    assert_eq(rows[5].text, "    - a")
+    assert_eq(rows[7].text, "> fn:old -> fn:new (renamed)")
+    assert_eq(rows[8].text, "+ warning[x.y.1] a.ail: m")
+    assert_eq(rows[9].text, "test t1: pass -> fail boom")
+    assert_eq(rows.len(), 10)
+    assert_eq(change_count(rows), 4)
+
+@test fn api_diff_marks_breaking_changes()
+    out := "\{\"change\":\"api\",\"op\":\"removed\",\"id\":\"fn:gone\",\"kind\":\"fn\",\"signature\":\"fn gone()\",\"breaking\":[\"removed\"]}\n\{\"summary\":true,\"added\":0,\"removed\":1,\"changed\":0,\"breaking\":1}\n"
+    rows := diff_rows(out)
+    assert_eq(rows[0].text, "0 added, 1 removed, 0 changed; 1 breaking")
+    assert_eq(rows[1].text, "- fn:gone fn gone()  breaking: removed")
+
+@test fn verify_report_has_four_parts()
+    out := "\{\"verify\":1,\"rev\":\"HEAD\",\"proved\":\{\"check\":\"ok\",\"changed\":[\"fn:add\"]},\"tested\":\{\"passed\":[\"t1\"],\"failed\":[\"t2: boom\"]},\"unverified\":[\"no test reaches fn:add\"],\"failures\":[\"new test: t2: boom\"]}"
+    rows := verify_rows(out)
+    assert_eq(rows[0].text, "proved: check ok; 1 changed declarations")
+    assert_eq(rows[1].id, "fn:add")
+    assert_eq(rows[2].text, "tested: 1 passed, 1 failed")
+    assert_eq(rows[4].text, "  FAIL t2: boom")
+    assert_eq(rows[5].text, "unverified: 1")
+    assert_eq(rows[7].text, "failures: 1")
+    assert_eq(rows[8].text, "  new test: t2: boom")
+    assert_eq(rows.len(), 9)
+
+@test fn git_hunks_become_gutter_lines()
+    d := "diff --git a/f b/f\n@@ -3 +3 @@ x\n-a\n+b\n@@ -7,0 +8,2 @@\n+c\n+d\n@@ -20,2 +21,0 @@\n-e\n-f\n"
+    m := changed_lines(d)
+    assert(m.contains(2))
+    assert(m.contains(7) and m.contains(8))
+    assert(m.contains(21))
+    assert_eq(m.len(), 4)
