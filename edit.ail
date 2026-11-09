@@ -5318,7 +5318,6 @@ fn Workspace.on_window_event(mut self, ev ui.Event, m ui.Modifiers)
     if not shift_click
         on_event(ev)
 
-
 # ---- Window front end (std.app, S1) --------------------------------------
 
 ## The `std.app` window: the workspace drawn on a canvas (`window/`), pixel
@@ -5507,7 +5506,7 @@ impl app.App for Shell
             io.exit(0)
 
     fn view(self) app.Node
-        app.canvas("edit", 0.0, 0.0, win.ops(frame(), m))
+        app.canvas("edit", 0.0, 0.0, win.canvas_ops(frame(), m))
 
     fn title(self) str
         e := ws.eds[ws.active]
@@ -5544,7 +5543,6 @@ impl app.App for Shell
     cp.meta = true
     sh.update(cp)
     assert_eq(sh.lines().len(), 0)
-
 
 ## Opens the `std.app` window, or prints one screen when there is no host.
 fn app_main(mut ed Editor, flags List[str])

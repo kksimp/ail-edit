@@ -126,7 +126,9 @@ fn sans_w(s str, size float) float
 
 ## The width of tab `t` at the chrome's font size `size`.
 pub fn tab_w(t Tab, size float) float
-    base := t.name.chars().len() + (if t.errors > 0 then 3 else 0) + (if t.warnings > 0 then 3 else 0)
+    base := t.name.chars().len()
+        + (if t.errors > 0 then 3 else 0)
+        + (if t.warnings > 0 then 3 else 0)
     TAB_PAD * 2.0 + base.to_float() * size * 0.56 + TAB_CLOSE_W
 
 ## What a click on the tab strip hit: a tab, and whether its close button.
@@ -198,8 +200,22 @@ pub fn tab_ops(f Frame, m Metrics) List[app.Op]
         if t.dirty
             ops.push(app.draw_rect(cx - 3.0, cy - 3.0, 7.0, 7.0, fg))
         else
-            ops.push(app.Op.Stroke(x1: cx - 3.5, y1: cy - 3.5, x2: cx + 3.5, y2: cy + 3.5, color: c.gutter_fg, width: 1.3))
-            ops.push(app.Op.Stroke(x1: cx - 3.5, y1: cy + 3.5, x2: cx + 3.5, y2: cy - 3.5, color: c.gutter_fg, width: 1.3))
+            ops.push(app.Op.Stroke(
+                x1: cx - 3.5,
+                y1: cy - 3.5,
+                x2: cx + 3.5,
+                y2: cy + 3.5,
+                color: c.gutter_fg,
+                width: 1.3,
+            ))
+            ops.push(app.Op.Stroke(
+                x1: cx - 3.5,
+                y1: cy + 3.5,
+                x2: cx + 3.5,
+                y2: cy - 3.5,
+                color: c.gutter_fg,
+                width: 1.3,
+            ))
         x += w
     ops
 
@@ -233,10 +249,14 @@ pub fn status_ops(f Frame, m Metrics) List[app.Op]
     c := f.colors
     y := row_y(m, f.status_row)
     size := chrome_size(m)
-    [
-        app.draw_rect(0.0, y, m.w, m.ch, c.status_bg),
-        txt(10.0, y + ((m.ch - size) / 2.0).floor() - 1.0, f.status.trim(), c.status_fg, size, false),
-    ]
+    [app.draw_rect(0.0, y, m.w, m.ch, c.status_bg), txt(
+        10.0,
+        y + ((m.ch - size) / 2.0).floor() - 1.0,
+        f.status.trim(),
+        c.status_fg,
+        size,
+        false,
+    )]
 
 ## The scrollbar down the right edge: a track, the thumb for the visible
 ## lines, and a tick for each mark.
@@ -251,7 +271,14 @@ pub fn bar_ops(f Frame, m Metrics) List[app.Op]
     mut ops := [app.Op.Shade(x: x, y: y0, w: SCROLL_W, h: h, color: c.line_bg, alpha: 0.6)]
     th := (h * f.bar.visible.to_float() / total).min(h).max(18.0)
     ty := y0 + (h - th) * f.bar.top.to_float() / (total - f.bar.visible.to_float()).max(1.0)
-    ops.push(app.Op.Shade(x: x + 2.0, y: ty, w: SCROLL_W - 4.0, h: th, color: c.gutter_fg, alpha: 0.45))
+    ops.push(app.Op.Shade(
+        x: x + 2.0,
+        y: ty,
+        w: SCROLL_W - 4.0,
+        h: th,
+        color: c.gutter_fg,
+        alpha: 0.45,
+    ))
     for mk in f.bar.marks
         my := y0 + h * mk.line.to_float() / total
         mut col := c.select_bg
@@ -263,7 +290,7 @@ pub fn bar_ops(f Frame, m Metrics) List[app.Op]
     ops
 
 ## The whole canvas, back to front.
-pub fn ops(f Frame, m Metrics) List[app.Op]
+pub fn canvas_ops(f Frame, m Metrics) List[app.Op]
     mut out := grid_ops(f, m)
     out.extend(status_ops(f, m))
     out.extend(bar_ops(f, m))
@@ -383,7 +410,7 @@ pub fn menu_key(label str) str
         bar: Bar(top: 0, total: 40, visible: 4, marks: [Mark(line: 10, kind: "error")]),
     )
     m := metrics(640.0, 300.0, 8.0, 16.0, 13.0)
-    o := ops(f, m)
+    o := canvas_ops(f, m)
     assert(o.len() > 10)
     assert_eq(status_ops(f, m).len(), 2)
     assert_eq(caret_ops(f, m).len(), 1)
