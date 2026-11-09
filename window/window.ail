@@ -167,7 +167,18 @@ pub fn metrics(
     right := SCROLL_W + (if minimap then MAP_W else 0.0)
     cols := ((w - x0 - right) / cw).floor().to_int().max(10)
     rows := (1.0 + ((h - tab_h - TOP_PAD) / ch).floor()).to_int().max(4)
-    Metrics(w: w, h: h, size: size, cw: cw, ch: ch, pad: pad, tab_h: tab_h, x0: x0, cols: cols, rows: rows)
+    Metrics(
+        w: w,
+        h: h,
+        size: size,
+        cw: cw,
+        ch: ch,
+        pad: pad,
+        tab_h: tab_h,
+        x0: x0,
+        cols: cols,
+        rows: rows,
+    )
 
 ## The top edge of grid row `r`.
 pub fn row_y(m Metrics, r int) float
@@ -452,7 +463,8 @@ pub fn grid_ops(f Frame, m Metrics) List[app.Op]
                 alpha: 0.1,
             ))
         elif r.text.trim() != ""
-            ops.push(mono(m.x0 + r.col.to_float() * m.cw, row_y(m, r.row) + m.pad, r.text, r.fg, m.size))
+            x := m.x0 + r.col.to_float() * m.cw
+            ops.push(mono(x, row_y(m, r.row) + m.pad, r.text, r.fg, m.size))
     ops
 
 ## The caret, a 2-point accent bar at the cursor's cell, while it is in the
