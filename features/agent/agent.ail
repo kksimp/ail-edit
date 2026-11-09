@@ -257,7 +257,7 @@ pub fn pack(path str, first int, body List[str], diags List[str], facts List[str
 ## starting with `+` or `-`, or `rename`).
 pub fn looks_like_edit(s str) bool
     t := s.trim()
-    if t.starts_with("[") or t.starts_with("{")
+    if t.starts_with("[") or t.starts_with("\{")
         return true
     for l in t.split("\n")
         if l.starts_with("+") or l.starts_with("-") or l.starts_with("rename ")
@@ -284,8 +284,9 @@ pub fn apply_buffer(ail str, path str, text str, hunks str, dry bool) Outcome
         return Outcome(ok: false, text: text, report: "can't run {err.cmd}: {err.kind}")
     mut result := text
     if not dry and r.status == 0
-        result = fs.read_text(copy) else err
+        got := fs.read_text(copy) else err
             return Outcome(ok: false, text: text, report: "can't read {err.path}")
+        result = got
     fs.remove(copy) else err
         return Outcome(ok: false, text: text, report: "can't remove {err.path}")
     mut report := r.out
