@@ -3123,7 +3123,7 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
 @test fn settings_list_cycles_and_remembers_in_the_session()
     mut ws := Workspace.new(typed("", []))
     ws.on_event(key_event("ctrl+,"))
-    assert(ws.picking and ws.mode == "settings")
+    assert(ws.picking and ws.picker_mode == "settings")
     assert_eq(ws.choices()[0], "{"Theme".pad_right(24, ' ')} dark")
     ws.on_event(press("enter"))
     assert_eq(ws.theme, "light")
@@ -3135,7 +3135,7 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     assert_eq(setting(ws.prefs, "font") else "", "24")
     ws.on_event(press("escape"))
     assert(not ws.picking)
-    assert_eq(ws.mode, "")
+    assert_eq(ws.picker_mode, "")
 
 @test fn rebound_keys_act_as_the_original()
     mut ws := Workspace.new(typed("", []))
@@ -3143,7 +3143,7 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     for c in "rebind".chars()
         ws.on_event(press("{c}"))
     ws.on_event(press("enter"))
-    assert_eq(ws.mode, "bind")
+    assert_eq(ws.picker_mode, "bind")
     for c in "ctrl+alt+t as Next theme".chars()
         ws.on_event(press("{c}"))
     ws.on_event(press("enter"))
@@ -3181,7 +3181,7 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
 @test fn new_project_refuses_bad_names()
     mut ws := Workspace.new(typed("", []))
     ws.on_event(key_event("ctrl+shift+n"))
-    assert_eq(ws.mode, "new")
+    assert_eq(ws.picker_mode, "new")
     ws.on_event(press("escape"))
     ws.new_project("Bad Name")
     assert(ws.message.contains("isn't a project name"))
@@ -4076,14 +4076,14 @@ fn Workspace.start_palette(mut self)
 
 ## What the open list shows: commands with their keys, or file paths.
 fn Workspace.choices(self) List[str]
-    if mode == "settings"
+    if picker_mode == "settings"
         mut shown_rows := List[str]()
         for r in workspace.rows(themes.NAMES)
             shown_rows.push(workspace.shown(r, value_of(r.key)))
         return shown_rows
-    if mode == "new"
+    if picker_mode == "new"
         return ["Enter creates NAME/ with ail.pkg and main.ail (ail new); Esc cancels"]
-    if mode == "bind"
+    if picker_mode == "bind"
         return ["NEWKEY as COMMAND, e.g. ctrl+alt+t as Next theme; Esc cancels"]
     if not commanding
         return matches()
@@ -4094,12 +4094,12 @@ fn Workspace.choices(self) List[str]
 
 ## Enter in the open list: runs the command, or opens the file.
 fn Workspace.choose(mut self)
-    if mode == "settings"
+    if picker_mode == "settings"
         cycle_setting(list.selected)
         return
     picking = false
-    m := mode
-    mode = ""
+    m := picker_mode
+    picker_mode = ""
     if m == "new"
         new_project(field.text)
         return
@@ -4212,7 +4212,7 @@ struct Workspace
     ## S10: what the picker is for ("" files or commands, "settings", "new",
     ## "bind"), the settings file's text, the key rebindings read from it,
     ## git marks of changed files in the tree, and the welcome screen.
-    mode str
+    picker_mode str
     prefs str
     binds List[workspace.Bind]
     gitmarks bool
@@ -4256,7 +4256,7 @@ fn Workspace.new(ed Editor) Workspace
         live_problems: false,
         test_on_save: false,
         typed_at: 0,
-        mode: "",
+        picker_mode: "",
         prefs: "",
         binds: [],
         gitmarks: false,
@@ -5618,7 +5618,7 @@ fn Workspace.pick_event(mut self, ev ui.Event)
             if k == "escape"
                 picking = false
                 commanding = false
-                mode = ""
+                picker_mode = ""
             elif k == "enter"
                 choose()
                 return
@@ -5642,7 +5642,7 @@ fn Workspace.pick_event(mut self, ev ui.Event)
 fn Workspace.start_mode(mut self, m str, label str)
     picking = true
     commanding = false
-    mode = m
+    picker_mode = m
     field = widgets.TextField.new(label, "")
     list = picker_list()
 
