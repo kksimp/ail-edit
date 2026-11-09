@@ -3,9 +3,9 @@
 
 ## One setting the Settings list (Ctrl-,) cycles through.
 pub struct Row
-    key str
-    label str
-    choices List[str]
+    pub key str
+    pub label str
+    pub choices List[str]
 
 ## Font sizes the list offers.
 pub FONTS := ["14", "16", "18", "20", "24", "28", "32"]
@@ -41,8 +41,8 @@ pub fn shown(r Row, cur str) str
 
 ## A rebound key: pressing `to` acts as `from` (specs such as `ctrl+shift+t`).
 pub struct Bind
-    from str
-    to str
+    pub from str
+    pub to str
 
 ## Settings key of a binding: `bind.` and the new key's spec.
 pub fn bind_key(to str) str
