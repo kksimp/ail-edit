@@ -18,7 +18,7 @@ pub fn lines(dirs List[str]) List[str]
     out.push("  Ctrl-P        open a file")
     out.push("  Ctrl-B        file tree, with git marks")
     out.push("  Ctrl-,        settings")
-    out.push("  Ctrl-Shift-K  rebind a key")
+    out.push("  Palette       rebind a key, welcome screen")
     out.push("  Ctrl-Shift-P  every command")
     out.push("")
     if dirs.len() > 0

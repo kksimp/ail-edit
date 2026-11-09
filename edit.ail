@@ -2910,6 +2910,8 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
             continue
         assert(not names.contains(r.name))
         names.add(r.name)
+        if r.spec.starts_with("cmd:")
+            continue
         match key_event(r.spec)
             Key(k, ctrl, alt, shift) =>
                 assert(
@@ -3122,7 +3124,10 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
 
 @test fn rebound_keys_act_as_the_original()
     mut ws := Workspace.new(typed("", []))
-    ws.on_event(key_event("ctrl+shift+k"))
+    ws.on_event(key_event("ctrl+shift+p"))
+    for c in "rebind".chars()
+        ws.on_event(press("{c}"))
+    ws.on_event(press("enter"))
     assert_eq(ws.mode, "bind")
     for c in "ctrl+alt+t as Next theme".chars()
         ws.on_event(press("{c}"))
@@ -3132,7 +3137,10 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     assert_eq(setting(ws.prefs, "bind.ctrl+alt+t") else "", "ctrl+shift+t")
     ws.on_event(key_event("ctrl+alt+t"))
     assert_eq(ws.theme, "light")
-    ws.on_event(key_event("ctrl+shift+k"))
+    ws.on_event(key_event("ctrl+shift+p"))
+    for c in "rebind".chars()
+        ws.on_event(press("{c}"))
+    ws.on_event(press("enter"))
     for c in "f9 as nothing".chars()
         ws.on_event(press("{c}"))
     ws.on_event(press("enter"))
@@ -3812,10 +3820,16 @@ fn key_rows() List[KeyRow]
             "Type a name, Enter: `ail new NAME` creates `NAME/` with `ail.pkg` and `main.ail`, and opens `main.ail`",
         ),
         key_row(
-            "Ctrl-Shift-K",
+            "Palette only",
             "Rebind a key",
-            "ctrl+shift+k",
+            "cmd:rebind",
             "Type `NEWKEY as COMMAND` (a palette name or a key, e.g. `ctrl+alt+t as Next theme`), Enter: saved as `bind.NEWKEY` in `~/.ail-edit`; the original key keeps working",
+        ),
+        key_row(
+            "Palette only",
+            "Welcome screen",
+            "cmd:welcome",
+            "The welcome screen with the recent projects; any key dismisses it",
         ),
         key_row(
             "Ctrl-Q",
@@ -3882,7 +3896,6 @@ enum WsKey
     TestOnSave
     Settings
     NewProject
-    Rebind
     Zoom(key str)
 
 fn workspace_key(k str, ctrl bool, shift bool) WsKey?
@@ -3912,7 +3925,6 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
             "h" | "H" => ReplaceInFiles
             "u" | "U" => TestOnSave
             "n" | "N" => NewProject
-            "k" | "K" => Rebind
             _ => none
     match k
         "b" | "B" => Tree
@@ -4231,7 +4243,6 @@ fn Workspace.dispatch(mut self, ev ui.Event)
                     Theme => next_theme()
                     Settings => start_mode("settings", "settings: ")
                     NewProject => start_mode("new", "new project: ")
-                    Rebind => start_mode("bind", "rebind: ")
                     Trace => trace_run()
                     FailurePaths => failure_paths()
                     Coverage => eds[active].coverage()
