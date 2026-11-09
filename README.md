@@ -155,6 +155,9 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-Q | Quit; with unsaved changes in any tab, press it twice. Closing the window counts as Ctrl-Q |
 | Palette | Show or hide the minimap beside the text (window) |
 | Palette | Hide the tab strip and status bar (window) |
+| Palette | Step the font size up (also Ctrl-+) |
+| Palette | Step the font size down (also Ctrl--) |
+| Palette | Back to the default font size (also Ctrl-0) |
 | Mouse | Click places the caret, drag or Shift-click selects, the wheel scrolls, a click on a diagnostic or an output location jumps to it |
 
 ## macOS sanity check
