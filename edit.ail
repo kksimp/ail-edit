@@ -855,10 +855,19 @@ fn Editor.auto_complete_members(mut self)
     if completing
         message = ""
 
-## After a `(`, shows the signature of the function or method before it.
+## Shows the signature popup for the call the cursor is inside: after a
+## `(`, while typing its arguments, and on Ctrl-Shift-Space. It walks back
+## to the call's unmatched `(`, finds the function or method named before
+## it in the `--symbols` index, and marks the current argument; the rows add
+## the contracts, effects and error set from the same index entry. Closed
+## when the cursor leaves the call.
 fn Editor.signature_help(mut self)
+    layer.sig = sem.View(rows: [], from: 0, to: 0)
     cs := cur()
-    mut b := col - 1
+    call := sem.call_at(cs, col)
+    if call.open < 0
+        return
+    mut b := call.open
     while b > 0 and cs[b - 1] == ' '
         b -= 1
     mut a := b
@@ -869,7 +878,7 @@ fn Editor.signature_help(mut self)
     name := cs[a..b].join("")
     for sym in symbols
         if sym.name == name and (sym.kind == "fn" or sym.kind == "method")
-            message = sym.signature
+            layer.sig = sem.sig_view(sym.signature, sym.facts, call.arg, a > 0 and cs[a - 1] == '.')
             return
 
 fn Editor.open_completion(mut self)
@@ -1468,6 +1477,8 @@ fn Editor.render(self) Screen
         mark_bracket(mut s, b.end_line, b.end_col)
     if completing
         render_popup(mut s)
+    elif layer.sig.rows.len() > 0
+        render_sig(mut s)
     # A diagnostic at the end of a line shows as one marked cell, and the
     # first diagnostic of each line shows its message after the line.
     mut shown := Set[int]()
@@ -1522,6 +1533,30 @@ fn Editor.mark_bracket(self, mut s Screen, l int, c int)
 
 ## The completion popup: below the cursor (above it near the bottom), at
 ## the start of the word, at most 8 entries around the selected one.
+## The signature popup: above the cursor's line (below it near the top),
+## the current argument on a selected background.
+fn Editor.render_sig(self, mut s Screen)
+    v := layer.sig
+    mut width := 0
+    for row in v.rows
+        width = width.max(row.chars().len() + 2)
+    width = width.min(cols).max(1)
+    n := v.rows.len()
+    x := gutter_width().min((cols - width).max(0))
+    mut y := line - top - n
+    if y < 0
+        y = line - top + 1
+    for k in 0..n
+        bg := PANE_BG
+        s.put(y + k, x, " ".repeat(width), FG, bg)
+        if k == 0
+            cs := v.rows[0].chars()
+            s.put(y, x + 1, cs[..v.from].join(""), FG, bg)
+            s.put(y, x + 1 + v.from, cs[v.from..v.to].join(""), FG, SELECT_BG)
+            s.put(y, x + 1 + v.to, cs[v.to..].join(""), FG, bg)
+        else
+            s.put(y + k, x + 1, v.rows[k], GUTTER_FG, bg)
+
 fn Editor.render_popup(self, mut s Screen)
     n := completions.len().min(8)
     cs := cur()
@@ -1719,6 +1754,7 @@ fn Editor.apply(mut self, cmd Command)
             pane = Diags
             message = ""
             selecting = false
+            layer.sig = sem.View(rows: [], from: 0, to: 0)
         Quit =>
             if dirty and not quit_armed
                 quit_armed = true
@@ -1729,6 +1765,8 @@ fn Editor.apply(mut self, cmd Command)
             cols = c
             rows = r
         Format | Rename | Save | Check | Explain | Outline => return
+    if layer.sig.rows.len() > 0
+        signature_help()
     scroll()
 
 ## Up, Down and Enter in the outline pane; true if `cmd` was one of them.
@@ -3008,7 +3046,7 @@ fn fg_at(s Screen, row int, col int) int
     ed.apply(Backspace)
     for c in ["a", "d", "d", "("]
         ed.apply(Insert(c))
-    assert_eq(ed.message, "fn add(a int, b int) int")
+    assert_eq(ed.layer.sig.rows[0], "fn add(a int, b int) int")
     assert_eq(ed.lines[10], "    add()")
 
 @test fn occurrences_and_inline_messages()
@@ -3757,8 +3795,11 @@ enum Extra
     RunFile
     TestFile
     Hints
+    Signature
 
 fn extra_key(key str, ctrl bool, alt bool, shift bool) Extra?
+    if ctrl and shift and not alt and key == " "
+        return Signature
     if alt and not ctrl and not shift and (key == "i" or key == "I")
         return Hints
     if ctrl or alt
@@ -3774,10 +3815,16 @@ fn Editor.run_extra(mut self, x Extra)
     if x == Hints
         layer_key("h")
         return
+    if x == Signature
+        index()
+        signature_help()
+        if layer.sig.rows.len() == 0
+            message = "not inside a call of a known function"
+        return
     words := match x
         RunFile => ["run"]
         TestFile => ["test"]
-        Hints => []
+        Hints | Signature => []
     r := ail_on_buffer(words) else return
     show_output(words[0], r)
 
@@ -4153,6 +4200,12 @@ fn key_rows() List[KeyRow]
             "Fix all",
             "ctrl+shift+.",
             "Preview the first non-overlapping fix of every diagnostic, as `ail lsp`'s fix-all takes them; Enter applies them as one undo step, any other key cancels",
+        ),
+        key_row(
+            "Ctrl-Shift-Space",
+            "Signature help",
+            "ctrl+shift+space",
+            "Signature popup for the call the cursor is inside: the signature with the current argument marked, then its contracts, effects and error set; follows the cursor through the arguments, Esc closes",
         ),
         key_row(
             "Alt-I",

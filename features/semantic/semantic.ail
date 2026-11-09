@@ -42,6 +42,19 @@ pub struct Colors
     pub field_fg int
     pub variant_fg int
 
+## The signature popup: its rows (the signature, then contracts and
+## effects) and the character range of the current argument in row 0.
+pub struct View
+    pub rows List[str]
+    pub from int
+    pub to int
+
+## Where a call stands: the index of its unmatched `(`, or -1, and which
+## argument (0-based) the cursor is in.
+pub struct Call
+    pub open int
+    pub arg int
+
 ## The layer's state in one editor. `level` 0 is off, 1 kind colors and
 ## code lens; `hints_on` adds inlay hints, whatever the level. `lens` and `hints` are keyed by 0-based
 ## line. A pending preview holds the whole buffer it would make.
@@ -53,6 +66,7 @@ pub struct State
     pub hints Map[int, str]
     pub pending bool
     pub proposed List[str]
+    pub sig View
 
 pub fn State.new() State
     State(
@@ -63,6 +77,7 @@ pub fn State.new() State
         hints: Map[int, str](),
         pending: false,
         proposed: [],
+        sig: View(rows: [], from: 0, to: 0),
     )
 
 fn jstr(j Json, key str) str
@@ -179,6 +194,84 @@ pub fn diff_rows(old List[str], new List[str], limit int) List[str]
         rows = rows[..limit]
         rows.push("... {more} more rows")
     rows
+
+# ---- Signature popup ------------------------------------------------------
+
+## The call the cursor (at `upto` characters into `cs`) is inside: walks
+## back to the unmatched `(` and counts the commas at its own depth.
+pub fn call_at(cs List[char], upto int) Call
+    mut depth := 0
+    mut commas := 0
+    mut i := upto.min(cs.len()) - 1
+    while i >= 0
+        c := cs[i]
+        if c == ')' or c == ']'
+            depth += 1
+        elif c == '(' or c == '['
+            if depth == 0
+                if c == '('
+                    return Call(open: i, arg: commas)
+                return Call(open: -1, arg: 0)
+            depth -= 1
+        elif c == ',' and depth == 0
+            commas += 1
+        i -= 1
+    Call(open: -1, arg: 0)
+
+## The parameters of a signature `fn f(a int, b List[int]) int` as flat
+## (start, end) character offsets.
+pub fn param_spans(sig str) List[int]
+    cs := sig.chars()
+    mut out := List[int]()
+    mut p := 0
+    while p < cs.len() and cs[p] != '('
+        p += 1
+    if p >= cs.len()
+        return out
+    mut depth := 0
+    mut start := p + 1
+    mut i := p + 1
+    while i < cs.len()
+        c := cs[i]
+        if c == '(' or c == '['
+            depth += 1
+        elif c == ')' or c == ']'
+            if depth == 0
+                if i > start
+                    out.push(start)
+                    out.push(i)
+                return out
+            depth -= 1
+        elif c == ',' and depth == 0
+            out.push(start)
+            out.push(i)
+            start = i + 1
+            while start < cs.len() and cs[start] == ' '
+                start += 1
+        i += 1
+    out
+
+## The popup for a signature: the signature with the argument `arg`
+## marked, then its contracts, effects and error set (`facts`). A method
+## called as `x.m(...)` has its `self` skipped (`skip_self`).
+pub fn sig_view(sig str, facts List[str], arg int, skip_self bool) View
+    spans := param_spans(sig)
+    cs := sig.chars()
+    mut n := arg
+    if skip_self and spans.len() >= 2
+        first := cs[spans[0]..spans[1]].join("")
+        if first == "self" or first == "mut self"
+            n += 1
+    mut from := 0
+    mut to := 0
+    if 2 * n + 1 < spans.len()
+        from = spans[2 * n]
+        to = spans[2 * n + 1]
+    mut rows := [sig]
+    for f in facts
+        if rows.len() < 5
+            rows.push("    {f}")
+    View(rows: rows, from: from, to: to)
 
 # ---- Spec links for explain ---------------------------------------------
 
@@ -366,6 +459,28 @@ pub fn ghost(s State, l int) str
 
 fn edit_at(l int, c int, el int, ec int, text str) Edit
     Edit(line: l, col: c, end_line: el, end_col: ec, text: text)
+
+@test fn a_call_knows_its_open_paren_and_argument()
+    cs := "f(a, g(1, 2), [3, 4], ".chars()
+    c := call_at(cs, cs.len())
+    assert_eq([c.open, c.arg], [1, 3])
+    inner := "f(a, g(1, ".chars()
+    d := call_at(inner, inner.len())
+    assert_eq([d.open, d.arg], [6, 1])
+    done := "f(a) + 1".chars()
+    assert_eq(call_at(done, done.len()).open, -1)
+    assert_eq(call_at("[1, 2".chars(), 5).open, -1)
+
+@test fn the_popup_marks_the_current_argument()
+    sig := "fn add(a int, b List[int]) int"
+    assert_eq(param_spans(sig), [7, 12, 14, 25])
+    v := sig_view(sig, ["requires a > 0", "effects: io"], 1, false)
+    assert_eq(sig.chars()[v.from..v.to].join(""), "b List[int]")
+    assert_eq(v.rows, [sig, "    requires a > 0", "    effects: io"])
+    m := sig_view("fn Point.shift(mut self, dx int)", [], 0, true)
+    assert_eq("fn Point.shift(mut self, dx int)".chars()[m.from..m.to].join(""), "dx int")
+    past := sig_view(sig, [], 5, false)
+    assert_eq(past.from, past.to)
 
 @test fn fix_all_takes_non_overlapping_first_fixes()
     a := Fix(rule: "r1", title: "a", edits: [edit_at(2, 5, 2, 9, "print")])

@@ -96,6 +96,7 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-0 | Default font size |
 | Ctrl-Shift-T | Next theme: dark, light, solarized, high-contrast; remembered for the next start |
 | Ctrl-Shift-. | Preview the first non-overlapping fix of every diagnostic, as `ail lsp`'s fix-all takes them; Enter applies them as one undo step, any other key cancels |
+| Ctrl-Shift-Space | Signature popup for the call the cursor is inside: the signature with the current argument marked, then its contracts, effects and error set; follows the cursor through the arguments, Esc closes |
 | Alt-I | Toggle inlay hints: the type of each local binding on the visible lines (`ail api --locals`), refreshed on save |
 | palette | Toggle declarations colored by kind, with a code lens after each: uses, effects, test (Ctrl-Shift-P) |
 | palette | Preview what `ail fix` makes of the buffer (fix rounds until none is left); Enter applies it as one undo step, any other key cancels (Ctrl-Shift-P) |
