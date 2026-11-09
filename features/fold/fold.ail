@@ -1,0 +1,96 @@
+## Code folding (editor plan S2). AIL blocks are indentation (lex.block.1),
+## so a fold is a header line plus the deeper lines that follow it. The
+## editor keeps the set of folded header lines (0-based); everything here
+## is a pure function of the lines and that set.
+use features.scope
+
+## The last line of the block that line `h` opens, or `h` when it opens none.
+## Blank and comment-only lines belong to the block only when a deeper line
+## follows them.
+pub fn end_of(lines List[str], h int) int
+    if h < 0 or h >= lines.len() or not scope.opens(lines, h)
+        return h
+    want := scope.indent(lines[h])
+    mut last := h
+    mut i := h + 1
+    while i < lines.len()
+        if not scope.skipped(lines[i])
+            if scope.indent(lines[i]) <= want
+                break
+            last = i
+        i += 1
+    last
+
+## Which lines are hidden by `folded`: the lines after a folded header up to
+## the end of its block.
+pub fn hidden(lines List[str], folded Set[int]) List[bool]
+    mut out := List[bool]()
+    for _ in 0..lines.len()
+        out.push(false)
+    for h in folded
+        e := end_of(lines, h)
+        for i in h + 1..e + 1
+            out[i] = true
+    out
+
+## How many lines before `l` are not hidden: `l`'s row in the folded view.
+pub fn rank(hid List[bool], l int) int
+    mut n := 0
+    for i in 0..l.min(hid.len())
+        if not hid[i]
+            n += 1
+    n
+
+## The line shown on row `k` of the folded view, or -1 past the end.
+pub fn nth(hid List[bool], k int) int
+    mut n := 0
+    for i in 0..hid.len()
+        if not hid[i]
+            if n == k
+                return i
+            n += 1
+    -1
+
+## The folded headers that still open a block, in range.
+pub fn prune(lines List[str], folded Set[int]) Set[int]
+    mut out := Set[int]()
+    for h in folded
+        if h >= 0 and h < lines.len() and scope.opens(lines, h)
+            out.add(h)
+    out
+
+## `folded` after an edit that ended on line `at` (before the edit) and
+## changed the number of lines by `delta`: later headers move with their text.
+pub fn shift(folded Set[int], at int, delta int) Set[int]
+    mut out := Set[int]()
+    for h in folded
+        if h > at
+            out.add(h + delta)
+        else
+            out.add(h)
+    out
+
+## `folded` without the folds that hide line `l`, so editing there shows it.
+pub fn reveal(lines List[str], folded Set[int], l int) Set[int]
+    mut out := Set[int]()
+    for h in folded
+        if l > h and l <= end_of(lines, h)
+            continue
+        out.add(h)
+    out
+
+## The header to fold or unfold for a caret on line `l`: `l` when it opens a
+## block, else the nearest enclosing header above it, or `none`.
+pub fn header_for(lines List[str], l int) int?
+    chain := scope.chain(lines, l)
+    if chain.len() == 0
+        return none
+    chain[chain.len() - 1]
+
+## Every top-level header that opens a block.
+pub fn top_level(lines List[str]) Set[int]
+    mut out := Set[int]()
+    for i in 0..lines.len()
+        if scope.indent(lines[i]) == 0 and scope.opens(lines, i)
+            out.add(i)
+    out
