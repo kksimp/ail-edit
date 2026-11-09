@@ -1,0 +1,127 @@
+## The editor's settings rows and key rebinding (S10). The settings file is
+## `~/.ail-edit`, lines of `KEY VALUE`; `edit.ail` reads and writes it.
+
+## One setting the Settings list (Ctrl-,) cycles through.
+pub struct Row
+    key str
+    label str
+    choices List[str]
+
+## Font sizes the list offers.
+pub FONTS := ["14", "16", "18", "20", "24", "28", "32"]
+
+## The rows, with the theme names to offer.
+pub fn rows(themes List[str]) List[Row]
+    [
+        Row(key: "theme", label: "Theme", choices: themes),
+        Row(key: "font", label: "Font size", choices: FONTS),
+        Row(key: "restore", label: "Reopen tabs at start", choices: ["on", "off"]),
+        Row(key: "welcome", label: "Welcome screen", choices: ["on", "off"]),
+        Row(key: "gitmarks", label: "Git marks in the tree", choices: ["on", "off"]),
+    ]
+
+## The value a setting has when the file doesn't set it.
+pub fn default_of(key str) str
+    if key == "theme"
+        return "dark"
+    if key == "font"
+        return "20"
+    "on"
+
+## The choice after `cur` in `r`, wrapping; the first when `cur` isn't one.
+pub fn next_choice(r Row, cur str) str
+    at := r.choices.index_of(cur) else -1
+    r.choices[(at + 1) % r.choices.len()]
+
+## The row as the list shows it, the label padded.
+pub fn shown(r Row, cur str) str
+    "{r.label.pad_right(24, ' ')} {cur}"
+
+# ---- Key rebinding ------------------------------------------------------
+
+## A rebound key: pressing `to` acts as `from` (specs such as `ctrl+shift+t`).
+pub struct Bind
+    from str
+    to str
+
+## Settings key of a binding: `bind.` and the new key's spec.
+pub fn bind_key(to str) str
+    "bind.{to}"
+
+## The bindings a settings file holds: lines `bind.NEWSPEC ORIGINALSPEC`.
+pub fn binds(text str) List[Bind]
+    mut out := List[Bind]()
+    for line in text.split("\n")
+        rest := line.strip_prefix("bind.") else continue
+        parts := rest.split(" ")
+        if parts.len() == 2 and parts[0] != "" and parts[1] != ""
+            out.push(Bind(from: parts[1], to: parts[0]))
+    out
+
+## The spec of a key press: modifiers in the order ctrl, alt, shift, then
+## the key in lower case (`space` for the space bar).
+pub fn spec_of(key str, ctrl bool, alt bool, shift bool) str
+    mut out := ""
+    if ctrl
+        out = "ctrl+"
+    if alt
+        out = "{out}alt+"
+    if shift
+        out = "{out}shift+"
+    mut k := key.to_lower()
+    if k == " "
+        k = "space"
+    "{out}{k}"
+
+## Puts a spec's modifiers in the order `spec_of` uses and lower-cases it.
+pub fn normal(spec str) str
+    mut parts := spec.to_lower().trim().split("+")
+    key := parts.pop() else ""
+    spec_of(key, parts.contains("ctrl"), parts.contains("alt"), parts.contains("shift"))
+
+## The original spec that `spec` is rebound to, if any.
+pub fn translate(bs List[Bind], spec str) str?
+    for b in bs
+        if b.to == spec
+            return b.from
+    none
+
+## `NEW as COMMAND` typed in the rebind prompt: the new spec and the command
+## (a name from the palette or a spec). `none` when it isn't that shape.
+pub fn parse_input(s str) Bind?
+    at := s.find(" as ") else return none
+    n := s.chars().len()
+    fresh := s.slice(0, at).trim()
+    cmd := s.slice(at + 4, n).trim()
+    if fresh == "" or cmd == "" or fresh.contains(" ")
+        return none
+    Bind(from: cmd, to: normal(fresh))
+
+@test fn settings_rows_cycle_and_wrap()
+    rs := rows(["dark", "light"])
+    assert_eq(rs.len(), 5)
+    assert_eq(next_choice(rs[0], "dark"), "light")
+    assert_eq(next_choice(rs[0], "light"), "dark")
+    assert_eq(next_choice(rs[0], "neon"), "dark")
+    assert_eq(next_choice(rs[1], "20"), "24")
+    assert_eq(default_of("font"), "20")
+    assert_eq(default_of("welcome"), "on")
+    assert_eq(shown(rs[2], "off"), "Reopen tabs at start     off")
+
+@test fn rebinding_reads_and_translates()
+    text := "font 20\nbind.ctrl+alt+t ctrl+shift+t\nbind.f9 f5\ntheme dark\n"
+    bs := binds(text)
+    assert_eq(bs.len(), 2)
+    assert_eq(translate(bs, "f9") else "none", "f5")
+    assert_eq(translate(bs, "ctrl+alt+t") else "none", "ctrl+shift+t")
+    assert_eq(translate(bs, "f5") else "none", "none")
+    assert_eq(spec_of("T", true, false, true), "ctrl+shift+t")
+    assert_eq(spec_of(" ", true, false, false), "ctrl+space")
+    assert_eq(normal("Shift+Ctrl+T"), "ctrl+shift+t")
+
+@test fn rebind_input_parses()
+    b := parse_input("Alt+Ctrl+T as Next theme") else unreachable("parses")
+    assert_eq(b.to, "ctrl+alt+t")
+    assert_eq(b.from, "Next theme")
+    assert(not parse_input("ctrl+t").is_some())
+    assert(not parse_input("a b as c").is_some())

@@ -14,6 +14,7 @@ use std.ui
 use std.ui.widgets
 use std.screen.cells as scells
 use themes
+use features.workspace
 
 # Colors, 0xRRGGBB.
 BG := 0x1e1e1e
@@ -3102,6 +3103,77 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     assert_eq(setting(text, "theme") else "", "light")
     assert_eq(setting("", "theme") else "none", "none")
 
+@test fn settings_list_cycles_and_remembers_in_the_session()
+    mut ws := Workspace.new(typed("", []))
+    ws.on_event(key_event("ctrl+,"))
+    assert(ws.picking and ws.mode == "settings")
+    assert_eq(ws.choices()[0], "{"Theme".pad_right(24, ' ')} dark")
+    ws.on_event(press("enter"))
+    assert_eq(ws.theme, "light")
+    assert(ws.picking)
+    assert_eq(setting(ws.prefs, "theme") else "", "light")
+    ws.on_event(press("down"))
+    ws.on_event(press("enter"))
+    assert_eq(ws.font, 24)
+    assert_eq(setting(ws.prefs, "font") else "", "24")
+    ws.on_event(press("escape"))
+    assert(not ws.picking)
+    assert_eq(ws.mode, "")
+
+@test fn rebound_keys_act_as_the_original()
+    mut ws := Workspace.new(typed("", []))
+    ws.on_event(key_event("ctrl+shift+k"))
+    assert_eq(ws.mode, "bind")
+    for c in "ctrl+alt+t as Next theme".chars()
+        ws.on_event(press("{c}"))
+    ws.on_event(press("enter"))
+    assert_eq(ws.binds.len(), 1)
+    assert_eq(ws.message, "ctrl+alt+t now acts as ctrl+shift+t")
+    assert_eq(setting(ws.prefs, "bind.ctrl+alt+t") else "", "ctrl+shift+t")
+    ws.on_event(key_event("ctrl+alt+t"))
+    assert_eq(ws.theme, "light")
+    ws.on_event(key_event("ctrl+shift+k"))
+    for c in "f9 as nothing".chars()
+        ws.on_event(press("{c}"))
+    ws.on_event(press("enter"))
+    assert_eq(ws.binds.len(), 1)
+    assert(ws.message.starts_with("no command"))
+
+@test fn new_project_refuses_bad_names()
+    mut ws := Workspace.new(typed("", []))
+    ws.on_event(key_event("ctrl+shift+n"))
+    assert_eq(ws.mode, "new")
+    ws.on_event(press("escape"))
+    ws.new_project("Bad Name")
+    assert(ws.message.contains("isn't a project name"))
+    assert_eq(ws.eds.len(), 1)
+
+@test fn welcome_lists_recent_projects_and_dismisses()
+    mut ws := Workspace.new(typed("", []))
+    ws.on_event(Resize(cols: 80, rows: 30))
+    ws.prefs = "open:/proj 3,4,/proj/a.ail\n"
+    ws.welcome = true
+    mut found := false
+    for row in ws.render().text
+        if row.contains("1  /proj")
+            found = true
+    assert(found)
+    ws.on_event(press("x"))
+    assert(not ws.welcome)
+    assert_eq(ws.eds[0].lines[0], "x")
+
+@test fn the_tree_shows_git_marks()
+    mut ws := Workspace.new(typed("x", []))
+    ws.on_event(Resize(cols: 80, rows: 20))
+    ws.gitmarks = true
+    ws.git = {"a.ail": "M"}
+    ws.tree = [TreeRow(path: "a.ail", name: "a.ail", depth: 0, dir: false)]
+    ws.tree_open = true
+    ws.resize_tabs()
+    row := ws.render().text[1]
+    assert(row.starts_with(" a.ail"))
+    assert(row.slice(0, TREE_W).contains(" M"))
+
 @test fn ctrl_plus_and_minus_step_the_font_size()
     mut ws := Workspace.new(typed("", []))
     ws.on_event(Key(key: "=", ctrl: true, alt: false, shift: false))
@@ -3728,6 +3800,24 @@ fn key_rows() List[KeyRow]
             "Next theme: dark, light, solarized, high-contrast; remembered for the next start",
         ),
         key_row(
+            "Ctrl-,",
+            "Settings",
+            "ctrl+,",
+            "Settings list: Up/Down, Enter changes the value (theme, font size, reopen tabs, welcome screen, git marks) and saves it to `~/.ail-edit`; Esc closes",
+        ),
+        key_row(
+            "Ctrl-Shift-N",
+            "New project",
+            "ctrl+shift+n",
+            "Type a name, Enter: `ail new NAME` creates `NAME/` with `ail.pkg` and `main.ail`, and opens `main.ail`",
+        ),
+        key_row(
+            "Ctrl-Shift-K",
+            "Rebind a key",
+            "ctrl+shift+k",
+            "Type `NEWKEY as COMMAND` (a palette name or a key, e.g. `ctrl+alt+t as Next theme`), Enter: saved as `bind.NEWKEY` in `~/.ail-edit`; the original key keeps working",
+        ),
+        key_row(
             "Ctrl-Q",
             "Quit",
             "ctrl+q",
@@ -3790,6 +3880,9 @@ enum WsKey
     References
     ReplaceInFiles
     TestOnSave
+    Settings
+    NewProject
+    Rebind
     Zoom(key str)
 
 fn workspace_key(k str, ctrl bool, shift bool) WsKey?
@@ -3818,12 +3911,15 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
             "m" | "M" => Problems
             "h" | "H" => ReplaceInFiles
             "u" | "U" => TestOnSave
+            "n" | "N" => NewProject
+            "k" | "K" => Rebind
             _ => none
     match k
         "b" | "B" => Tree
         "w" | "W" => CloseTab
         "q" | "Q" => QuitAll
         "p" | "P" => OpenFile
+        "," => Settings
         _ => none
 
 ## The palette's rows matching what is typed: those that run a command
@@ -3843,6 +3939,15 @@ fn Workspace.start_palette(mut self)
 
 ## What the open list shows: commands with their keys, or file paths.
 fn Workspace.choices(self) List[str]
+    if mode == "settings"
+        mut shown_rows := List[str]()
+        for r in workspace.rows(themes.NAMES)
+            shown_rows.push(workspace.shown(r, value_of(r.key)))
+        return shown_rows
+    if mode == "new"
+        return ["Enter creates NAME/ with ail.pkg and main.ail (ail new); Esc cancels"]
+    if mode == "bind"
+        return ["NEWKEY as COMMAND, e.g. ctrl+alt+t as Next theme; Esc cancels"]
     if not commanding
         return matches()
     mut out := List[str]()
@@ -3852,7 +3957,18 @@ fn Workspace.choices(self) List[str]
 
 ## Enter in the open list: runs the command, or opens the file.
 fn Workspace.choose(mut self)
+    if mode == "settings"
+        cycle_setting(list.selected)
+        return
     picking = false
+    m := mode
+    mode = ""
+    if m == "new"
+        new_project(field.text)
+        return
+    if m == "bind"
+        add_binding(field.text)
+        return
     if commanding
         found := commands()
         commanding = false
@@ -3930,6 +4046,15 @@ struct Workspace
     ## Ctrl-Shift-U: run the tab's tests after each save (ADR 0354).
     test_on_save bool
     typed_at int
+    ## S10: what the picker is for ("" files or commands, "settings", "new",
+    ## "bind"), the settings file's text, the key rebindings read from it,
+    ## git marks of changed files in the tree, and the welcome screen.
+    mode str
+    prefs str
+    binds List[workspace.Bind]
+    gitmarks bool
+    git Map[str, str]
+    welcome bool
 
 fn Workspace.new(ed Editor) Workspace
     Workspace(
@@ -3968,6 +4093,12 @@ fn Workspace.new(ed Editor) Workspace
         live_problems: false,
         test_on_save: false,
         typed_at: 0,
+        mode: "",
+        prefs: "",
+        binds: [],
+        gitmarks: false,
+        git: Map[str, str](),
+        welcome: false,
     )
 
 ## The file name a tab shows: the path after its last `/`.
@@ -4035,6 +4166,23 @@ fn Workspace.quit_all(mut self)
     quit = true
 
 fn Workspace.on_event(mut self, ev ui.Event)
+    if binds.len() > 0
+        if spec := event_spec(ev)
+            if orig := workspace.translate(binds, spec)
+                dispatch(key_event(orig))
+                return
+    dispatch(ev)
+
+## The spec (`ctrl+shift+t` form) of a key event; none for other events.
+fn event_spec(ev ui.Event) str?
+    match ev
+        Key(k, ctrl, alt, shift) => workspace.spec_of(k, ctrl, alt, shift)
+        Resize(_, _) | Close | Mouse(_, _, _, _) | Scroll(_) => none
+
+fn Workspace.dispatch(mut self, ev ui.Event)
+    if welcome
+        if welcome_event(ev)
+            return
     if picking
         pick_event(ev)
         return
@@ -4081,6 +4229,9 @@ fn Workspace.on_event(mut self, ev ui.Event)
                     NextHit => next_hit()
                     Tree => toggle_tree()
                     Theme => next_theme()
+                    Settings => start_mode("settings", "settings: ")
+                    NewProject => start_mode("new", "new project: ")
+                    Rebind => start_mode("bind", "rebind: ")
                     Trace => trace_run()
                     FailurePaths => failure_paths()
                     Coverage => eds[active].coverage()
@@ -4098,6 +4249,7 @@ fn Workspace.on_event(mut self, ev ui.Event)
             saves := eds[active].saves
             eds[active].on_event(ev)
             if eds[active].saves != saves
+                refresh_git()
                 check_other_tabs()
                 if hits_title.starts_with("program card")
                     card_view()
@@ -4314,6 +4466,7 @@ fn Workspace.toggle_tree(mut self)
         tree_focus = false
     else
         if not tree_open
+            refresh_git()
             tree = tree_rows(tree_root, 0)
             tree_sel = 0
         tree_open = true
@@ -4395,6 +4548,11 @@ fn Workspace.render_tree(self, mut s Screen)
             indent := "  ".repeat(t.depth)
             cs := "{indent}{t.name}".chars()
             text = cs[..cs.len().min(TREE_W - 1)].join("")
+            if gitmarks
+                m := workspace.mark(git, t.path, t.dir)
+                if m != ""
+                    fg = WARN_FG
+                    text = "{text.slice(0, text.len().min(TREE_W - 4)).pad_right(TREE_W - 4, ' ')} {m}"
             s.put(r, 0, " {text}".pad_right(TREE_W, ' '), fg, bg)
         shown := " {text}".pad_right(TREE_W + 1, ' ')
         s.text[r] = "{shown}{s.text[r]}"
@@ -5188,6 +5346,7 @@ fn Workspace.pick_event(mut self, ev ui.Event)
             if k == "escape"
                 picking = false
                 commanding = false
+                mode = ""
             elif k == "enter"
                 choose()
                 return
@@ -5204,6 +5363,149 @@ fn Workspace.pick_event(mut self, ev ui.Event)
             on_event(ev)
         Mouse(_, _, _, _) | Scroll(_) => return
     list.selected = list.selected.min((choices().len() - 1).max(0))
+
+# ---- Workspace and settings (S10) ---------------------------------------
+
+## Starts the picker in a mode: `settings`, `new` (project name) or `bind`.
+fn Workspace.start_mode(mut self, m str, label str)
+    picking = true
+    commanding = false
+    mode = m
+    field = widgets.TextField.new(label, "")
+    list = picker_list()
+
+## A setting's value: the live theme and font, else the settings text, else
+## its default.
+fn Workspace.value_of(self, key str) str
+    if key == "theme"
+        return theme
+    if key == "font"
+        return "{font}"
+    setting(prefs, key) else workspace.default_of(key)
+
+## Keeps a setting in this session and, in the window, in `~/.ail-edit`.
+fn Workspace.set_pref(mut self, key str, value str)
+    prefs = with_setting(prefs, key, value)
+    binds = workspace.binds(prefs)
+    if not remember
+        return
+    path := settings_path() else return
+    mut text := ""
+    if fs.exists(path)
+        text = fs.read_text(path) else ""
+    fs.write_text(path, with_setting(text, key, value)) else err
+        message = "can't write {err.path}: {err.kind}"
+
+## Enter on row `i` of the settings list: the next value of that setting.
+fn Workspace.cycle_setting(mut self, i int)
+    rs := workspace.rows(themes.NAMES)
+    if i >= rs.len()
+        return
+    r := rs[i]
+    chosen := workspace.next_choice(r, value_of(r.key))
+    if r.key == "theme"
+        set_theme(chosen)
+    elif r.key == "font"
+        font = chosen.to_int() else font
+    elif r.key == "gitmarks"
+        gitmarks = chosen == "on"
+        refresh_git()
+    set_pref(r.key, chosen)
+    message = "{r.label}: {chosen}"
+
+## Loads the settings file's text: rebindings, git marks, and the font
+## unless the start flags gave one.
+fn Workspace.load_prefs(mut self)
+    path := settings_path() else return
+    if not fs.exists(path)
+        return
+    prefs = fs.read_text(path) else ""
+    binds = workspace.binds(prefs)
+    gitmarks = value_of("gitmarks") == "on"
+
+## The marks `git status` gives the tree's files; empty when marks are off
+## or this isn't a git checkout.
+fn Workspace.refresh_git(mut self)
+    git = Map[str, str]()
+    if not gitmarks
+        return
+    p := proc.run("git", ["rev-parse", "--show-prefix"]) else return
+    if p.status != 0
+        return
+    r := proc.run("git", ["status", "--porcelain"]) else return
+    if r.status != 0
+        return
+    git = workspace.parse(r.out, p.out.trim())
+
+## Enter in the new-project prompt: `ail new NAME`, then opens `main.ail`.
+fn Workspace.new_project(mut self, name str)
+    if not workspace.valid_name(name)
+        message = "`{name}` isn't a project name: lowercase letters, digits, _ and -, starting with a letter"
+        return
+    r := proc.run(ail_command(), ["new", name]) else err
+        message = "can't run {err.cmd}: {err.kind}"
+        return
+    if r.status != 0
+        message = "ail new: {r.err.trim()}"
+        return
+    welcome = false
+    open("{name}/main.ail")
+    message = "created {name}/: ail run {name}, ail test {name}/main.ail"
+
+## Enter in the rebind prompt: `NEWKEY as COMMAND`, saved as `bind.NEWKEY`.
+fn Workspace.add_binding(mut self, text str)
+    if not workspace.parse_input(text).is_some()
+        message = "type NEWKEY as COMMAND, e.g. ctrl+alt+t as Next theme"
+        return
+    b := workspace.parse_input(text) else return
+    want := b.from.to_lower()
+    mut spec := ""
+    for r in key_rows()
+        if r.spec != "" and (r.spec == want or r.name.to_lower() == want)
+            spec = r.spec
+    if spec == ""
+        message = "no command `{b.from}`: Ctrl-Shift-P lists them"
+        return
+    set_pref(workspace.bind_key(b.to), spec)
+    message = "{b.to} now acts as {spec}"
+
+## The welcome screen's keys: a digit reopens that recent project's tabs;
+## any other key dismisses it and goes on to the editor. True if used here.
+fn Workspace.welcome_event(mut self, ev ui.Event) bool
+    match ev
+        Key(k, ctrl, alt, _) =>
+            welcome = false
+            if ctrl or alt
+                return false
+            dirs := workspace.recent(prefs)
+            n := k.to_int() else return false
+            if n < 1 or n > dirs.len().min(9)
+                return false
+            value := setting(prefs, session_key(dirs[n - 1])) else return true
+            places := session_places(value)
+            if places.len() > 0 and fs.exists(places[0].path)
+                open(places[0].path)
+                eds[active].jump_to(places[0])
+            true
+        Resize(_, _) | Close | Mouse(_, _, _, _) | Scroll(_) => false
+
+## Draws the welcome screen over the editor area.
+fn Workspace.render_welcome(self, mut s Screen)
+    ls := workspace.lines(workspace.recent(prefs))
+    x := left() + 2
+    top := ((rows - ls.len()) / 2).max(1)
+    w := (cols - x - 1).max(10)
+    for r in 1..rows
+        s.put(r, x - 1, " ".repeat(w + 1), FG, BG)
+    for i in 0..ls.len()
+        mut fg := FG
+        if i == 0
+            fg = KEYWORD_FG
+        elif ls[i] == "Start" or ls[i].starts_with("Recent")
+            fg = TYPE_FG
+        s.put(top + i, x, ls[i], fg, BG)
+    s.cursor_row = -1
+    s.cursor_col = -1
 
 ## The screen: the tab bar, the active editor below it, and the picker over
 ## it when open.
@@ -5236,6 +5538,8 @@ fn Workspace.render(self) Screen
     if tree_open
         render_tree(mut s)
     render_search(mut s)
+    if welcome
+        render_welcome(mut s)
     if picking
         render_picker(mut s)
     s
@@ -5339,7 +5643,14 @@ fn window_main(mut ed Editor, flags List[str])
     mut ws := Workspace.new(ed)
     ws.font = font_flag(flags)
     ws.remember = true
-    ws.restore_session()
+    ws.load_prefs()
+    if not flags.contains("--font")
+        ws.font = ws.value_of("font").to_int() else 20
+    if ws.value_of("restore") == "on" and not flags.contains("--start")
+        ws.restore_session()
+    ws.welcome = flags.contains("--welcome")
+    if flags.contains("--start") and ws.value_of("welcome") == "on"
+        ws.welcome = true
     mut name := saved_theme()
     at := flags.index_of("--theme") else -1
     if at >= 0 and at + 1 < flags.len()
@@ -5386,6 +5697,12 @@ fn print_screen(ed Editor, flags List[str])
             ws.on_event(key_event(spec))
         elif f == "--idle"
             ws.idle(time.now_ms() + 1000)
+        elif f == "--welcome"
+            ws.load_prefs()
+            ws.welcome = true
+        elif f == "--git"
+            ws.gitmarks = true
+            ws.refresh_git()
     shown := ws.render()
     if flags.contains("--screen")
         runs := [
@@ -5422,19 +5739,25 @@ fn bench(mut ed Editor)
 
 fn main() !
     args := env.args()
-    if args.len() == 0
-        print("usage: ail run edit.ail [--font N] [--keys] [--print [--screen] [--check] [--outline] [--explain] [--at=L:C] [--type=TEXT] [--key=KEY]...] FILE")
+    if args.contains("--help")
+        print("usage: ail run edit.ail [--font N] [--keys] [--welcome] [--git] [--print [--screen] [--check] [--outline] [--explain] [--at=L:C] [--type=TEXT] [--key=KEY]...] [FILE]")
         return
     if args.contains("--keys")
         for l in key_table()
             print(l)
         return
-    path := args[args.len() - 1]
+    # With no FILE the window opens on the welcome screen (S10).
+    mut path := "untitled.ail"
+    mut flags := args
+    if args.len() == 0
+        flags = ["--start"]
+    elif not args[args.len() - 1].starts_with("--")
+        path = args[args.len() - 1]
+        flags = args[..args.len() - 1]
     mut text := ""
     if fs.exists(path)
         text = fs.read_text(path)?
     mut ed := Editor.new(path, text, 100, 32)
-    flags := args[..args.len() - 1]
     if flags.contains("--bench")
         bench(mut ed)
         return
