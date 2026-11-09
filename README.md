@@ -24,6 +24,13 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 ../ail/ail test edit.ail                         # the headless tests
 ```
 
+With no FILE the window opens on a welcome screen: the first steps and the
+recent projects (press a digit to reopen that project's tabs). `--welcome`
+shows it under `--print`; `--git` adds git marks (`M`, `A`, `D`, `?`, `U`; `*`
+on a directory with changes) to the file tree. Settings live in `~/.ail-edit`
+as `KEY VALUE` lines: `theme`, `font`, `restore`, `welcome`, `gitmarks`
+(`on` or `off`) and `bind.NEWKEY ORIGINALKEY`.
+
 The window remembers its open tabs and cursors per working directory in
 `~/.ail-edit` and reopens them on the next start there
 ([ADR 0339](https://github.com/kksimp/ail/blob/main/docs/decisions/0339-editor-problems-and-sessions.md)).
@@ -84,6 +91,14 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | F5 | Run the buffer (`ail run`); the output fills the pane (its end, when long), Esc closes it, and a click on a `FILE:LINE:COL` or `at LINE:COL` jumps there, opening the file in a tab if needed |
 | F6 | Run the buffer's tests (`ail test`), shown like F5 |
 | Shift-F5 | Run with every trace event (`ail run --trace=all`): calls with arguments, returns, contracts, and a trap with each frame's locals; Up/Down, Enter jumps to an event (ADR 0312) |
+| Ctrl-Shift-R | Probe the cursor line (`ail run --at FILE:LINE --show NAMES`): the selection, else the line's variables; each hit is a row, the last hit's values follow the line |
+| Ctrl-Shift-W | Watch the selected or word-at-cursor variable (`ail run --watch NAME`): each write is a row, its value follows the line |
+| Shift-F7 | Run (`ail run --values`); a trap lists its frames with their values, the innermost frame's follow the trap line |
+| F9 | Jump to the next row of the probe, watch, trace, sanitize or leak list, wrapping |
+| palette | Run with every trace event as a tree: Left folds a call, Right opens it, `f` cycles the filter (all, calls, effects, contracts, traps) |
+| palette | `ail sanitize --json`: runs that differ under random schedules, with the replay command |
+| palette | `ail sanitize --race`: unsynchronised unsafe accesses; Enter jumps to an access |
+| palette | `ail leak --json`: live memory growth by kind and the roots that hold it |
 | Ctrl-Shift-E | Each function's error set and every return, `?` and `else` that fails or handles, from `ail check --errors`; Up/Down, Enter jumps (ADR 0312) |
 | Ctrl-Shift-M | Every diagnostic of the open tabs' programs (`ail check --json`, modules included, buffers as edited), errors first; Up/Down, Enter jumps, opening the file (ADR 0339); while shown it refreshes on save and 500 ms after typing stops (ADR 0353) |
 | Ctrl-Shift-I | The program card (`ail api --card`) of the file's program, its modules included: entry point, tests, and every declaration with effects, contracts and error sets; Up/Down, Enter jumps to a declaration; refreshed on save (ADR 0331) |
@@ -107,6 +122,10 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-Shift-K | The open `ail task` (`.ail-task`): goal, base, last verify, and the impact since the base (`ail ask --affected --json`): changed and affected declarations, affected tests, changed effects; Up/Down, Enter jumps; V verifies, F finishes, X aborts (`ail task`). After each save, affected declarations are marked `~` in the gutter until the next edit (S4) |
 | F8 | Run only the tests the changes since the base can reach (`ail test --affected`, since the open task's base, else `HEAD`); the saved file is compared, so save first (S4) |
 | F7 | Run `ail task verify` (check, then the affected tests) and show the answer: result, failing stage, last lines, next step (S4) |
+| Alt-Shift-C | Copy the selection (else the line) with the diagnostics and card entries on it, cut to a token budget, to the clipboard, for pasting into an agent |
+| Alt-Shift-V | Preview the `ail edit` hunks on the clipboard (else in `.agent-edit`) as a diff; press again to apply them to the buffer (Ctrl-Z undoes), Esc cancels |
+| palette | List the files an agent changed beside the editor and the lines it changed (marked `+` in the gutter until you save); Enter jumps |
+| palette | Show or hide the `+` gutter marks on lines an agent changed |
 | Ctrl-Shift-H | Type what to find, Enter, the replacement, Enter: every changed line of the project's `.ail` files is previewed old -> new; Space skips or accepts a row, A accepts all; Ctrl-Enter applies the accepted rows to the buffers (files open as tabs, nothing saved, Ctrl-Z undoes per tab), Esc cancels (ADRs 0339, 0353) |
 | Ctrl-Shift-F | Search every `.ail` file under the directory (open tabs as edited); the matches fill the pane, Up/Down select, Enter jumps, Esc closes (ADR 0292) |
 | Ctrl-Shift-A | Ask the program a question in plain words (`ail ask`: who writes F, who reads F, what calls f, what does f call, which effects reach f, who uses T); the answers fill the pane, Up/Down select, Enter jumps (api.ask.1-6) |
@@ -115,7 +134,7 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | palette | Count the tokens of the buffer and of the selection (`ail api --tokens`) and say so in the message |
 | palette | Show or hide the file's token count at the right of the status row (shown by default; refreshed on save) |
 | F4 | Jump to the next match of the last project search |
-| Ctrl-P | Open a file: type part of its path (letters in order), Up/Down, Enter |
+| Ctrl-P | Open a file: type part of its path (letters in order), Up/Down, Enter; Enter on a path nothing matches creates that file |
 | Ctrl-Tab | Next tab; a click on a tab selects it |
 | Ctrl-Shift-Tab | Previous tab |
 | Ctrl-W | Close the tab; with unsaved changes, press it twice |
@@ -123,6 +142,11 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-- | Smaller font |
 | Ctrl-0 | Default font size |
 | Ctrl-Shift-T | Next theme: dark, light, solarized, high-contrast; remembered for the next start |
+| Ctrl-, | Settings list: Up/Down, Enter changes the value (theme, font size, reopen tabs, welcome screen, git marks) and saves it to `~/.ail-edit`; Esc closes |
+| Ctrl-Shift-N | Type a name, Enter: `ail new NAME` creates `NAME/` with `ail.pkg` and `main.ail`, and opens `main.ail` |
+| palette | Type `NEWKEY as COMMAND` (a palette name or a key, e.g. `ctrl+alt+t as Next theme`), Enter: saved as `bind.NEWKEY` in `~/.ail-edit`; the original key keeps working |
+| palette | The welcome screen with the recent projects; any key dismisses it |
+| palette | Opens the file picker: type a path, and Enter on a path nothing matches creates that file |
 | Ctrl-Shift-. | Preview the first non-overlapping fix of every diagnostic, as `ail lsp`'s fix-all takes them; Enter applies them as one undo step, any other key cancels |
 | Ctrl-Shift-Space | Signature popup for the call the cursor is inside: the signature with the current argument marked, then its contracts, effects and error set; follows the cursor through the arguments, Esc closes |
 | Alt-I | Toggle inlay hints: the type of each local binding on the visible lines (`ail api --locals`), refreshed on save |

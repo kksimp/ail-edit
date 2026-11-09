@@ -1,0 +1,68 @@
+## The welcome screen and `ail new` helpers (S10).
+
+## The project directories remembered in the settings file: its `open:DIR`
+## lines, newest last in the file, newest first here.
+pub fn recent(text str) List[str]
+    mut out := List[str]()
+    for line in text.split("\n")
+        rest := line.strip_prefix("open:") else continue
+        at := rest.find(" ") else continue
+        out.push(rest.slice(0, at))
+    out.reverse()
+    out
+
+## The screen's lines for `dirs` (at most nine are numbered), ASCII only.
+pub fn lines(dirs List[str]) List[str]
+    mut out := ["ail-edit", "", "Start", ""]
+    out.push("  Ctrl-Shift-N  new project (ail new)")
+    out.push("  Ctrl-P        open a file")
+    out.push("  Ctrl-B        file tree, with git marks")
+    out.push("  Ctrl-,        settings")
+    out.push("  Palette       rebind a key, welcome screen")
+    out.push("  Ctrl-Shift-P  every command")
+    out.push("")
+    if dirs.len() > 0
+        out.push("Recent (press its number to reopen its tabs)")
+        out.push("")
+        for i in 0..dirs.len().min(9)
+            out.push("  {i + 1}  {dirs[i]}")
+        out.push("")
+    out.push("Any other key starts editing.")
+    out
+
+## Whether `name` can name a new project: a lowercase letter first, then
+## lowercase letters, digits, `_` and `-` (tool.new.1).
+pub fn valid_name(name str) bool
+    cs := name.chars()
+    if cs.len() == 0
+        return false
+    for i in 0..cs.len()
+        c := cs[i]
+        lower := "abcdefghijklmnopqrstuvwxyz".contains(c)
+        digit := c.is_digit()
+        if i == 0 and not lower
+            return false
+        if not (lower or digit or "_-".contains(c))
+            return false
+    true
+
+@test fn recent_projects_newest_first()
+    text := "theme dark\nopen:/a 1,1,/a/x.ail\nfont 20\nopen:/b 2,3,/b/y.ail|1,1,/b/z.ail\n"
+    assert_eq(recent(text), ["/b", "/a"])
+    assert_eq(recent(""), List[str]())
+
+@test fn welcome_lists_recent_with_numbers()
+    ls := lines(["/b", "/a"])
+    assert(ls.contains("  1  /b"))
+    assert(ls.contains("  2  /a"))
+    assert_eq(ls[0], "ail-edit")
+    assert(not lines([]).contains("  1  /b"))
+
+@test fn project_names()
+    assert(valid_name("demo"))
+    assert(valid_name("my-app_2"))
+    assert(not valid_name(""))
+    assert(not valid_name("Demo"))
+    assert(not valid_name("2d"))
+    assert(not valid_name("a b"))
+    assert(not valid_name("a/b"))

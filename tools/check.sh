@@ -11,3 +11,5 @@ cd "$here"
 "$ail_dir/ail" check .
 "$ail_dir/ail" fmt --check .
 "$ail_dir/ail" test edit.ail
+"$ail_dir/ail" test features/probes/probes.ail
+"$ail_dir/ail" test features/agent
