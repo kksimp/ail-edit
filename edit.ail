@@ -2519,6 +2519,11 @@ ADD_REFS_JSON := "\{\"api\":1,\"symbol\":\"fn:add\",\"refs\":[\{\"file\":\"t.ail
         assert(r.name != "")
     ws.run_command("nonesuch")
     assert_eq(ws.message, "no command `nonesuch`")
+    ws.run_command("Toggle minimap")
+    ws.run_command("Toggle zen mode")
+    assert(ws.minimap and ws.zen)
+    ws.run_command("Toggle zen mode")
+    assert(not ws.zen)
 
 @test fn references_list_declaration_and_uses()
     found := refs_hits(".", parse_json(REFS_JSON) else Json.Null)
@@ -3736,6 +3741,8 @@ fn key_rows() List[KeyRow]
             "ctrl+q",
             "Quit; with unsaved changes in any tab, press it twice. Closing the window counts as Ctrl-Q",
         ),
+        key_row("Palette", "Toggle minimap", "", "Show or hide the minimap beside the text (window)"),
+        key_row("Palette", "Toggle zen mode", "", "Hide the tab strip and status bar (window)"),
         key_row(
             "Mouse",
             "",
@@ -3874,6 +3881,8 @@ fn Workspace.choose(mut self)
 ## `key_rows()` and one arm here, which a slice adds for its own command.
 fn Workspace.run_command(mut self, name str)
     match name
+        "Toggle minimap" => minimap = not minimap
+        "Toggle zen mode" => zen = not zen
         _ => message = "no command `{name}`"
 
 # ---- Tabs ---------------------------------------------------------------
@@ -3933,6 +3942,9 @@ struct Workspace
     ## Ctrl-Shift-U: run the tab's tests after each save (ADR 0354).
     test_on_save bool
     typed_at int
+    ## Palette toggles of the window: the minimap and zen mode.
+    minimap bool
+    zen bool
 
 fn Workspace.new(ed Editor) Workspace
     Workspace(
@@ -3971,6 +3983,8 @@ fn Workspace.new(ed Editor) Workspace
         live_problems: false,
         test_on_save: false,
         typed_at: 0,
+        minimap: false,
+        zen: false,
     )
 
 ## The file name a tab shows: the path after its last `/`.
@@ -5356,7 +5370,7 @@ struct Shell
 fn Shell.new(w Workspace) Shell
     Shell(
         ws: w,
-        m: win.metrics(1000.0, 700.0, 8.0, 16.0, 13.0),
+        m: win.metrics(1000.0, 700.0, 8.0, 16.0, 13.0, false),
         pw: 1000.0,
         ph: 700.0,
         cellw: 8.0,
@@ -5373,7 +5387,7 @@ fn Shell.size(self) float
 
 ## Lays the grid out for the canvas and tells the workspace its new size.
 fn Shell.relayout(mut self)
-    next := win.metrics(pw, ph, cellw, cellh, size())
+    next := win.metrics(pw, ph, cellw, cellh, size(), ws.minimap)
     if not ready or next.cols != m.cols or next.rows != m.rows
         ws.on_event(Resize(cols: next.cols, rows: next.rows))
     m = next
@@ -5423,6 +5437,10 @@ fn Shell.frame(self) win.Frame
     mut marks := List[win.Mark]()
     for d in e.diags
         marks.push(win.Mark(line: (d.line - 1).max(0), kind: d.severity))
+    mut lens := List[int]()
+    if ws.minimap
+        for l in e.lines
+            lens.push(l.chars().len())
     win.Frame(
         colors: colors,
         runs: runs,
@@ -5437,6 +5455,9 @@ fn Shell.frame(self) win.Frame
         bar_from: 1,
         bar_to: srow,
         bar: win.Bar(top: e.top, total: e.lines.len(), visible: e.text_rows(), marks: marks),
+        minimap: ws.minimap,
+        zen: ws.zen,
+        lens: lens,
     )
 
 ## A key as the workspace takes it.

@@ -93,6 +93,8 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-0 | Default font size |
 | Ctrl-Shift-T | Next theme: dark, light, solarized, high-contrast; remembered for the next start |
 | Ctrl-Q | Quit; with unsaved changes in any tab, press it twice. Closing the window counts as Ctrl-Q |
+| Palette | Show or hide the minimap beside the text (window) |
+| Palette | Hide the tab strip and status bar (window) |
 | Mouse | Click places the caret, drag or Shift-click selects, the wheel scrolls, a click on a diagnostic or an output location jumps to it |
 
 ## macOS sanity check

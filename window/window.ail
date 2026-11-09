@@ -13,6 +13,7 @@ pub SCROLL_W := 12.0
 pub TAB_PAD := 14.0
 pub TAB_CLOSE_W := 22.0
 pub MIN_LINE_H := 14.0
+pub MAP_W := 80.0
 
 ## Colors as 0xRRGGBB, taken from the editor's theme.
 pub struct Colors
@@ -74,6 +75,11 @@ pub struct Frame
     pub bar_from int
     pub bar_to int
     pub bar Bar
+    ## Palette toggles: the minimap beside the text, zen mode (no tabs or status bar).
+    pub minimap bool
+    pub zen bool
+    ## Each buffer line's length, for the minimap (empty when it is off).
+    pub lens List[int]
 
 ## How grid cells map to points.
 pub struct Metrics
@@ -90,12 +96,13 @@ pub struct Metrics
 
 ## The metrics for a canvas of `w` by `h` points. `cell_w` and `cell_h` are the
 ## host's measure of one `mono` character at 13 points (std.app.5).
-pub fn metrics(w float, h float, cell_w float, cell_h float, size float) Metrics
+pub fn metrics(w float, h float, cell_w float, cell_h float, size float, minimap bool) Metrics
     k := size / 13.0
     cw := (cell_w * k).max(1.0)
     ch := (cell_h * k).max(MIN_LINE_H)
     tab_h := (ch * 1.5).ceil()
-    cols := ((w - SCROLL_W) / cw).floor().to_int().max(10)
+    right := SCROLL_W + (if minimap then MAP_W else 0.0)
+    cols := ((w - right) / cw).floor().to_int().max(10)
     rows := (1.0 + ((h - tab_h) / ch).floor()).to_int().max(4)
     Metrics(w: w, h: h, size: size, cw: cw, ch: ch, tab_h: tab_h, cols: cols, rows: rows)
 
@@ -289,13 +296,38 @@ pub fn bar_ops(f Frame, m Metrics) List[app.Op]
         ops.push(app.draw_rect(x, my, SCROLL_W, 2.0, col))
     ops
 
+## The minimap: one short stroke per buffer line, left of the scrollbar, with
+## the visible lines lit.
+pub fn minimap_ops(f Frame, m Metrics) List[app.Op]
+    if not f.minimap or f.bar_to <= f.bar_from or f.lens.len() == 0
+        return []
+    c := f.colors
+    y0 := row_y(m, f.bar_from)
+    h := row_y(m, f.bar_to) - y0
+    x := m.w - SCROLL_W - MAP_W
+    n := f.lens.len()
+    pitch := (h / n.to_float()).min(2.0)
+    mut out := [app.draw_rect(x, y0, MAP_W, h, c.bg)]
+    for i in 0..n
+        y := y0 + i.to_float() * pitch
+        if y >= y0 + h
+            break
+        w := (f.lens[i].to_float() * 0.9).min(MAP_W - 6.0)
+        if w > 0.0
+            out.push(app.Op.Shade(x: x + 3.0, y: y, w: w, h: (pitch - 0.4).max(1.0), color: c.fg, alpha: 0.35))
+    out.push(app.Op.Shade(x: x, y: y0 + f.bar.top.to_float() * pitch, w: MAP_W, h: f.bar.visible.to_float() * pitch, color: c.select_bg, alpha: 0.3))
+    out
+
 ## The whole canvas, back to front.
 pub fn canvas_ops(f Frame, m Metrics) List[app.Op]
     mut out := grid_ops(f, m)
-    out.extend(status_ops(f, m))
+    if not f.zen
+        out.extend(status_ops(f, m))
+    out.extend(minimap_ops(f, m))
     out.extend(bar_ops(f, m))
     out.extend(caret_ops(f, m))
-    out.extend(tab_ops(f, m))
+    if not f.zen
+        out.extend(tab_ops(f, m))
     out
 
 ## The editor's `Key` fields for a host key event (std.app.5): Command and
@@ -333,14 +365,14 @@ pub fn menu_key(label str) str
     MENU_KEYS[at]
 
 @test fn metrics_scale_with_the_font()
-    a := metrics(1000.0, 700.0, 8.0, 16.0, 13.0)
-    b := metrics(1000.0, 700.0, 8.0, 16.0, 26.0)
+    a := metrics(1000.0, 700.0, 8.0, 16.0, 13.0, false)
+    b := metrics(1000.0, 700.0, 8.0, 16.0, 26.0, false)
     assert(b.cw > a.cw)
     assert(b.cols < a.cols)
     assert_eq(a.cols, ((1000.0 - SCROLL_W) / 8.0).floor().to_int())
 
 @test fn cells_round_trip_through_points()
-    m := metrics(800.0, 600.0, 8.0, 16.0, 13.0)
+    m := metrics(800.0, 600.0, 8.0, 16.0, 13.0, false)
     c := cell_at(m, 41.0, row_y(m, 3) + 1.0)
     assert_eq(c.col, 5)
     assert_eq(c.row, 3)
@@ -408,9 +440,13 @@ pub fn menu_key(label str) str
         bar_from: 1,
         bar_to: 5,
         bar: Bar(top: 0, total: 40, visible: 4, marks: [Mark(line: 10, kind: "error")]),
+        minimap: true,
+        zen: false,
+        lens: [10, 0, 30],
     )
-    m := metrics(640.0, 300.0, 8.0, 16.0, 13.0)
+    m := metrics(640.0, 300.0, 8.0, 16.0, 13.0, false)
     o := canvas_ops(f, m)
     assert(o.len() > 10)
     assert_eq(status_ops(f, m).len(), 2)
     assert_eq(caret_ops(f, m).len(), 1)
+    assert(minimap_ops(f, m).len() > 2)
