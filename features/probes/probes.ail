@@ -118,6 +118,11 @@ KEYWORDS := [
     "self",
     "unsafe",
     "let",
+    "int",
+    "float",
+    "str",
+    "bool",
+    "char",
 ]
 
 fn is_word(c char) bool
@@ -155,7 +160,7 @@ pub fn names_of(line str, selection str) List[str]
         before := if i > 0 then cs[i - 1] else ' '
         first := cs[i]
         upper := first.is_alpha() and first == first.to_upper()
-        if before != '.' and after != '(' and after != '[' and not upper
+        if before != '.' and after != '(' and not upper
             if not KEYWORDS.contains(word) and not out.contains(word)
                 out.push(word)
         i = j
@@ -764,8 +769,8 @@ TRACE := "\{\"api\":1,\"trace\":\"call\",\"fn\":\"main\",\"depth\":1,\"args\":\{
     assert_eq(rows.len(), 5)
     assert_eq(rows[0].text, "[-] main() = ()")
     assert_eq(rows[1].text, "  [-] half(n = 4) = 2")
-    assert_eq(rows[2].text, "      requires n > 0 held")
-    assert_eq(rows[3].text, "    effect fs.read_text")
+    assert_eq(rows[2].text, "        requires n > 0 held")
+    assert_eq(rows[3].text, "      effect fs.read_text")
     assert_eq(rows[4].text, "    > hi")
     v.fold(1, false)
     assert_eq(v.rows().len(), 4)
@@ -781,7 +786,7 @@ TRACE := "\{\"api\":1,\"trace\":\"call\",\"fn\":\"main\",\"depth\":1,\"args\":\{
     v.next_filter()
     assert_eq(FILTERS[v.filter], "contracts")
     assert_eq(v.rows().len(), 3)
-    assert_eq(v.rows()[2].text, "      requires n > 0 held")
+    assert_eq(v.rows()[2].text, "        requires n > 0 held")
 
 @test fn sanitize_and_race_rows()
     out := "\{\"api\":1,\"severity\":\"warning\",\"rule\":\"san.sched.1\",\"file\":\"m.ail\",\"seed\":3,\"message\":\"output differs\",\"replay\":\"ail run --schedule=random:3 m.ail\"}\n\{\"summary\":true,\"seeds\":8,\"schedule_dependent\":1}"
