@@ -1,0 +1,70 @@
+## Git status marks for the file tree (S10). The editor runs
+## `git status --porcelain` and `git rev-parse --show-prefix`; this file only
+## reads their text.
+
+## The mark for a two-letter porcelain code: `?` untracked, `A` added,
+## `D` deleted, `U` conflict, `R` renamed, otherwise `M`.
+pub fn letter(code str) str
+    if code == "??"
+        return "?"
+    if code == "DD" or code == "AA" or code.contains("U")
+        return "U"
+    if code.contains("A")
+        return "A"
+    if code.contains("D")
+        return "D"
+    if code.contains("R")
+        return "R"
+    "M"
+
+## The mark of each changed path, as `git status --porcelain` printed them
+## in `text`, with the directory `prefix` (the cwd inside the repository,
+## ending in `/` or empty) taken off the front. Paths outside it are left out.
+pub fn parse(text str, prefix str) Map[str, str]
+    mut out := Map[str, str]()
+    for line in text.split("\n")
+        n := line.chars().len()
+        if n < 4
+            continue
+        mut path := line.slice(3, n)
+        if arrow := path.find(" -> ")
+            path = path.slice(arrow + 4, path.chars().len())
+        if path.starts_with("\"")
+            path = path.slice(1, path.chars().len() - 1)
+        if prefix != ""
+            rest := path.strip_prefix(prefix) else continue
+            path = rest
+        if path.ends_with("/")
+            path = path.slice(0, path.chars().len() - 1)
+        out[path] = letter(line.slice(0, 2))
+    out
+
+## The mark a tree row shows: a file's own, or `*` for a directory with a
+## changed file below it; empty for a clean one.
+pub fn mark(marks Map[str, str], path str, dir bool) str
+    if m := marks.get(path)
+        return m
+    if dir
+        below := "{path}/"
+        for p in marks.keys()
+            if p.starts_with(below)
+                return "*"
+    ""
+
+@test fn git_letters_and_paths()
+    text := " M edit.ail\n?? features/\nA  new.ail\nR  old.ail -> moved.ail\n D gone.ail\nUU clash.ail\n"
+    m := parse(text, "")
+    assert_eq(m.get("edit.ail") else "", "M")
+    assert_eq(m.get("features") else "", "?")
+    assert_eq(m.get("new.ail") else "", "A")
+    assert_eq(m.get("moved.ail") else "", "R")
+    assert_eq(m.get("gone.ail") else "", "D")
+    assert_eq(m.get("clash.ail") else "", "U")
+
+@test fn git_prefix_and_directory_marks()
+    m := parse(" M sub/a.ail\n M other/b.ail\n M sub/deep/c.ail\n", "sub/")
+    assert_eq(m.len(), 2)
+    assert_eq(mark(m, "a.ail", false), "M")
+    assert_eq(mark(m, "deep", true), "*")
+    assert_eq(mark(m, "b.ail", false), "")
+    assert_eq(mark(m, "deep", false), "")
