@@ -1,0 +1,365 @@
+## Agent co-editing (plan 2026-11, slice S9; D2, D3, D4).
+##
+## An agent works in the same directory as the editor. This module holds what
+## the editor needs to see that: the files' change stamps and the lines an
+## agent changed (marks), the lines changed between two texts, the "Copy for
+## agent" pack, applying `ail edit` hunks to a buffer with a preview, and the
+## JSON dump every panel prints under `--print --json`. It knows nothing of the
+## editor's types: `edit.ail` passes lines and paths in and gets lines back.
+use std.fs
+use std.proc
+
+## A file's modification time, in ms, when the editor last looked.
+pub struct Stamp
+    pub path str
+    pub ms int
+
+## The 0-based lines of a file that an agent changed since the last human save.
+pub struct Marks
+    pub path str
+    pub lines List[int]
+
+## What `State.poll` found: the text the buffer should show, whether it
+## differs from the buffer, and a short message for the status line.
+pub struct Poll
+    pub path str
+    pub lines List[str]
+    pub reload bool
+    pub note str
+
+## The result of running `ail edit` on a copy of a buffer.
+pub struct Outcome
+    pub ok bool
+    pub text str
+    pub report str
+
+## Everything the editor remembers about the agent.
+pub struct State
+    pub stamps List[Stamp]
+    pub marks List[Marks]
+    ## When the directory was last scanned, in ms.
+    pub scanned int
+    ## Edit hunks previewed and waiting for a second press to apply.
+    pub pending str
+    ## Files not open in a tab that changed on disk since they were first seen.
+    pub recent List[str]
+    ## The gutter marks are hidden (palette: Toggle agent marks).
+    pub hidden bool
+
+pub fn new_state() State
+    State(stamps: [], marks: [], scanned: 0, pending: "", recent: [], hidden: false)
+
+## The tokens a text costs, estimated as AIL's tools do: one per four characters.
+pub fn tokens(s str) int
+    (s.len() + 3) / 4
+
+fn mtime(path str) int?
+    m := fs.metadata(path) else return none
+    m.modified_ms
+
+## Remembers the file's current stamp.
+pub fn State.stamp(mut self, path str)
+    ms := mtime(path) else return
+    for i in 0..stamps.len()
+        if stamps[i].path == path
+            stamps[i] = Stamp(path: path, ms: ms)
+            return
+    stamps.push(Stamp(path: path, ms: ms))
+
+fn State.known(self, path str) int
+    for s in stamps
+        if s.path == path
+            return s.ms
+    -1
+
+## The sorted union of two line lists.
+pub fn merge(a List[int], b List[int]) List[int]
+    mut seen := Set[int]()
+    mut out := List[int]()
+    for x in a
+        if seen.add(x)
+            out.push(x)
+    for x in b
+        if seen.add(x)
+            out.push(x)
+    out.sorted()
+
+## Marks `more` as changed by an agent in `path`.
+pub fn State.mark(mut self, path str, more List[int])
+    for i in 0..marks.len()
+        if marks[i].path == path
+            marks[i] = Marks(path: path, lines: merge(marks[i].lines, more))
+            return
+    marks.push(Marks(path: path, lines: more))
+
+## Whether an agent changed 0-based line `l` of `path`.
+pub fn State.marked(self, path str, l int) bool
+    for m in marks
+        if m.path == path
+            return m.lines.contains(l)
+    false
+
+## The first marked line of `path` (0-based), or -1.
+pub fn State.first_mark(self, path str) int
+    for m in marks
+        if m.path == path and m.lines.len() > 0
+            return m.lines[0]
+    -1
+
+## How many lines of `path` carry an agent mark.
+pub fn State.marked_count(self, path str) int
+    for m in marks
+        if m.path == path
+            return m.lines.len()
+    0
+
+## A human save makes the file the baseline again: its marks go away.
+pub fn State.saved(mut self, path str)
+    mut keep := List[Marks]()
+    for m in marks
+        if m.path != path
+            keep.push(m)
+    marks = keep
+    stamp(path)
+
+fn split_lines(text str) List[str]
+    mut out := text.split("\n")
+    if out.len() > 1 and out[out.len() - 1] == ""
+        out.pop()
+    out
+
+## Looks at `path` on disk. `none` while the file is as the editor last saw
+## it or reads the same as the buffer. A changed file reloads, with the
+## changed lines marked, unless the buffer has unsaved edits: then the buffer
+## is kept and the note says so.
+pub fn State.poll(mut self, path str, lines List[str], dirty bool) Poll?
+    ms := mtime(path) else return none
+    was := known(path)
+    if was < 0
+        stamp(path)
+        return none
+    if ms == was
+        return none
+    stamp(path)
+    text := fs.read_text(path) else return none
+    fresh := split_lines(text)
+    if fresh == lines
+        return none
+    if dirty
+        return Poll(
+            path: path,
+            lines: lines,
+            reload: false,
+            note: "{path} changed on disk; unsaved edits kept",
+        )
+    changed := changed_lines(lines, fresh)
+    mark(path, changed)
+    Poll(
+        path: path,
+        lines: fresh,
+        reload: true,
+        note: "agent changed {path}: {changed.len()} line(s) marked",
+    )
+
+## Files of `names` whose stamp differs from the last one seen (new files
+## count), restamped; for files that are not open in a tab.
+pub fn State.changed_files(mut self, names List[str]) List[str]
+    mut out := List[str]()
+    for n in names
+        ms := mtime(n) else continue
+        was := known(n)
+        if was < 0
+            stamp(n)
+        elif was != ms
+            stamp(n)
+            out.push(n)
+            if not recent.contains(n)
+                recent.push(n)
+    out
+
+## The 0-based lines of `new` that are not in `old`: a longest-common-
+## subsequence line diff after trimming the common head and tail. A
+## deletion marks the line after it. Huge middles mark every line.
+pub fn changed_lines(old List[str], new List[str]) List[int]
+    mut lo := 0
+    while lo < old.len() and lo < new.len() and old[lo] == new[lo]
+        lo += 1
+    mut oh := old.len()
+    mut nh := new.len()
+    while oh > lo and nh > lo and old[oh - 1] == new[nh - 1]
+        oh -= 1
+        nh -= 1
+    n := oh - lo
+    m := nh - lo
+    mut out := List[int]()
+    if n == 0 and m == 0
+        return out
+    if m == 0
+        if new.len() > 0
+            out.push(lo.min(new.len() - 1))
+        return out
+    if n == 0 or n * m > 4000000
+        for j in lo..nh
+            out.push(j)
+        return out
+    w := m + 1
+    mut t := [0 for _ in 0..(n + 1) * w]
+    for k in 0..n
+        i := n - 1 - k
+        for h in 0..m
+            j := m - 1 - h
+            if old[lo + i] == new[lo + j]
+                t[i * w + j] = t[(i + 1) * w + j + 1] + 1
+            else
+                t[i * w + j] = t[(i + 1) * w + j].max(t[i * w + j + 1])
+    mut i := 0
+    mut j := 0
+    while i < n and j < m
+        if old[lo + i] == new[lo + j]
+            i += 1
+            j += 1
+        elif t[(i + 1) * w + j] >= t[i * w + j + 1]
+            i += 1
+        else
+            out.push(lo + j)
+            j += 1
+    while j < m
+        out.push(lo + j)
+        j += 1
+    out
+
+## "Copy for agent": the selection, then the diagnostics on it, then the
+## card entries it touches, cut to `budget` tokens. Each part is whole or
+## left out, and the selection is cut with a note, so an agent can tell.
+pub fn pack(path str, first int, body List[str], diags List[str], facts List[str], budget int) str
+    mut out := ["{path}:{first + 1}"]
+    mut used := tokens(out[0])
+    for l in body
+        t := tokens(l) + 1
+        if used + t > budget
+            out.push("... cut at the {budget} token budget")
+            return out.join("\n")
+        out.push(l)
+        used += t
+    mut head := "diagnostics:"
+    for d in diags
+        t := tokens(d) + 1
+        if used + t > budget
+            break
+        if head != ""
+            out.push(head)
+            head = ""
+        out.push(d)
+        used += t
+    head = "card:"
+    for f in facts
+        t := tokens(f) + 1
+        if used + t > budget
+            break
+        if head != ""
+            out.push(head)
+            head = ""
+        out.push(f)
+        used += t
+    out.join("\n")
+
+## Whether `s` reads as `ail edit` input: JSON, or compact hunks (a line
+## starting with `+` or `-`, or `rename`).
+pub fn looks_like_edit(s str) bool
+    t := s.trim()
+    if t.starts_with("[") or t.starts_with("\{")
+        return true
+    for l in t.split("\n")
+        if l.starts_with("+") or l.starts_with("-") or l.starts_with("rename ")
+            return true
+    false
+
+## Runs `ail edit` with `hunks` on a copy of the buffer (`text`) written
+## beside `path`, so imports resolve and the file on disk never changes. With
+## `dry` the report is the unified diff; otherwise `text` is the edited,
+## formatted buffer, and nothing is applied when the edit leaves errors
+## (`--if-clean`).
+pub fn apply_buffer(ail str, path str, text str, hunks str, dry bool) Outcome
+    copy := "{path}.agent-edit.ail"
+    fs.write_text(copy, text) else err
+        return Outcome(ok: false, text: text, report: "can't write {err.path}: {err.kind}")
+    mut args := ["edit", copy]
+    if dry
+        args.push("--dry-run")
+    else
+        args.push("--if-clean")
+    r := proc.run(ail, args, hunks) else err
+        fs.remove(copy) else gone
+            return Outcome(ok: false, text: text, report: "can't remove {gone.path}")
+        return Outcome(ok: false, text: text, report: "can't run {err.cmd}: {err.kind}")
+    mut result := text
+    if not dry and r.status == 0
+        got := fs.read_text(copy) else err
+            return Outcome(ok: false, text: text, report: "can't read {err.path}")
+        result = got
+    fs.remove(copy) else err
+        return Outcome(ok: false, text: text, report: "can't remove {err.path}")
+    mut report := r.out
+    if r.err != ""
+        report = "{r.out}{r.err}"
+    Outcome(ok: r.status == 0, text: result, report: report)
+
+## The JSON a panel prints under `--print --json` (D4): its title and rows.
+pub fn json_panel(panel str, rows List[str]) str
+    mut items := List[str]()
+    for r in rows
+        items.push(Json.Str(r).to_text())
+    "\{\"panel\":{Json.Str(panel).to_text()},\"rows\":[{items.join(",")}]}"
+
+@test fn changed_lines_marks_inserted_and_edited_lines()
+    old := ["a", "b", "c", "d"]
+    assert_eq(changed_lines(old, old), [])
+    assert_eq(changed_lines(old, ["a", "B", "c", "d"]), [1])
+    assert_eq(changed_lines(old, ["a", "x", "y", "b", "c", "d", "z"]), [1, 2, 6])
+    assert_eq(changed_lines(old, ["a", "b", "d"]), [2])
+    assert_eq(changed_lines(old, ["a", "b", "c"]), [2])
+    assert_eq(changed_lines([], ["a", "b"]), [0, 1])
+    assert_eq(changed_lines(["a", "b", "c", "d", "e"], ["a", "X", "c", "d", "Y"]), [1, 4])
+
+@test fn marks_merge_and_clear_on_save()
+    assert_eq(merge([3, 1], [2, 3]), [1, 2, 3])
+    mut st := new_state()
+    st.mark("a.ail", [1, 2])
+    st.mark("a.ail", [2, 5])
+    assert(st.marked("a.ail", 5))
+    assert(not st.marked("a.ail", 3))
+    assert(not st.marked("b.ail", 1))
+    assert_eq(st.marked_count("a.ail"), 3)
+    st.saved("a.ail")
+    assert_eq(st.marked_count("a.ail"), 0)
+
+@test fn pack_respects_the_budget()
+    body := ["fn f()", "    1"]
+    full := pack("a.ail", 4, body, ["a.ail:5:1: error[x] bad"], ["fn f()"], 1000)
+    assert_eq(full.split("\n")[0], "a.ail:5")
+    assert(full.contains("diagnostics:"))
+    assert(full.contains("card:"))
+    small := pack("a.ail", 4, body, ["a.ail:5:1: error[x] bad"], ["fn f()"], 8)
+    assert(small.contains("fn f()"))
+    assert(not small.contains("diagnostics:"))
+    cut := pack(
+        "a.ail",
+        0,
+        ["aaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbb", "cccccccccccccccccccc"],
+        [],
+        [],
+        12,
+    )
+    assert(cut.contains("cut at the 12 token budget"))
+    assert(not cut.contains("cccc"))
+
+@test fn edit_input_is_recognised()
+    assert(looks_like_edit("fn:add\n-    a + b\n+    a + b + 1"))
+    assert(looks_like_edit("[\{\"op\":\"delete\",\"id\":\"fn:f\"}]"))
+    assert(looks_like_edit("rename a b"))
+    assert(not looks_like_edit("just some text"))
+    assert(not looks_like_edit(""))
+
+@test fn panels_print_as_json()
+    assert_eq(json_panel("p", ["a", "b\"c"]), "\{\"panel\":\"p\",\"rows\":[\"a\",\"b\\\"c\"]}")
+    assert_eq(json_panel("p", []), "\{\"panel\":\"p\",\"rows\":[]}")
