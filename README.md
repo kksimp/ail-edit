@@ -24,6 +24,13 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 ../ail/ail test edit.ail                         # the headless tests
 ```
 
+With no FILE the window opens on a welcome screen: the first steps and the
+recent projects (press a digit to reopen that project's tabs). `--welcome`
+shows it under `--print`; `--git` adds git marks (`M`, `A`, `D`, `?`, `U`; `*`
+on a directory with changes) to the file tree. Settings live in `~/.ail-edit`
+as `KEY VALUE` lines: `theme`, `font`, `restore`, `welcome`, `gitmarks`
+(`on` or `off`) and `bind.NEWKEY ORIGINALKEY`.
+
 The window remembers its open tabs and cursors per working directory in
 `~/.ail-edit` and reopens them on the next start there
 ([ADR 0339](https://github.com/kksimp/ail/blob/main/docs/decisions/0339-editor-problems-and-sessions.md)).
@@ -115,7 +122,7 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | palette | Count the tokens of the buffer and of the selection (`ail api --tokens`) and say so in the message |
 | palette | Show or hide the file's token count at the right of the status row (shown by default; refreshed on save) |
 | F4 | Jump to the next match of the last project search |
-| Ctrl-P | Open a file: type part of its path (letters in order), Up/Down, Enter |
+| Ctrl-P | Open a file: type part of its path (letters in order), Up/Down, Enter; Enter on a path nothing matches creates that file |
 | Ctrl-Tab | Next tab; a click on a tab selects it |
 | Ctrl-Shift-Tab | Previous tab |
 | Ctrl-W | Close the tab; with unsaved changes, press it twice |
@@ -123,6 +130,11 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-- | Smaller font |
 | Ctrl-0 | Default font size |
 | Ctrl-Shift-T | Next theme: dark, light, solarized, high-contrast; remembered for the next start |
+| Ctrl-, | Settings list: Up/Down, Enter changes the value (theme, font size, reopen tabs, welcome screen, git marks) and saves it to `~/.ail-edit`; Esc closes |
+| Ctrl-Shift-N | Type a name, Enter: `ail new NAME` creates `NAME/` with `ail.pkg` and `main.ail`, and opens `main.ail` |
+| palette | Type `NEWKEY as COMMAND` (a palette name or a key, e.g. `ctrl+alt+t as Next theme`), Enter: saved as `bind.NEWKEY` in `~/.ail-edit`; the original key keeps working |
+| palette | The welcome screen with the recent projects; any key dismisses it |
+| palette | Opens the file picker: type a path, and Enter on a path nothing matches creates that file |
 | Ctrl-Shift-. | Preview the first non-overlapping fix of every diagnostic, as `ail lsp`'s fix-all takes them; Enter applies them as one undo step, any other key cancels |
 | Ctrl-Shift-Space | Signature popup for the call the cursor is inside: the signature with the current argument marked, then its contracts, effects and error set; follows the cursor through the arguments, Esc closes |
 | Alt-I | Toggle inlay hints: the type of each local binding on the visible lines (`ail api --locals`), refreshed on save |
