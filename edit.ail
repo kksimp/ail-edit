@@ -4758,24 +4758,24 @@ fn Workspace.probe_key(mut self, spec str)
         r := eds[active].ail_on_buffer(probes.trace_args()) else return
         probe_view = probes.tree_of(r.err, r.out)
         probe_view.on = true
-        show_list(probe_view.title(), hits_of(path, probe_view.rows()))
+        show_list(probe_view.title(), hits_of(path, probe_view.found_rows()))
     elif spec == "sanitize" or spec == "race"
         race := spec == "race"
         r := eds[active].ail_on_buffer(probes.sanitize_args(race)) else return
-        mut rows := probes.sanitize_rows(r.out)
+        mut found_rows := probes.sanitize_rows(r.out)
         if race
-            rows = probes.race_rows(r.err)
-        if rows.len() == 0
+            found_rows = probes.race_rows(r.err)
+        if found_rows.len() == 0
             message = "sanitize: nothing to report (exit {r.status})"
             return
-        show_list(if race then "race report" else "schedule sanitizer", hits_of(path, rows))
+        show_list(if race then "race report" else "schedule sanitizer", hits_of(path, found_rows))
     else
         r := eds[active].ail_on_buffer(probes.leak_args()) else return
-        rows := probes.leak_rows(r.err)
-        if rows.len() == 0
+        found_rows := probes.leak_rows(r.err)
+        if found_rows.len() == 0
             message = "leak: no report (exit {r.status})"
             return
-        show_list("leak report", hits_of(path, rows))
+        show_list("leak report", hits_of(path, found_rows))
 
 # ---- The agent panel: trace, failure paths, coverage ----------------------
 
