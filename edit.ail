@@ -2916,9 +2916,9 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     assert(ws.quit)
 
 @test fn probe_keys_reach_the_workspace_and_the_trace_tree_folds()
-    assert_eq(workspace_key("j", true, true), Probes("ctrl+shift+j"))
-    assert_eq(workspace_key("f6", false, true), Probes("shift+f6"))
-    assert(workspace_key("f6", false, false) == none)
+    assert_eq(workspace_key("r", true, true), Probes("probe"))
+    assert_eq(workspace_key("f7", false, true), Probes("values"))
+    assert_eq(workspace_key("f9", false, false), Probes("next"))
     mut ws := Workspace.new(Editor.new("a.ail", "fn main()\n    pass\n", 60, 20))
     ws.probe_view = probes.tree_of("\{\"api\":1,\"trace\":\"call\",\"fn\":\"main\",\"depth\":1,\"args\":\{},\"line\":1,\"col\":1}\n\{\"api\":1,\"trace\":\"effect\",\"call\":\"time.now\",\"args\":[],\"line\":2,\"col\":5}", "")
     ws.probe_view.on = true
@@ -3673,45 +3673,51 @@ fn key_rows() List[KeyRow]
             "Run with every trace event (`ail run --trace=all`): calls with arguments, returns, contracts, and a trap with each frame's locals; Up/Down, Enter jumps to an event (ADR 0312)",
         ),
         key_row(
-            "Ctrl-Shift-J",
+            "Ctrl-Shift-R",
             "Probe line",
-            "ctrl+shift+j",
+            "ctrl+shift+r",
             "Probe the cursor line (`ail run --at FILE:LINE --show NAMES`): the selection, else the line's variables; each hit is a row, the last hit's values follow the line",
         ),
         key_row(
-            "Ctrl-Shift-K",
+            "Ctrl-Shift-W",
             "Watch variable",
-            "ctrl+shift+k",
+            "ctrl+shift+w",
             "Watch the selected or word-at-cursor variable (`ail run --watch NAME`): each write is a row, its value follows the line",
         ),
         key_row(
-            "Shift-F6",
+            "Shift-F7",
             "Trap values",
-            "shift+f6",
+            "shift+f7",
             "Run (`ail run --values`); a trap lists its frames with their values, the innermost frame's follow the trap line",
         ),
         key_row(
-            "Ctrl-Shift-Y",
+            "F9",
+            "Next probe or trace hit",
+            "f9",
+            "Jump to the next row of the probe, watch, trace, sanitize or leak list, wrapping",
+        ),
+        key_row(
+            "Palette",
             "Trace tree",
-            "ctrl+shift+y",
+            "palette+tree",
             "Run with every trace event as a tree: Left folds a call, Right opens it, `f` cycles the filter (all, calls, effects, contracts, traps)",
         ),
         key_row(
-            "Ctrl-Shift-S",
+            "Palette",
             "Schedule sanitizer",
-            "ctrl+shift+s",
+            "palette+sanitize",
             "`ail sanitize --json`: runs that differ under random schedules, with the replay command",
         ),
         key_row(
-            "Ctrl-Shift-R",
+            "Palette",
             "Race detector",
-            "ctrl+shift+r",
+            "palette+race",
             "`ail sanitize --race`: unsynchronised unsafe accesses; Enter jumps to an access",
         ),
         key_row(
-            "Ctrl-Shift-L",
+            "Palette",
             "Leak report",
-            "ctrl+shift+l",
+            "palette+leak",
             "`ail leak --json`: live memory growth by kind and the roots that hold it",
         ),
         key_row(
@@ -4711,7 +4717,9 @@ fn Workspace.probe_key(mut self, spec str)
     # The file `ail_on_buffer` runs, so `--at` names it.
     file := if eds[active].dirty then "{path}.edit-check.ail" else path
     probe_view.on = false
-    if spec == "ctrl+shift+j"
+    if spec == "next"
+        next_hit()
+    elif spec == "probe"
         names := probes.names_of(eds[active].lines[at], eds[active].selected_text())
         if names.len() == 0
             message = "probe: select the variable names to show (a, b), or put the cursor on a line that uses some"
@@ -4724,7 +4732,7 @@ fn Workspace.probe_key(mut self, spec str)
             return
         eds[active].notes[at] = probes.probe_note(found)
         show_list("probe {names.join(", ")} at line {at + 1}: {found.len()} hits", hits_of(path, probes.probe_rows(found)))
-    elif spec == "ctrl+shift+k"
+    elif spec == "watch"
         mut name := eds[active].selected_text().trim()
         if name == ""
             name = eds[active].word_here()
@@ -4738,7 +4746,7 @@ fn Workspace.probe_key(mut self, spec str)
             message = "watch: `{name}` was never written (exit {r.status})"
             return
         show_list("watch {name}: {writes.len()} writes", hits_of(path, probes.watch_rows(writes)))
-    elif spec == "shift+f6"
+    elif spec == "values"
         r := eds[active].ail_on_buffer(probes.values_args()) else return
         t := probes.trap_of(r.err)
         if t.rule == ""
@@ -4746,13 +4754,13 @@ fn Workspace.probe_key(mut self, spec str)
             return
         eds[active].notes = probes.trap_notes(t)
         show_list("trap values", hits_of(path, probes.trap_rows(t)))
-    elif spec == "ctrl+shift+y"
+    elif spec == "tree"
         r := eds[active].ail_on_buffer(probes.trace_args()) else return
         probe_view = probes.tree_of(r.err, r.out)
         probe_view.on = true
         show_list(probe_view.title(), hits_of(path, probe_view.rows()))
-    elif spec == "ctrl+shift+s" or spec == "ctrl+shift+r"
-        race := spec == "ctrl+shift+r"
+    elif spec == "sanitize" or spec == "race"
+        race := spec == "race"
         r := eds[active].ail_on_buffer(probes.sanitize_args(race)) else return
         mut rows := probes.sanitize_rows(r.out)
         if race

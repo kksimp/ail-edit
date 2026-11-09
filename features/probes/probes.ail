@@ -36,23 +36,28 @@ fn pairs(j Json) str
 fn row(line int, col int, text str) Row
     Row(line: line, col: col, text: text)
 
-## The key specs of the probe commands, in the order of their key rows.
-pub SPECS := [
-    "ctrl+shift+j", "ctrl+shift+k", "shift+f6", "ctrl+shift+y", "ctrl+shift+s",
-    "ctrl+shift+r", "ctrl+shift+l",
-]
+## The commands the keys and the palette run, by name. `tree`, `sanitize`,
+## `race` and `leak` have no key of their own: their palette rows use the spec
+## `palette+NAME`, which presses the key named NAME (no modifiers).
+pub COMMANDS := ["probe", "watch", "values", "next", "tree", "sanitize", "race", "leak"]
 
-## The spec of the probe command a key (without its modifiers) presses, if any.
+## The probe command a key (without its modifiers) presses, if any.
 pub fn key_spec(k str, ctrl bool, shift bool) str?
-    if not shift
+    if ctrl and shift
+        return match k.to_lower()
+            "r" => "probe"
+            "w" => "watch"
+            _ => none
+    if ctrl
         return none
-    if not ctrl
-        if k == "f6"
-            return "shift+f6"
+    if shift
+        if k == "f7"
+            return "values"
         return none
-    spec := "ctrl+shift+{k.to_lower()}"
-    if SPECS.contains(spec)
-        return spec
+    if k == "f9"
+        return "next"
+    if COMMANDS.contains(k)
+        return k
     none
 
 # ---- The arguments of each command --------------------------------------
@@ -749,7 +754,11 @@ TRACE := "\{\"api\":1,\"trace\":\"call\",\"fn\":\"main\",\"depth\":1,\"args\":\{
     assert_eq(size_text(300 * 1024), "300 KiB")
 
 @test fn key_specs_name_the_probe_keys()
-    assert_eq(key_spec("J", true, true), "ctrl+shift+j")
-    assert_eq(key_spec("f6", false, true), "shift+f6")
-    assert(key_spec("f6", false, false) == none)
+    assert_eq(key_spec("R", true, true), "probe")
+    assert_eq(key_spec("w", true, true), "watch")
+    assert_eq(key_spec("f7", false, true), "values")
+    assert_eq(key_spec("f9", false, false), "next")
+    assert_eq(key_spec("leak", false, false), "leak")
+    assert(key_spec("f7", false, false) == none)
     assert(key_spec("p", true, true) == none)
+    assert(key_spec("s", false, false) == none)
