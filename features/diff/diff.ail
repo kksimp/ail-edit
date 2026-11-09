@@ -86,7 +86,10 @@ pub fn diff_rows(out str) List[Row]
                 text: "{sign_of(j)} {str_of(j, "severity")}[{str_of(j, "rule")}] {str_of(j, "file")}: {str_of(j, "message")}",
             ))
         elif change == "test"
-            body.push(Row(id: "", text: "test {str_of(j, "test")}: {str_of(j, "old")} -> {str_of(j, "new")} {str_of(j, "message")}"))
+            body.push(Row(
+                id: "",
+                text: "test {str_of(j, "test")}: {str_of(j, "old")} -> {str_of(j, "new")} {str_of(j, "message")}",
+            ))
     for r in body
         head.push(r)
     head
@@ -102,7 +105,10 @@ pub fn verify_rows(out str) List[Row]
             continue
         proved := j.get("proved") else Json.Null
         changed := arr_of(proved, "changed")
-        rows.push(Row(id: "", text: "proved: check {str_of(proved, "check")}; {changed.len()} changed declarations"))
+        rows.push(Row(
+            id: "",
+            text: "proved: check {str_of(proved, "check")}; {changed.len()} changed declarations",
+        ))
         for c in changed
             rows.push(Row(id: text_of(c), text: "  {text_of(c)}"))
         tested := j.get("tested") else Json.Null
@@ -159,7 +165,10 @@ pub fn changed_lines(diff str) Set[int]
 pub fn change_count(rows List[Row]) int
     mut n := 0
     for r in rows
-        if r.text.starts_with("+ ") or r.text.starts_with("- ") or r.text.starts_with("~ ") or r.text.starts_with("> ")
+        if r.text.starts_with("+ ")
+            or r.text.starts_with("- ")
+            or r.text.starts_with("~ ")
+            or r.text.starts_with("> ")
             n += 1
     n
 
