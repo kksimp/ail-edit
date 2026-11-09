@@ -878,12 +878,7 @@ fn Editor.signature_help(mut self)
     name := cs[a..b].join("")
     for sym in symbols
         if sym.name == name and (sym.kind == "fn" or sym.kind == "method")
-            layer.sig = sem.sig_view(
-                sym.signature,
-                sym.facts,
-                call.arg,
-                a > 0 and cs[a - 1] == '.',
-            )
+            layer.sig = sem.sig_view(sym.signature, sym.facts, call.arg, a > 0 and cs[a - 1] == '.')
             return
 
 fn Editor.open_completion(mut self)
