@@ -2549,6 +2549,20 @@ ADD_REFS_JSON := "\{\"api\":1,\"symbol\":\"fn:add\",\"refs\":[\{\"file\":\"t.ail
     ed.apply(Insert("x"))
     assert_eq(ed.git_marks.len(), 0)
 
+@test fn dragging_a_tab_reorders_and_keeps_the_active_tab()
+    mut ws := Workspace.new(Editor.new("a.ail", "a\n", 40, 10))
+    ws.eds.push(Editor.new("b.ail", "b\n", 40, 10))
+    ws.eds.push(Editor.new("c.ail", "c\n", 40, 10))
+    ws.active = 0
+    ws.move_tab(0, 2)
+    assert_eq(ws.eds[0].path, "b.ail")
+    assert_eq(ws.eds[2].path, "a.ail")
+    assert_eq(ws.active, 2)
+    ws.move_tab(5, 0)
+    assert_eq(ws.eds[0].path, "b.ail")
+    ws.run_command("Font larger")
+    assert(ws.font > 20)
+
 @test fn references_list_declaration_and_uses()
     found := refs_hits(".", parse_json(REFS_JSON) else Json.Null)
     assert_eq(found.len(), 3)
@@ -3868,6 +3882,9 @@ fn key_rows() List[KeyRow]
             "Show or hide the minimap beside the text (window)",
         ),
         key_row("Palette", "Toggle zen mode", "", "Hide the tab strip and status bar (window)"),
+        key_row("Palette", "Font larger", "", "Step the font size up (also Ctrl-+)"),
+        key_row("Palette", "Font smaller", "", "Step the font size down (also Ctrl--)"),
+        key_row("Palette", "Font reset", "", "Back to the default font size (also Ctrl-0)"),
         key_row(
             "Mouse",
             "",
@@ -4026,6 +4043,9 @@ fn Workspace.run_command(mut self, name str)
     match name
         "Toggle minimap" => minimap = not minimap
         "Toggle zen mode" => zen = not zen
+        "Font larger" => zoom("+")
+        "Font smaller" => zoom("-")
+        "Font reset" => zoom("0")
         "API diff" => diff_view("api")
         "Git change gutter" => diff_view("gutter")
         "Update preview" => test_tool("preview")
@@ -4342,6 +4362,18 @@ fn Workspace.tab_labels(self) List[str]
             flag = "{flag} W{w}"
         out.push(" {base_name(ed.path)}{flag} ")
     out
+
+## Moves tab `from` to place `to`, keeping the same tab active.
+fn Workspace.move_tab(mut self, from int, to int)
+    n := eds.len()
+    if from < 0 or from >= n or to < 0 or to >= n
+        return
+    order := win.order_after_move(n, from, to)
+    mut moved := List[Editor]()
+    for i in order
+        moved.push(eds[i])
+    active = order.index_of(active) else 0
+    eds = moved
 
 fn Workspace.click_tab(mut self, c int)
     mut x := 0
@@ -5740,11 +5772,16 @@ struct Shell
     menu app.Popup?
     sent List[str]
     ready bool
+    ## The pointer over the canvas (-1 when it left), and a tab being dragged.
+    hover_x float
+    hover_y float
+    tab_drag int
+    tab_drop int
 
 fn Shell.new(w Workspace) Shell
     Shell(
         ws: w,
-        m: win.metrics(1000.0, 700.0, 8.0, 16.0, 13.0, false),
+        m: win.metrics(1000.0, 700.0, 8.0, 16.0, 13.0, false, win.ACT_W),
         pw: 1000.0,
         ph: 700.0,
         cellw: 8.0,
@@ -5753,15 +5790,25 @@ fn Shell.new(w Workspace) Shell
         menu: none,
         sent: [],
         ready: false,
+        hover_x: -1.0,
+        hover_y: -1.0,
+        tab_drag: -1,
+        tab_drop: -1,
     )
 
 ## The code's font size in points: the workspace's cell height, scaled.
 fn Shell.size(self) float
     ws.font.to_float() * 0.65
 
+## The grid's left edge: the activity bar, hidden in zen mode.
+fn Shell.x0(self) float
+    if ws.zen
+        return 0.0
+    win.ACT_W
+
 ## Lays the grid out for the canvas and tells the workspace its new size.
 fn Shell.relayout(mut self)
-    next := win.metrics(pw, ph, cellw, cellh, size(), ws.minimap)
+    next := win.metrics(pw, ph, cellw, cellh, size(), ws.minimap, x0())
     if not ready or next.cols != m.cols or next.rows != m.rows
         ws.on_event(Resize(cols: next.cols, rows: next.rows))
     m = next
@@ -5815,6 +5862,12 @@ fn Shell.frame(self) win.Frame
     if ws.minimap
         for l in e.lines
             lens.push(l.chars().len())
+    mut hover_tab := -1
+    mut hover_close := false
+    if hover_x >= 0.0 and hover_y >= 0.0 and hover_y < m.tab_h
+        hit := win.tab_hit(tabs(), win.chrome_size(m), hover_x)
+        hover_tab = hit.index
+        hover_close = hit.close
     win.Frame(
         colors: colors,
         runs: runs,
@@ -5832,6 +5885,11 @@ fn Shell.frame(self) win.Frame
         minimap: ws.minimap,
         zen: ws.zen,
         lens: lens,
+        hover_tab: hover_tab,
+        hover_close: hover_close,
+        drag_tab: tab_drag,
+        drop_tab: tab_drop,
+        hover_act: win.activity_hit(m, hover_x, hover_y),
     )
 
 ## A key as the workspace takes it.
@@ -5860,6 +5918,13 @@ fn Shell.pointer_down(mut self, ev app.Event)
             ws.active = hit.index
             if hit.close
                 ws.close_tab()
+            else
+                tab_drag = hit.index
+                tab_drop = hit.index
+        return
+    act := win.activity_hit(m, ev.x, ev.y)
+    if act >= 0
+        ws.on_event(key_event(win.ACTIVITY_KEYS[act]))
         return
     if ev.x >= m.w - win.SCROLL_W
         click_bar(ev.y)
@@ -5891,11 +5956,23 @@ impl app.App for Shell
             "down" =>
                 pointer_down(ev)
             "move" =>
-                if held
+                hover_x = ev.x
+                hover_y = ev.y
+                if tab_drag >= 0
+                    tab_drop = win.tab_drop(tabs(), win.chrome_size(m), ev.x)
+                elif held
                     cell := win.cell_at(m, ev.x, ev.y)
                     ws.on_event(Mouse(col: cell.col, row: cell.row, button: "left", kind: "drag"))
+            "leave" =>
+                hover_x = -1.0
+                hover_y = -1.0
             "up" =>
-                if held
+                if tab_drag >= 0
+                    if tab_drop >= 0 and tab_drop != tab_drag
+                        ws.move_tab(tab_drag, tab_drop)
+                    tab_drag = -1
+                    tab_drop = -1
+                elif held
                     held = false
                     cell := win.cell_at(m, ev.x, ev.y)
                     ws.on_event(Mouse(col: cell.col, row: cell.row, button: "left", kind: "up"))
@@ -5935,6 +6012,9 @@ impl app.App for Shell
 
     fn edge(self) bool
         false
+
+    fn hover(self) bool
+        true
 
 @test fn the_app_shell_draws_and_edits_without_a_window()
     mut sh := Shell.new(Workspace.new(Editor.new("t.ail", "fn main()\n", 100, 32)))
