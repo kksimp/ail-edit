@@ -2920,7 +2920,10 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     assert_eq(workspace_key("f7", false, true), Probes("values"))
     assert_eq(workspace_key("f9", false, false), Probes("next"))
     mut ws := Workspace.new(Editor.new("a.ail", "fn main()\n    pass\n", 60, 20))
-    ws.probe_view = probes.tree_of("\{\"api\":1,\"trace\":\"call\",\"fn\":\"main\",\"depth\":1,\"args\":\{},\"line\":1,\"col\":1}\n\{\"api\":1,\"trace\":\"effect\",\"call\":\"time.now\",\"args\":[],\"line\":2,\"col\":5}", "")
+    ws.probe_view = probes.tree_of(
+        "\{\"api\":1,\"trace\":\"call\",\"fn\":\"main\",\"depth\":1,\"args\":\{},\"line\":1,\"col\":1}\n\{\"api\":1,\"trace\":\"effect\",\"call\":\"time.now\",\"args\":[],\"line\":2,\"col\":5}",
+        "",
+    )
     ws.probe_view.on = true
     ws.show_list(ws.probe_view.title(), hits_of("a.ail", ws.probe_view.rows()))
     assert_eq(ws.hits.len(), 2)
@@ -4731,7 +4734,10 @@ fn Workspace.probe_key(mut self, spec str)
             message = "probe: line {at + 1} never ran (exit {r.status})"
             return
         eds[active].notes[at] = probes.probe_note(found)
-        show_list("probe {names.join(", ")} at line {at + 1}: {found.len()} hits", hits_of(path, probes.probe_rows(found)))
+        show_list(
+            "probe {names.join(", ")} at line {at + 1}: {found.len()} hits",
+            hits_of(path, probes.probe_rows(found)),
+        )
     elif spec == "watch"
         mut name := eds[active].selected_text().trim()
         if name == ""

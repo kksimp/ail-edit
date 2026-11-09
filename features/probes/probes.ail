@@ -93,9 +93,36 @@ pub fn leak_args() List[str]
 # ---- Names to probe ------------------------------------------------------
 
 KEYWORDS := [
-    "if", "elif", "else", "for", "while", "in", "return", "mut", "and", "or", "not", "fn",
-    "true", "false", "match", "break", "continue", "none", "use", "pub", "struct", "enum",
-    "requires", "ensures", "spawn", "par", "defer", "self", "unsafe", "let",
+    "if",
+    "elif",
+    "else",
+    "for",
+    "while",
+    "in",
+    "return",
+    "mut",
+    "and",
+    "or",
+    "not",
+    "fn",
+    "true",
+    "false",
+    "match",
+    "break",
+    "continue",
+    "none",
+    "use",
+    "pub",
+    "struct",
+    "enum",
+    "requires",
+    "ensures",
+    "spawn",
+    "par",
+    "defer",
+    "self",
+    "unsafe",
+    "let",
 ]
 
 fn is_word(c char) bool
@@ -472,7 +499,8 @@ pub fn tree_of(err str, out str) View
         else
             mut text := kind
             if kind == "contract"
-                held := if (j.get("held") else Json.Null) == Json.Bool(true) then "held" else "FAILED"
+                held := if (j.get("held") else Json.Null)
+                    == Json.Bool(true) then "held" else "FAILED"
                 text = "{jstr(j, "kind")} {jstr(j, "cond")} {held}"
             elif kind == "effect"
                 text = "effect {jstr(j, "call")}"
@@ -487,7 +515,14 @@ pub fn tree_of(err str, out str) View
                 text: text,
             ))
     for l in out.lines()
-        v.events.push(Event(kind: "output", parent: 0 - 1, depth: 0, line: 0, col: 0, text: "> {l}"))
+        v.events.push(Event(
+            kind: "output",
+            parent: 0 - 1,
+            depth: 0,
+            line: 0,
+            col: 0,
+            text: "> {l}",
+        ))
     v
 
 fn matches(kind str, filter str) bool
@@ -577,7 +612,11 @@ pub fn sanitize_rows(out str) List[Row]
     for l in out.lines()
         j := parse_json(l) else continue
         if (j.get("summary") else Json.Null) == Json.Bool(true)
-            rows.push(row(0, 0, "{jint(j, "seeds")} schedules, {jint(j, "schedule_dependent")} differ from the fixed schedule"))
+            rows.push(row(
+                0,
+                0,
+                "{jint(j, "seeds")} schedules, {jint(j, "schedule_dependent")} differ from the fixed schedule",
+            ))
         elif jstr(j, "rule") != ""
             rows.push(row(0, 0, "{jstr(j, "rule")} seed {jint(j, "seed")}: {jstr(j, "message")}"))
             if jstr(j, "replay") != ""
@@ -631,18 +670,34 @@ pub fn leak_rows(out str) List[Row]
         if (j.get("summary") else Json.Null) == Json.Bool(true)
             grew := (j.get("grew") else Json.Null) == Json.Bool(true)
             verdict := if grew then "growing" else "no growth"
-            rows.push(row(0, 0, "{jint(j, "collections")} collections, {size_text(jint(j, "live_bytes"))} live at exit, {verdict}"))
+            rows.push(row(
+                0,
+                0,
+                "{jint(j, "collections")} collections, {size_text(jint(j, "live_bytes"))} live at exit, {verdict}",
+            ))
             continue
         rule := jstr(j, "rule")
         if rule == "san.leak.1"
-            rows.push(row(0, 0, "live memory grew over {jint(j, "collections")} collections: {size_text(jint(j, "first_bytes"))} to {size_text(jint(j, "live_bytes"))}"))
+            rows.push(row(
+                0,
+                0,
+                "live memory grew over {jint(j, "collections")} collections: {size_text(jint(j, "first_bytes"))} to {size_text(jint(j, "live_bytes"))}",
+            ))
             for k in jarr(j, "kinds")
-                rows.push(row(0, 0, "  {jstr(k, "kind")}: {size_text(jint(k, "first_bytes"))} to {size_text(jint(k, "bytes"))} ({jint(k, "objects")} objects)"))
+                rows.push(row(
+                    0,
+                    0,
+                    "  {jstr(k, "kind")}: {size_text(jint(k, "first_bytes"))} to {size_text(jint(k, "bytes"))} ({jint(k, "objects")} objects)",
+                ))
         elif rule == "san.leak.2"
             mut root := jstr(j, "root")
             if root == "global"
                 root = "global slot {jint(j, "slot")}"
-            rows.push(row(0, 0, "root {root} holds {size_text(jint(j, "bytes"))} in {jint(j, "objects")} objects, mostly {jstr(j, "kind")} ({size_text(jint(j, "first_bytes"))} at the first collection)"))
+            rows.push(row(
+                0,
+                0,
+                "root {root} holds {size_text(jint(j, "bytes"))} in {jint(j, "objects")} objects, mostly {jstr(j, "kind")} ({size_text(jint(j, "first_bytes"))} at the first collection)",
+            ))
     rows
 
 # ---- Tests ---------------------------------------------------------------------
@@ -654,10 +709,14 @@ pub fn leak_rows(out str) List[Row]
     assert_eq(names_of("anything", "a, b ,a"), ["a", "b"])
 
 @test fn probe_args_name_the_file_line_and_names()
-    assert_eq(
-        probe_args("m.ail", 12, ["i", "total"]),
-        ["run", "--at", "m.ail:12", "--show", "i,total", "--json"],
-    )
+    assert_eq(probe_args("m.ail", 12, ["i", "total"]), [
+        "run",
+        "--at",
+        "m.ail:12",
+        "--show",
+        "i,total",
+        "--json",
+    ])
     assert_eq(watch_args("n"), ["run", "--watch", "n", "--json"])
     assert_eq(sanitize_args(false), ["sanitize", "--json"])
     assert_eq(sanitize_args(true), ["sanitize", "--race"])
@@ -749,7 +808,10 @@ TRACE := "\{\"api\":1,\"trace\":\"call\",\"fn\":\"main\",\"depth\":1,\"args\":\{
     assert_eq(rows.len(), 4)
     assert_eq(rows[0].text, "live memory grew over 9 collections: 1.0 MiB to 6.0 MiB")
     assert_eq(rows[1].text, "  list: 0 B to 5.0 MiB (40 objects)")
-    assert_eq(rows[2].text, "root global slot 3 holds 5.0 MiB in 40 objects, mostly list (0 B at the first collection)")
+    assert_eq(
+        rows[2].text,
+        "root global slot 3 holds 5.0 MiB in 40 objects, mostly list (0 B at the first collection)",
+    )
     assert_eq(rows[3].text, "9 collections, 6.0 MiB live at exit, growing")
     assert_eq(size_text(300 * 1024), "300 KiB")
 
