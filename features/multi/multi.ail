@@ -1,0 +1,272 @@
+## Multiple cursors (editor plan S2). A `Caret` is a selection with a head
+## (where the caret is drawn) and an anchor; an empty one is a plain caret.
+## Everything is a pure function on the lines, so the editor's headless
+## tests drive it. Positions are 0-based, columns count characters.
+
+## `tag` is 1 on the editor's main caret and 0 on the others; it survives
+## sorting and merging so the editor can tell them apart afterwards.
+pub struct Caret
+    pub line int
+    pub col int
+    pub anchor_line int
+    pub anchor_col int
+    pub tag int
+
+impl Ord for Caret
+
+## The result of an edit: the new lines and the carets after it, in buffer
+## order, each an empty caret at the end of what it typed.
+pub struct Edited
+    pub lines List[str]
+    pub carets List[Caret]
+
+pub fn at(l int, c int, tag int) Caret
+    Caret(line: l, col: c, anchor_line: l, anchor_col: c, tag: tag)
+
+## A selection from `a` to `b`, with the head at `b`.
+pub fn span(al int, ac int, bl int, bc int, tag int) Caret
+    Caret(line: bl, col: bc, anchor_line: al, anchor_col: ac, tag: tag)
+
+fn head_first(c Caret) bool
+    c.line < c.anchor_line or c.line == c.anchor_line and c.col <= c.anchor_col
+
+pub fn start_line(c Caret) int
+    if head_first(c)
+        return c.line
+    c.anchor_line
+
+pub fn start_col(c Caret) int
+    if head_first(c)
+        return c.col
+    c.anchor_col
+
+pub fn end_line(c Caret) int
+    if head_first(c)
+        return c.anchor_line
+    c.line
+
+pub fn end_col(c Caret) int
+    if head_first(c)
+        return c.anchor_col
+    c.col
+
+pub fn empty(c Caret) bool
+    c.line == c.anchor_line and c.col == c.anchor_col
+
+fn before(l1 int, c1 int, l2 int, c2 int) bool
+    l1 < l2 or l1 == l2 and c1 < c2
+
+## Sorts the carets, and merges those that overlap or coincide. A merged
+## caret is tagged as the main one if either was.
+pub fn normalize(cs List[Caret]) List[Caret]
+    mut out := List[Caret]()
+    for c in cs.sorted()
+        if out.len() > 0
+            p := out[out.len() - 1]
+            same_start := start_line(c) == start_line(p) and start_col(c) == start_col(p)
+            same_end := end_line(c) == end_line(p) and end_col(c) == end_col(p)
+            same := same_start and same_end
+            if same or before(start_line(c), start_col(c), end_line(p), end_col(p))
+                mut el := end_line(p)
+                mut ec := end_col(p)
+                if before(el, ec, end_line(c), end_col(c))
+                    el = end_line(c)
+                    ec = end_col(c)
+                out[out.len() - 1] = span(start_line(p), start_col(p), el, ec, p.tag.max(c.tag))
+                continue
+        out.push(c)
+    out
+
+## The main caret and the others, as one sorted list.
+pub fn prepare(main Caret, others List[Caret]) List[Caret]
+    mut all := [main]
+    all.extend(others)
+    normalize(all)
+
+## Replaces each caret's selection with the matching entry of `texts`
+## (`carets` sorted and not overlapping, as `normalize` leaves them). The
+## carets that come back sit at the end of each inserted text.
+pub fn replace_each(lines List[str], carets List[Caret], texts List[str]) Edited
+    mut ls := lines
+    mut out := List[Caret]()
+    mut dl := 0
+    mut dcol := 0
+    mut last := -1
+    for k in 0..carets.len()
+        c := carets[k]
+        sl := start_line(c)
+        el := end_line(c)
+        mut c1 := start_col(c)
+        mut c2 := end_col(c)
+        if sl == last
+            c1 += dcol
+        if el == last
+            c2 += dcol
+        l1 := sl + dl
+        l2 := el + dl
+        before_text := ls[l1].slice(0, c1)
+        after_text := ls[l2].slice(c2, ls[l2].len())
+        mut parts := texts[k].split("\n")
+        last_part := parts.len() - 1
+        mut ncol := parts[last_part].len()
+        if last_part == 0
+            ncol += c1
+        parts[0] = "{before_text}{parts[0]}"
+        parts[last_part] = "{parts[last_part]}{after_text}"
+        tail := ls[l2 + 1..]
+        ls = ls[..l1]
+        ls.extend(parts)
+        ls.extend(tail)
+        nl := l1 + last_part
+        dl = nl - el
+        dcol = ncol - end_col(c)
+        last = el
+        out.push(at(nl, ncol, c.tag))
+    Edited(lines: ls, carets: out)
+
+## `replace_each` with the same text at every caret.
+pub fn replace_all(lines List[str], carets List[Caret], text str) Edited
+    mut texts := List[str]()
+    for _ in carets
+        texts.push(text)
+    replace_each(lines, carets, texts)
+
+## Backspace: each empty caret takes in the character before it (the line
+## break at a line start). Then the result is merged.
+pub fn grow_back(lines List[str], carets List[Caret]) List[Caret]
+    mut out := List[Caret]()
+    for c in carets
+        if not empty(c)
+            out.push(c)
+        elif c.col > 0
+            out.push(span(c.line, c.col, c.line, c.col - 1, c.tag))
+        elif c.line > 0
+            out.push(span(c.line, 0, c.line - 1, lines[c.line - 1].len(), c.tag))
+        else
+            out.push(c)
+    normalize(out)
+
+## Delete: each empty caret takes in the character after it.
+pub fn grow_forward(lines List[str], carets List[Caret]) List[Caret]
+    mut out := List[Caret]()
+    for c in carets
+        if not empty(c)
+            out.push(c)
+        elif c.col < lines[c.line].len()
+            out.push(span(c.line, c.col, c.line, c.col + 1, c.tag))
+        elif c.line + 1 < lines.len()
+            out.push(span(c.line, c.col, c.line + 1, 0, c.tag))
+        else
+            out.push(c)
+    normalize(out)
+
+fn is_word(c char) bool
+    c.is_alnum() or c == '_'
+
+## Moves every caret. `dir` is left, right, up, down, home, end, word_left
+## or word_right; `select` keeps the anchors, else they follow the heads.
+pub fn move_each(lines List[str], carets List[Caret], dir str, select bool) List[Caret]
+    mut out := List[Caret]()
+    for c in carets
+        mut l := c.line
+        mut col := c.col
+        n := lines[l].len()
+        if dir == "left"
+            if col > 0
+                col -= 1
+            elif l > 0
+                l -= 1
+                col = lines[l].len()
+        elif dir == "right"
+            if col < n
+                col += 1
+            elif l + 1 < lines.len()
+                l += 1
+                col = 0
+        elif dir == "up"
+            if l > 0
+                l -= 1
+                col = col.min(lines[l].len())
+        elif dir == "down"
+            if l + 1 < lines.len()
+                l += 1
+                col = col.min(lines[l].len())
+        elif dir == "home"
+            col = 0
+        elif dir == "end"
+            col = n
+        elif dir == "word_left"
+            cs := lines[l].chars()
+            while col > 0 and not is_word(cs[col - 1])
+                col -= 1
+            while col > 0 and is_word(cs[col - 1])
+                col -= 1
+        elif dir == "word_right"
+            cs := lines[l].chars()
+            while col < n and not is_word(cs[col])
+                col += 1
+            while col < n and is_word(cs[col])
+                col += 1
+        if select
+            out.push(Caret(
+                line: l,
+                col: col,
+                anchor_line: c.anchor_line,
+                anchor_col: c.anchor_col,
+                tag: c.tag,
+            ))
+        else
+            out.push(at(l, col, c.tag))
+    normalize(out)
+
+## The index at or after `from` where `q` starts in `cs`, or -1.
+fn find_from(cs List[char], q List[char], from int) int
+    if q.len() == 0
+        return -1
+    mut i := from
+    while i + q.len() <= cs.len()
+        mut k := 0
+        while k < q.len() and cs[i + k] == q[k]
+            k += 1
+        if k == q.len()
+            return i
+        i += 1
+    -1
+
+## The first occurrence of `word` at or after (`l`, `c`), wrapping round to
+## the start of the buffer, as a selection with tag 0; `none` when the
+## buffer has none.
+pub fn occurrence_after(lines List[str], word str, l int, c int) Caret?
+    q := word.chars()
+    for step in 0..lines.len() + 1
+        i := (l + step) % lines.len()
+        mut from := 0
+        if step == 0
+            from = c
+        found := find_from(lines[i].chars(), q, from)
+        if found >= 0
+            return span(i, found, i, found + q.len(), 0)
+    none
+
+## Every occurrence of `word`, in order, as selections with tag 0.
+pub fn occurrences(lines List[str], word str) List[Caret]
+    mut out := List[Caret]()
+    q := word.chars()
+    for i in 0..lines.len()
+        cs := lines[i].chars()
+        mut from := 0
+        while from < cs.len()
+            found := find_from(cs, q, from)
+            if found < 0
+                break
+            out.push(span(i, found, i, found + q.len(), 0))
+            from = found + q.len()
+    out
+
+## A caret one line `d` (-1 or 1) from `c`, at the same column or the end of
+## that line; `none` at the first or last line.
+pub fn vertical(lines List[str], c Caret, d int) Caret?
+    l := c.line + d
+    if l < 0 or l >= lines.len()
+        return none
+    at(l, c.col.min(lines[l].len()), 0)
