@@ -4944,7 +4944,7 @@ fn Workspace.card_view(mut self)
         sources.push(Source(path: f, lines: text.lines()))
     show_list("program card {jstr(j, "card")}", card_hits(j, sources))
 
-# ---- Semantic diff (Ctrl-Shift-D, A, R, G) --------------------------------
+# ---- Semantic diff (Ctrl-Shift-D, Ctrl-Shift-V, palette) ----------------------
 
 ## The saved file against git HEAD, three ways (`ail diff`, `ail api --diff`,
 ## `ail verify --diff`) as a list whose rows jump to the declaration, or the
