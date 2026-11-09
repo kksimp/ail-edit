@@ -8055,11 +8055,11 @@ fn Shell.caret_on_now(self) bool
         return true
     not caret_on
 
-## Posts a blink tick every 530 ms until something arrives on `stop`.
-fn blinker(inbox app.Inbox, stop Channel[int])
+## Posts a blink tick every 530 ms until `stop` holds 1.
+fn blinker(inbox app.Inbox, stop Mutex[int])
     while true
-        got := stop.recv_for(530) else 0
-        if got == 1
+        time.sleep_ms(530)
+        if stop.get() == 1
             break
         inbox.post(app.external("blink", ""))
 
@@ -8202,15 +8202,15 @@ fn app_main(mut ed Editor, flags List[str])
         print_screen(ed, flags)
         return
     inbox := app.new_inbox()
-    stop := Channel[int](1)
+    stop := Mutex(0)
     g := TaskGroup()
     g.add(spawn blinker(inbox, stop))
     app.run_with(mut sh, host, [], inbox) else err
         print("edit: no window ({err.kind}: {err.message}); printing the screen instead")
-        stop.send(1)
+        stop.set(1)
         print_screen(ed, flags)
         return
-    stop.send(1)
+    stop.set(1)
 
 ## Opens the window, or prints one screen when there's no display.
 fn window_main(mut ed Editor, flags List[str])
