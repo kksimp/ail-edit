@@ -14,6 +14,7 @@ use std.ui
 use std.ui.widgets
 use std.screen.cells as scells
 use themes
+use features.diff as sdiff
 
 # Colors, 0xRRGGBB.
 BG := 0x1e1e1e
@@ -188,6 +189,8 @@ struct Editor
     rename RenamePlan
     ## Lines the tests never ran (Ctrl-Shift-C), 0-based; cleared by an edit.
     missed Set[int]
+    ## Lines that differ from git HEAD (Ctrl-Shift-G, S5), 0-based; cleared by an edit.
+    git_marks Set[int]
     ## Successful saves, so the workspace can check the other tabs.
     saves int
     ## The last tests-on-save result for the status line, or "" (ADR 0354).
@@ -234,6 +237,7 @@ fn Editor.new(path str, text str, cols int, rows int) Editor
         member_of: "",
         rename: RenamePlan(name: "", at: [], semantic: false),
         missed: Set[int](),
+        git_marks: Set[int](),
         saves: 0,
         tests: "",
         comp_sel: 0,
@@ -259,6 +263,7 @@ fn Editor.snapshot(mut self)
     indexed = false
     diags = []
     missed = Set[int]()
+    git_marks = Set[int]()
 
 fn Editor.set_col(mut self, c int)
     col = c
@@ -1417,6 +1422,8 @@ fn Editor.render(self) Screen
         num := "{l + 1}"
         if missed.contains(l)
             s.put(r, 0, "{num.pad_left(gw - 1, ' ')}!", ERROR_FG, bg)
+        elif git_marks.contains(l)
+            s.put(r, 0, "{num.pad_left(gw - 1, ' ')}+", COMMENT_FG, bg)
         else
             s.put(r, 0, "{num.pad_left(gw - 1, ' ')} ", GUTTER_FG, bg)
         cs := lines[l].chars()
@@ -2516,6 +2523,15 @@ ADD_REFS_JSON := "\{\"api\":1,\"symbol\":\"fn:add\",\"refs\":[\{\"file\":\"t.ail
         assert(r.name != "")
     ws.run_command("nonesuch")
     assert_eq(ws.message, "no command `nonesuch`")
+
+@test fn changed_lines_show_in_the_gutter()
+    mut ed := Editor.new("t.ail", "a\nb\nc\n", 40, 10)
+    ed.git_marks = sdiff.changed_lines("@@ -2 +2 @@\n")
+    row := ed.render().text[1]
+    assert(row.contains("2+"))
+    assert(not ed.render().text[0].contains("+"))
+    ed.apply(Insert("x"))
+    assert_eq(ed.git_marks.len(), 0)
 
 @test fn references_list_declaration_and_uses()
     found := refs_hits(".", parse_json(REFS_JSON) else Json.Null)
@@ -3669,6 +3685,30 @@ fn key_rows() List[KeyRow]
             "Run the tests with line coverage (`ail test --coverage=lines`) and mark the lines they never ran in the gutter, until the next edit (ADR 0313)",
         ),
         key_row(
+            "Ctrl-Shift-D",
+            "Semantic diff",
+            "ctrl+shift+d",
+            "List what changed in the saved file since git HEAD by meaning (`ail diff --rev HEAD`): declarations added, removed, changed (with their body lines), diagnostics and tests; Enter jumps to a declaration",
+        ),
+        key_row(
+            "palette",
+            "API diff",
+            "",
+            "List the public API changes since git HEAD (`ail api --diff --rev HEAD`), `breaking:` ones marked",
+        ),
+        key_row(
+            "Ctrl-Shift-V",
+            "Verify change",
+            "ctrl+shift+v",
+            "The four-part report of `ail verify --diff --rev HEAD`: proved, tested, unverified, failures",
+        ),
+        key_row(
+            "palette",
+            "Git change gutter",
+            "",
+            "Mark the lines that differ from git HEAD with `+` in the gutter (`git diff -U0`), until the next edit",
+        ),
+        key_row(
             "Ctrl-Shift-P",
             "",
             "",
@@ -3791,6 +3831,7 @@ enum WsKey
     ReplaceInFiles
     TestOnSave
     Zoom(key str)
+    Diff(kind str)
 
 fn workspace_key(k str, ctrl bool, shift bool) WsKey?
     if not ctrl
@@ -3818,6 +3859,8 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
             "m" | "M" => Problems
             "h" | "H" => ReplaceInFiles
             "u" | "U" => TestOnSave
+            "d" | "D" => Diff("diff")
+            "v" | "V" => Diff("verify")
             _ => none
     match k
         "b" | "B" => Tree
@@ -3871,6 +3914,8 @@ fn Workspace.choose(mut self)
 ## `key_rows()` and one arm here, which a slice adds for its own command.
 fn Workspace.run_command(mut self, name str)
     match name
+        "API diff" => diff_view("api")
+        "Git change gutter" => diff_view("gutter")
         _ => message = "no command `{name}`"
 
 # ---- Tabs ---------------------------------------------------------------
@@ -4085,6 +4130,7 @@ fn Workspace.on_event(mut self, ev ui.Event)
                     FailurePaths => failure_paths()
                     Coverage => eds[active].coverage()
                     Card => card_view()
+                    Diff(w) => diff_view(w)
                     Problems => problems()
                     References => show_references()
                     ReplaceInFiles => start_replace()
@@ -4897,6 +4943,51 @@ fn Workspace.card_view(mut self)
             text = fs.read_text(f) else ""
         sources.push(Source(path: f, lines: text.lines()))
     show_list("program card {jstr(j, "card")}", card_hits(j, sources))
+
+# ---- Semantic diff (Ctrl-Shift-D, A, R, G) --------------------------------
+
+## The saved file against git HEAD, three ways (`ail diff`, `ail api --diff`,
+## `ail verify --diff`) as a list whose rows jump to the declaration, or the
+## `+` marks of `git diff -U0` in the gutter (S5, features/diff).
+fn Workspace.diff_view(mut self, kind str)
+    path := eds[active].path
+    if eds[active].dirty
+        message = "the diff is of the saved file: save with Ctrl-S first"
+        return
+    if kind == "gutter"
+        g := proc.run("git", ["diff", "-U0", "HEAD", "--", path]) else err
+            message = "can't run {err.cmd}: {err.kind}"
+            return
+        eds[active].git_marks = sdiff.changed_lines(g.out)
+        message = "{eds[active].git_marks.len()} lines differ from HEAD; an edit clears the marks"
+        return
+    mut args := ["diff", "--no-tests", "--json", "--rev", "HEAD", path]
+    mut title := "semantic diff vs HEAD"
+    if kind == "api"
+        args = ["api", "--diff", "--json", "--rev", "HEAD", path]
+        title = "API diff vs HEAD"
+    elif kind == "verify"
+        args = ["verify", "--diff", "--json", "--rev", "HEAD", path]
+        title = "verify vs HEAD"
+    r := proc.run(ail_command(), args) else err
+        message = "can't run {err.cmd}: {err.kind}"
+        return
+    if r.status > 1 and r.out.trim() == ""
+        why := r.err.trim().lines()
+        message = "{title}: {if why.is_empty() then "failed" else why[0]}"
+        return
+    report := if kind == "verify" then sdiff.verify_rows(r.out) else sdiff.diff_rows(r.out)
+    if report.is_empty()
+        message = "{title}: no changes"
+        return
+    eds[active].index()
+    mut found := List[Hit]()
+    for row in report
+        mut line := 0
+        if sym := eds[active].symbol(row.id)
+            line = sym.line
+        found.push(Hit(loc: Loc(path: path, line: line, col: 1), text: row.text))
+    show_list("{title}: {sdiff.change_count(report)} changes", found)
 
 # ---- Replace in files (Ctrl-Shift-H) ---------------------------------------
 
