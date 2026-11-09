@@ -5465,7 +5465,7 @@ fn Workspace.new_project(mut self, name str)
 
 ## Enter in the rebind prompt: `NEWKEY as COMMAND`, saved as `bind.NEWKEY`.
 fn Workspace.add_binding(mut self, text str)
-    if not workspace.parse_input(text).is_some()
+    if not workspace.valid_input(text)
         message = "type NEWKEY as COMMAND, e.g. ctrl+alt+t as Next theme"
         return
     b := workspace.parse_input(text) else return

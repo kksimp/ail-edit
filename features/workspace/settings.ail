@@ -97,6 +97,12 @@ pub fn parse_input(s str) Bind?
         return none
     Bind(from: cmd, to: normal(fresh))
 
+## Whether `s` is a well-formed `NEW as COMMAND`.
+pub fn valid_input(s str) bool
+    if b := parse_input(s)
+        return b.to != ""
+    false
+
 @test fn settings_rows_cycle_and_wrap()
     rs := rows(["dark", "light"])
     assert_eq(rs.len(), 5)
@@ -123,5 +129,5 @@ pub fn parse_input(s str) Bind?
     b := parse_input("Alt+Ctrl+T as Next theme") else unreachable("parses")
     assert_eq(b.to, "ctrl+alt+t")
     assert_eq(b.from, "Next theme")
-    assert(not parse_input("ctrl+t").is_some())
-    assert(not parse_input("a b as c").is_some())
+    assert(not valid_input("ctrl+t"))
+    assert(not valid_input("a b as c"))
