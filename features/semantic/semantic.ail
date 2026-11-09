@@ -1,0 +1,475 @@
+## The editor's semantic layer (plan-2026-11 slice S3): highlighting by
+## declaration kind, inlay hints for local types, code lens, fix-all and
+## fix previews. Everything here is pure; `edit.ail` runs `ail` and passes
+## the answers in. Hints come from `ail api --locals`, lens from `--symbols`,
+## fix-all follows `ail lsp`'s `source.fixAll.ail` (lsp.action.2).
+
+## One text edit of a fix: replace from (line, col) up to, not including,
+## (end_line, end_col). 1-based, as in `ail check --json`.
+pub struct Edit
+    pub line int
+    pub col int
+    pub end_line int
+    pub end_col int
+    pub text str
+
+## The first fix of one diagnostic.
+pub struct Fix
+    pub rule str
+    pub title str
+    pub edits List[Edit]
+
+## The fixes fix-all takes: their edits, last to first in the file, and
+## their titles.
+pub struct FixPlan
+    pub edits List[Edit]
+    pub titles List[str]
+
+## A declaration, as the code lens needs it. `line` is 1-based.
+pub struct Decl
+    pub id str
+    pub kind str
+    pub line int
+    pub effects str
+    pub test bool
+
+## The colors recoloring may use (the editor's, so themes recolor them).
+pub struct Colors
+    pub plain int
+    pub type_fg int
+    pub fn_fg int
+    pub const_fg int
+    pub field_fg int
+    pub variant_fg int
+
+## The layer's state in one editor. `level` 0 is off, 1 kind colors and
+## code lens, 2 adds inlay hints. `lens` and `hints` are keyed by 0-based
+## line. A pending preview holds the whole buffer it would make.
+pub struct State
+    pub level int
+    pub kinds Map[str, str]
+    pub lens Map[int, str]
+    pub hints Map[int, str]
+    pub pending bool
+    pub proposed List[str]
+
+pub fn State.new() State
+    State(
+        level: 0,
+        kinds: Map[str, str](),
+        lens: Map[int, str](),
+        hints: Map[int, str](),
+        pending: false,
+        proposed: [],
+    )
+
+fn jstr(j Json, key str) str
+    (j.get(key) else Json.Null).as_str() else ""
+
+fn jint(j Json, key str) int
+    ((j.get(key) else Json.Null).as_num() else 0.0).to_int()
+
+fn jarr(j Json, key str) List[Json]
+    (j.get(key) else Json.Null).as_arr() else List[Json]()
+
+fn word_char(c char) bool
+    c.is_alnum() or c == '_'
+
+# ---- Fix-all and previews -----------------------------------------------
+
+fn span_key(line int, col int) int
+    line * 1048576 + col
+
+## The edits sorted last to first, so applying them in order keeps every
+## position valid.
+fn last_to_first(es List[Edit]) List[Edit]
+    mut out := List[Edit]()
+    for e in es
+        key := span_key(e.line, e.col)
+        mut at := out.len()
+        for i in 0..out.len()
+            if span_key(out[i].line, out[i].col) < key
+                at = i
+                break
+        mut next := out[..at]
+        next.push(e)
+        next.extend(out[at..])
+        out = next
+    out
+
+## `source.fixAll.ail` (lsp.action.2): the first fix of every diagnostic
+## whose edits touch none already taken, in diagnostic order.
+pub fn fix_all(fixes List[Fix]) FixPlan
+    mut taken := List[int]()
+    mut chosen := List[Edit]()
+    mut titles := List[str]()
+    for f in fixes
+        if f.edits.len() == 0
+            continue
+        mut clash := false
+        for e in f.edits
+            s := span_key(e.line - 1, e.col - 1)
+            t := span_key(e.end_line - 1, e.end_col - 1)
+            mut k := 0
+            while k < taken.len()
+                if (s < taken[k + 1] and taken[k] < t) or s == taken[k]
+                    clash = true
+                k += 2
+        if clash
+            continue
+        for e in f.edits
+            chosen.push(e)
+            taken.push(span_key(e.line - 1, e.col - 1))
+            taken.push(span_key(e.end_line - 1, e.end_col - 1))
+        titles.push(f.title)
+    FixPlan(edits: last_to_first(chosen), titles: titles)
+
+## `lines` with `es` applied, in the order given (last to first in the
+## file). An edit outside the buffer is skipped.
+pub fn apply_edits(lines List[str], es List[Edit]) List[str]
+    mut out := lines
+    for e in es
+        l1 := e.line - 1
+        l2 := e.end_line - 1
+        if l1 < 0 or l2 >= out.len() or l1 > l2
+            continue
+        c1 := (e.col - 1).max(0).min(out[l1].len())
+        c2 := (e.end_col - 1).max(0).min(out[l2].len())
+        before := out[l1].slice(0, c1)
+        after := out[l2].slice(c2, out[l2].len())
+        mut parts := e.text.split("\n")
+        end := parts.len() - 1
+        parts[0] = "{before}{parts[0]}"
+        parts[end] = "{parts[end]}{after}"
+        mut next := out[..l1]
+        next.extend(parts)
+        next.extend(out[l2 + 1..])
+        out = next
+    out
+
+## What a change does, as rows: `LINE - old` and `LINE + new`. Buffers of
+## the same length list each changed line; otherwise one block between the
+## common start and end. At most `limit` rows.
+pub fn diff_rows(old List[str], new List[str], limit int) List[str]
+    mut rows := List[str]()
+    if old.len() == new.len()
+        for i in 0..old.len()
+            if old[i] != new[i]
+                rows.push("{i + 1} - {old[i]}")
+                rows.push("{i + 1} + {new[i]}")
+    else
+        mut a := 0
+        while a < old.len() and a < new.len() and old[a] == new[a]
+            a += 1
+        mut ob := old.len()
+        mut nb := new.len()
+        while ob > a and nb > a and old[ob - 1] == new[nb - 1]
+            ob -= 1
+            nb -= 1
+        for i in a..ob
+            rows.push("{i + 1} - {old[i]}")
+        for i in a..nb
+            rows.push("{i + 1} + {new[i]}")
+    if rows.len() == 0
+        return ["no changes"]
+    if rows.len() > limit
+        more := rows.len() - limit
+        rows = rows[..limit]
+        rows.push("... {more} more rows")
+    rows
+
+# ---- Spec links for explain ---------------------------------------------
+
+## The spec chapter file that holds a rule id's chapter key, or "".
+pub fn spec_file(rule str) str
+    key := rule.split(".")[0]
+    match key
+        "plat" => "docs/spec/01-platforms.md"
+        "lex" => "docs/spec/02-lexical.md"
+        "gram" => "docs/spec/03-grammar.md"
+        "type" => "docs/spec/04-types.md"
+        "expr" => "docs/spec/05-expressions.md"
+        "own" => "docs/spec/07-ownership.md"
+        "err" => "docs/spec/08-errors.md"
+        "gen" => "docs/spec/09-generics.md"
+        "trait" => "docs/spec/10-traits.md"
+        "conc" => "docs/spec/11-concurrency.md"
+        "mod" => "docs/spec/12-modules.md"
+        "unsafe" => "docs/spec/13-unsafe.md"
+        "ffi" => "docs/spec/14-ffi.md"
+        "ct" => "docs/spec/15-compile-time.md"
+        "refl" => "docs/spec/16-reflection.md"
+        "std" => "docs/spec/17-std.md"
+        "eff" => "docs/spec/18-effects.md"
+        "test" => "docs/spec/19-testing.md"
+        "contract" => "docs/spec/20-contracts.md"
+        "trace" | "probe" => "docs/spec/21-trace.md"
+        "api" | "explain" | "fix" | "budget" | "snap" | "diff" | "edit" | "replay" | "bundle" | "verify" | "shrink" => "docs/spec/22-tools.md"
+        "native" => "docs/spec/23-native.md"
+        _ => ""
+
+## The line `explain` shows under a rule's text, or "" for an unknown chapter.
+pub fn spec_line(rule str) str
+    f := spec_file(rule)
+    if f == ""
+        return ""
+    "spec: {f} (rule {rule})"
+
+# ---- Kind colors ---------------------------------------------------------
+
+## One letter per kind the layer colors: f function or method, c constant,
+## d field, v variant.
+fn kind_letter(kind str) str
+    match kind
+        "fn" | "method" => "f"
+        "const" => "c"
+        "field" => "d"
+        "variant" => "v"
+        _ => ""
+
+## name -> the letters of every kind the file declares under that name.
+pub fn kind_index(names List[str], kinds List[str]) Map[str, str]
+    mut out := Map[str, str]()
+    for i in 0..names.len()
+        k := kind_letter(kinds[i])
+        if k == ""
+            continue
+        have := out.get(names[i]) else ""
+        if not have.contains(k)
+            out[names[i]] = "{have}{k}"
+    out
+
+fn all_caps(name str) bool
+    for ch in name.chars()
+        if ch.is_alnum() and not ch.is_digit() and not ch.is_upper()
+            return false
+    true
+
+## `fgs` with declared names recolored by kind. Only words the plain
+## highlighter left uncolored (or colored as a type) change, and the shape
+## around a word decides: a function is followed by `(`, a field follows
+## `.` and has no `(`, a variant follows `.` and starts upper case, a
+## constant is all upper case. A local that shares a name stays plain.
+pub fn recolor(cs List[char], fgs List[int], kinds Map[str, str], c Colors) List[int]
+    mut out := fgs
+    n := cs.len()
+    mut i := 0
+    while i < n
+        if not word_char(cs[i]) or cs[i].is_digit()
+            i += 1
+            continue
+        mut j := i
+        while j < n and word_char(cs[j])
+            j += 1
+        if fgs[i] == c.plain or fgs[i] == c.type_fg
+            name := cs[i..j].join("")
+            have := kinds.get(name) else ""
+            if have != ""
+                dotted := i > 0 and cs[i - 1] == '.'
+                called := j < n and cs[j] == '('
+                mut want := fgs[i]
+                if have.contains("f") and called and fgs[i] == c.plain
+                    want = c.fn_fg
+                elif have.contains("v") and dotted and cs[i].is_upper()
+                    want = c.variant_fg
+                elif have.contains("c") and all_caps(name) and not dotted
+                    want = c.const_fg
+                elif have.contains("d") and dotted and not called and fgs[i] == c.plain
+                    want = c.field_fg
+                for k in i..j
+                    out[k] = want
+        i = j
+    out
+
+# ---- Code lens ------------------------------------------------------------
+
+## The text after a declaration's line: its number of uses, its effects and,
+## for a test, that F6 runs it. Keyed by 0-based line.
+pub fn lens_rows(decls List[Decl], uses Map[str, int]) Map[int, str]
+    mut out := Map[int, str]()
+    for d in decls
+        mut parts := List[str]()
+        if d.kind == "fn" or d.kind == "method" or d.kind == "struct" or d.kind == "enum" or d.kind == "trait"
+            n := uses.get(d.id) else 0
+            if n == 1
+                parts.push("1 ref")
+            elif n > 1 or not d.test
+                parts.push("{n} refs")
+        if d.effects != ""
+            parts.push("effects: {d.effects}")
+        if d.test
+            parts.push("run test: F6")
+        if parts.len() > 0
+            out[d.line - 1] = parts.join(" | ")
+    out
+
+# ---- Inlay hints ----------------------------------------------------------
+
+fn ident(s str) bool
+    if s == "" or s == "_"
+        return false
+    cs := s.chars()
+    if cs[0].is_digit()
+        return false
+    for ch in cs
+        if not word_char(ch)
+            return false
+    true
+
+## The name an indented line binds without a type: `x := e`, `mut x := e`
+## or `for x in e`; "" for any other line.
+pub fn binding_name(src str) str
+    if not src.starts_with(" ")
+        return ""
+    t := src.trim()
+    if t.starts_with("for ")
+        words := t.slice(4, t.len()).split(" ")
+        if words.len() > 2 and words[1] == "in" and ident(words[0])
+            return words[0]
+        return ""
+    mut rest := t
+    if t.starts_with("mut ")
+        rest = t.slice(4, t.len())
+    parts := rest.split(" := ")
+    if parts.len() >= 2 and ident(parts[0])
+        return parts[0]
+    ""
+
+## `name: type` for the local `name` declared on 1-based `decl_line`, from
+## the answer of `ail api --locals`; "" when it isn't there or has no type.
+pub fn hint_in(j Json, name str, decl_line int) str
+    for v in jarr(j, "locals")
+        if jstr(v, "name") == name and jint(v, "line") == decl_line
+            ty := jstr(v, "type")
+            if ty == "" or ty.contains("unknown")
+                return ""
+            return "{name}: {ty}"
+    ""
+
+# ---- Ghost text ------------------------------------------------------------
+
+## What to show after line `l` (0-based): its code lens and, at level 2,
+## its inlay hint.
+pub fn ghost(s State, l int) str
+    if s.level == 0
+        return ""
+    mut parts := List[str]()
+    if t := s.lens.get(l)
+        parts.push(t)
+    if s.level >= 2
+        if h := s.hints.get(l)
+            parts.push(h)
+    parts.join("   ")
+
+# ---- Tests ------------------------------------------------------------------
+
+fn edit_at(l int, c int, el int, ec int, text str) Edit
+    Edit(line: l, col: c, end_line: el, end_col: ec, text: text)
+
+@test fn fix_all_takes_non_overlapping_first_fixes()
+    a := Fix(rule: "r1", title: "a", edits: [edit_at(2, 5, 2, 9, "print")])
+    b := Fix(rule: "r2", title: "b", edits: [edit_at(2, 7, 2, 12, "x")])
+    c := Fix(rule: "r3", title: "c", edits: [edit_at(4, 1, 4, 1, "mut ")])
+    none_fix := Fix(rule: "r4", title: "d", edits: [])
+    plan := fix_all([a, b, none_fix, c])
+    assert_eq(plan.titles, ["a", "c"])
+    assert_eq(plan.edits.len(), 2)
+    assert_eq(plan.edits[0].line, 4)
+    assert_eq(plan.edits[1].line, 2)
+
+@test fn edits_apply_last_to_first()
+    lines := ["fn main()", "    prnt(1)", "    x := 2"]
+    plan := fix_all([
+        Fix(rule: "a", title: "a", edits: [edit_at(2, 5, 2, 9, "print")]),
+        Fix(rule: "b", title: "b", edits: [edit_at(3, 5, 3, 5, "mut ")]),
+    ])
+    got := apply_edits(lines, plan.edits)
+    assert_eq(got, ["fn main()", "    print(1)", "    mut x := 2"])
+
+@test fn an_edit_may_add_a_line()
+    got := apply_edits(["a", "b"], [edit_at(1, 2, 1, 2, "\nc")])
+    assert_eq(got, ["a", "c", "b"])
+
+@test fn diff_rows_show_changed_lines()
+    old := ["a", "b", "c"]
+    assert_eq(diff_rows(old, ["a", "x", "c"], 10), ["2 - b", "2 + x"])
+    assert_eq(diff_rows(old, old, 10), ["no changes"])
+    assert_eq(diff_rows(old, ["a", "b", "q", "c"], 10), ["3 + q"])
+    assert_eq(diff_rows(old, ["x", "y", "z"], 2), ["1 - a", "1 + x", "... 4 more rows"])
+
+@test fn spec_links_use_the_chapter_key()
+    assert_eq(spec_file("expr.name.1"), "docs/spec/05-expressions.md")
+    assert_eq(spec_file("fix.apply.1"), "docs/spec/22-tools.md")
+    assert_eq(spec_file("nope.x.1"), "")
+    assert_eq(spec_line("err.prop.3"), "spec: docs/spec/08-errors.md (rule err.prop.3)")
+    assert_eq(spec_line("nope.x.1"), "")
+
+@test fn bindings_are_found_on_indented_lines()
+    assert_eq(binding_name("    x := 1"), "x")
+    assert_eq(binding_name("    mut sum := f(1)"), "sum")
+    assert_eq(binding_name("    for p in points"), "p")
+    assert_eq(binding_name("    for _ in 0..3"), "")
+    assert_eq(binding_name("    if v := m.get(k)"), "")
+    assert_eq(binding_name("MAX := 3"), "")
+    assert_eq(binding_name("    print(1)"), "")
+
+@test fn hints_read_the_locals_answer()
+    j := parse_json("\{\"locals\":[\{\"name\":\"sum\",\"type\":\"int\",\"mut\":true,\"kind\":\"binding\",\"line\":11,\"col\":9}]}") else Json.Null
+    assert_eq(hint_in(j, "sum", 11), "sum: int")
+    assert_eq(hint_in(j, "sum", 12), "")
+    assert_eq(hint_in(j, "other", 11), "")
+
+COLORS := Colors(plain: 1, type_fg: 2, fn_fg: 10, const_fg: 11, field_fg: 12, variant_fg: 13)
+
+fn painted(src str, kinds Map[str, str]) List[int]
+    cs := src.chars()
+    mut fgs := List[int]()
+    for ch in cs
+        if ch.is_upper()
+            fgs.push(2)
+        else
+            fgs.push(1)
+    recolor(cs, fgs, kinds, COLORS)
+
+@test fn declared_names_take_their_kind_color()
+    kinds := kind_index(
+        ["add", "x", "Red", "MAX", "add"],
+        ["fn", "field", "variant", "const", "field"],
+    )
+    assert_eq(kinds.get("add") else "", "fd")
+    got := painted("add(p.x, Color.Red, MAX)", kinds)
+    assert_eq(got[0], 10)
+    assert_eq(got[2], 10)
+    assert_eq(got[4], 1)
+    assert_eq(got[6], 12)
+    assert_eq(got[15], 13)
+    assert_eq(got[20], 11)
+
+@test fn a_local_with_a_function_name_stays_plain()
+    kinds := kind_index(["add"], ["fn"])
+    got := painted("add + 1", kinds)
+    assert_eq(got[0], 1)
+
+@test fn lens_counts_uses_effects_and_tests()
+    decls := [
+        Decl(id: "fn:add", kind: "fn", line: 5, effects: "", test: false),
+        Decl(id: "fn:main", kind: "fn", line: 8, effects: "io, fs", test: false),
+        Decl(id: "fn:t", kind: "fn", line: 12, effects: "", test: true),
+        Decl(id: "field:P.x", kind: "field", line: 2, effects: "", test: false),
+    ]
+    uses := {"fn:add": 1}
+    lens := lens_rows(decls, uses)
+    assert_eq(lens.get(4) else "", "1 ref")
+    assert_eq(lens.get(7) else "", "0 refs | effects: io, fs")
+    assert_eq(lens.get(11) else "", "run test: F6")
+    assert_eq(lens.get(1) else "", "")
+
+@test fn ghost_text_follows_the_level()
+    mut s := State.new()
+    s.lens[4] = "1 ref"
+    s.hints[4] = "x: int"
+    assert_eq(ghost(s, 4), "")
+    s.level = 1
+    assert_eq(ghost(s, 4), "1 ref")
+    s.level = 2
+    assert_eq(ghost(s, 4), "1 ref   x: int")

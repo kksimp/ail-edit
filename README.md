@@ -95,6 +95,9 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-- | Smaller font |
 | Ctrl-0 | Default font size |
 | Ctrl-Shift-T | Next theme: dark, light, solarized, high-contrast; remembered for the next start |
+| Ctrl-Shift-L | Cycle the semantic layer: off, declarations colored by kind with a code lens after each (uses, effects, test), then inlay hints with the types of local bindings (`ail api --locals`); refreshed on save (slice S3) |
+| Ctrl-Shift-X | Preview the first non-overlapping fix of every diagnostic, as `ail lsp`'s fix-all takes them; Enter applies them as one undo step, any other key cancels |
+| Ctrl-Shift-Y | Preview what `ail fix` makes of the buffer (fix rounds until none is left); Enter applies it as one undo step, any other key cancels |
 | Ctrl-Q | Quit; with unsaved changes in any tab, press it twice. Closing the window counts as Ctrl-Q |
 | Mouse | Click places the caret, drag or Shift-click selects, the wheel scrolls, a click on a diagnostic or an output location jumps to it |
 
