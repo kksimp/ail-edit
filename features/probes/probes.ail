@@ -1,0 +1,755 @@
+## Probes and diagnosis (editor plan S7). Everything here is pure: it builds
+## the `ail` argument lists for a probe (`ail run --at --show`), a watch
+## (`--watch`), trap values (`--values`), a trace tree, `ail sanitize` and
+## `ail leak`, and turns their output into rows. `edit.ail` runs the commands
+## and shows the rows, so every row is testable without a display and every
+## panel is also data for an agent (plan D4).
+
+## One row of a panel: where it jumps to (`line` 0 for none) and its text.
+pub struct Row
+    line int
+    col int
+    text str
+
+## A JSON value as short text: strings as they are, others as JSON.
+fn jtext(j Json) str
+    if s := j.as_str()
+        return s
+    j.to_text()
+
+fn jstr(j Json, key str) str
+    (j.get(key) else Json.Null).as_str() else ""
+
+fn jint(j Json, key str) int
+    ((j.get(key) else Json.Null).as_num() else 0.0).to_int()
+
+fn jarr(j Json, key str) List[Json]
+    (j.get(key) else Json.Null).as_arr() else List[Json]()
+
+## `name = value, ...` from a JSON object such as a frame's `locals`.
+fn pairs(j Json) str
+    mut out := List[str]()
+    for m in j.as_obj() else List[JsonMember]()
+        out.push("{m.key} = {jtext(m.value)}")
+    out.join(", ")
+
+fn row(line int, col int, text str) Row
+    Row(line: line, col: col, text: text)
+
+## The key specs of the probe commands, in the order of their key rows.
+pub SPECS := [
+    "ctrl+shift+j", "ctrl+shift+k", "shift+f6", "ctrl+shift+y", "ctrl+shift+s",
+    "ctrl+shift+r", "ctrl+shift+l",
+]
+
+## The spec of the probe command a key (without its modifiers) presses, if any.
+pub fn key_spec(k str, ctrl bool, shift bool) str?
+    if not shift
+        return none
+    if not ctrl
+        if k == "f6"
+            return "shift+f6"
+        return none
+    spec := "ctrl+shift+{k.to_lower()}"
+    if SPECS.contains(spec)
+        return spec
+    none
+
+# ---- The arguments of each command --------------------------------------
+
+## `ail run --at FILE:LINE --show a,b --json FILE` (probe.run.1-3). The file
+## is the one the run is on, so a check copy of an unsaved buffer works too.
+pub fn probe_args(file str, line int, names List[str]) List[str]
+    ["run", "--at", "{file}:{line}", "--show", names.join(","), "--json"]
+
+## `ail run --watch NAME --json FILE` (trace.watch.5).
+pub fn watch_args(name str) List[str]
+    ["run", "--watch", name, "--json"]
+
+## `ail run --json --values FILE`: a trap carries its frames' values (ADR 0886).
+pub fn values_args() List[str]
+    ["run", "--json", "--values"]
+
+## `ail run --trace=all --json --values FILE`: the events of the trace tree.
+pub fn trace_args() List[str]
+    ["run", "--trace=all", "--json", "--values"]
+
+## `ail sanitize [--race] --json FILE` (san.sched.1, san.race.1). The race
+## detector's reports are text, so `--race` runs without `--json`.
+pub fn sanitize_args(race bool) List[str]
+    if race
+        return ["sanitize", "--race"]
+    ["sanitize", "--json"]
+
+## `ail leak --json FILE` (san.leak.3).
+pub fn leak_args() List[str]
+    ["leak", "--json"]
+
+# ---- Names to probe ------------------------------------------------------
+
+KEYWORDS := [
+    "if", "elif", "else", "for", "while", "in", "return", "mut", "and", "or", "not", "fn",
+    "true", "false", "match", "break", "continue", "none", "use", "pub", "struct", "enum",
+    "requires", "ensures", "spawn", "par", "defer", "self", "unsafe", "let",
+]
+
+fn is_word(c char) bool
+    c.is_alpha() or c.is_digit() or c == '_'
+
+## The variable names a probe on this source line shows: the selection split on
+## commas when there is one, else the line's identifiers that are not
+## keywords, not called (`name(`), not a member (`.name`) and not a type, once
+## each in order.
+pub fn names_of(line str, selection str) List[str]
+    mut out := List[str]()
+    if selection.trim() != ""
+        for part in selection.split(",")
+            p := part.trim()
+            if p != "" and not out.contains(p)
+                out.push(p)
+        return out
+    cs := line.chars()
+    mut i := 0
+    while i < cs.len()
+        if not (cs[i].is_alpha() or cs[i] == '_')
+            if cs[i] == '"'
+                i += 1
+                while i < cs.len() and cs[i] != '"'
+                    i += 1
+            elif cs[i] == '#'
+                break
+            i += 1
+            continue
+        mut j := i
+        while j < cs.len() and is_word(cs[j])
+            j += 1
+        word := cs[i..j].join("")
+        after := if j < cs.len() then cs[j] else ' '
+        before := if i > 0 then cs[i - 1] else ' '
+        first := cs[i]
+        upper := first.is_alpha() and first == first.to_upper()
+        if before != '.' and after != '(' and after != '[' and not upper
+            if not KEYWORDS.contains(word) and not out.contains(word)
+                out.push(word)
+        i = j
+    out
+
+# ---- Probe and watch events ----------------------------------------------
+
+## A probe hit: the values shown at the line, `a = 1, b = 2`.
+pub struct Hit
+    at str
+    values str
+    line int
+
+fn probe_json(j Json) Hit
+    at := jstr(j, "at")
+    mut parts := List[str]()
+    for m in j.as_obj() else List[JsonMember]()
+        if m.key != "api" and m.key != "trace" and m.key != "at"
+            parts.push("{m.key} = {jtext(m.value)}")
+    parts_line := at.split(":")
+    Hit(at: at, values: parts.join(", "), line: (parts_line[parts_line.len() - 1].to_int() else 0))
+
+## The probe hits in a run's standard error, in order: the JSON events and the
+## text form `probe: FILE:LINE a = V, b = W`.
+pub fn probe_hits(err str) List[Hit]
+    mut out := List[Hit]()
+    for l in err.lines()
+        if j := parse_json(l)
+            if jstr(j, "trace") == "probe"
+                out.push(probe_json(j))
+            continue
+        if rest := l.strip_prefix("probe: ")
+            sp := rest.find(" ") else rest.len()
+            at := rest.slice(0, sp)
+            parts := at.split(":")
+            out.push(Hit(
+                at: at,
+                values: rest.slice((sp + 1).min(rest.len()), rest.len()),
+                line: (parts[parts.len() - 1].to_int() else 0),
+            ))
+    out
+
+## The panel rows of a probe: one per hit, numbered, jumping to the probed line.
+pub fn probe_rows(hits List[Hit]) List[Row]
+    mut out := List[Row]()
+    mut n := 1
+    for h in hits
+        out.push(row(h.line, 1, "#{n} {h.at}  {h.values}"))
+        n += 1
+    out
+
+## The inline note for the probed line: the last hit's values and how many
+## times the line ran.
+pub fn probe_note(hits List[Hit]) str
+    if hits.len() == 0
+        return ""
+    last := hits[hits.len() - 1].values
+    if hits.len() == 1
+        return last
+    "{last}  ({hits.len()} hits)"
+
+## One watch event: the variable's new value where it was written.
+pub struct Write
+    name str
+    value str
+    line int
+    col int
+    note str
+
+fn write_json(j Json) Write
+    mut note := ""
+    if jstr(j, "op") != ""
+        note = "{jstr(j, "op")} {jstr(j, "element")}"
+        if j.get("index") != none
+            note = "{note} at index {jtext(j.get("index") else Json.Null)}"
+        if j.get("key") != none
+            note = "{note} at key {jtext(j.get("key") else Json.Null)}"
+    if jstr(j, "frame") != ""
+        note = "{note} in {jstr(j, "frame")}".trim()
+    Write(
+        name: jstr(j, "name"),
+        value: jstr(j, "value"),
+        line: jint(j, "line"),
+        col: jint(j, "col"),
+        note: note,
+    )
+
+## The writes in a watch run's standard error (JSON, or `watch: NAME = V at L:C`).
+pub fn watch_writes(err str) List[Write]
+    mut out := List[Write]()
+    for l in err.lines()
+        if j := parse_json(l)
+            if jstr(j, "trace") == "watch"
+                out.push(write_json(j))
+            continue
+        if rest := l.strip_prefix("watch: ")
+            eq := rest.find(" = ") else continue
+            at := rest.rfind(" at ") else continue
+            place := rest.slice(at + 4, rest.len()).split(" ")[0].split(":")
+            if place.len() < 2
+                continue
+            out.push(Write(
+                name: rest.slice(0, eq),
+                value: rest.slice(eq + 3, at),
+                line: (place[place.len() - 2].to_int() else 0),
+                col: (place[place.len() - 1].to_int() else 0),
+                note: "",
+            ))
+    out
+
+pub fn watch_rows(writes List[Write]) List[Row]
+    mut out := List[Row]()
+    mut n := 1
+    for w in writes
+        mut text := "#{n} {w.name} = {w.value}  {w.line}:{w.col}"
+        if w.note != ""
+            text = "{text}  [{w.note}]"
+        out.push(row(w.line, w.col, text))
+        n += 1
+    out
+
+## 0-based line to the inline note of the last write on it.
+pub fn watch_notes(writes List[Write]) Map[int, str]
+    mut out := Map[int, str]()
+    for w in writes
+        out[w.line - 1] = "{w.name} = {w.value}"
+    out
+
+# ---- Traps and their values ----------------------------------------------
+
+## A trap frame: the function, where it was, and its values.
+pub struct Frame
+    fn_name str
+    line int
+    col int
+    args str
+    locals str
+
+## The trap of a run (`ail run --json --values`): the message and its frames,
+## innermost first. `rule` is "" when the run did not trap.
+pub struct Trap
+    rule str
+    message str
+    line int
+    col int
+    frames List[Frame]
+
+fn text_frame(l str) Frame?
+    if not l.starts_with("  at ") or not l.contains(" in ")
+        return none
+    body := l.slice(5, l.len())
+    at := body.find(" in ") else return none
+    place := body.slice(0, at).split(":")
+    if place.len() != 2
+        return none
+    frame := body.slice(at + 4, body.len())
+    mut locals := ""
+    mut call := frame
+    if i := frame.find("); ")
+        call = frame.slice(0, i + 1)
+        locals = frame.slice(i + 3, frame.len())
+    open := call.find("(") else call.len()
+    mut args := ""
+    if open < call.len() - 1
+        args = call.slice(open + 1, call.len() - 1)
+    if args == ".."
+        args = ""
+    Frame(
+        fn_name: call.slice(0, open),
+        line: (place[0].to_int() else 0),
+        col: (place[1].to_int() else 0),
+        args: args,
+        locals: locals,
+    )
+
+## The trap in a run's standard error, as the JSON object (`stack`) or the text
+## form `FILE:L:C: trap[RULE]: MESSAGE` with `  at L:C in NAME(ARGS); LOCALS` lines.
+pub fn trap_of(err str) Trap
+    mut t := Trap(rule: "", message: "", line: 0, col: 0, frames: [])
+    for l in err.lines()
+        if j := parse_json(l)
+            if jstr(j, "severity") == "trap"
+                t.rule = jstr(j, "rule")
+                t.message = jstr(j, "message")
+                t.line = jint(j, "line")
+                t.col = jint(j, "col")
+                for f in jarr(j, "stack")
+                    t.frames.push(Frame(
+                        fn_name: jstr(f, "fn"),
+                        line: jint(f, "line"),
+                        col: jint(f, "col"),
+                        args: pairs(f.get("args") else Json.Null),
+                        locals: pairs(f.get("locals") else Json.Null),
+                    ))
+            continue
+        if l.contains(": trap[")
+            parts := l.split(": trap[")
+            place := parts[0].split(":")
+            rest := parts[1].split("]: ")
+            if place.len() >= 3
+                t.rule = rest[0]
+                t.message = if rest.len() > 1 then rest[1] else ""
+                t.line = (place[place.len() - 2].to_int() else 0)
+                t.col = (place[place.len() - 1].to_int() else 0)
+        elif f := text_frame(l)
+            t.frames.push(f)
+    t
+
+fn frame_text(f Frame) str
+    mut text := "in {f.fn_name} {f.line}:{f.col}"
+    if f.args != ""
+        text = "{text}  args: {f.args}"
+    if f.locals != ""
+        text = "{text}  locals: {f.locals}"
+    text
+
+pub fn trap_rows(t Trap) List[Row]
+    mut out := List[Row]()
+    if t.rule == ""
+        return out
+    out.push(row(t.line, t.col, "trap[{t.rule}] {t.message}  {t.line}:{t.col}"))
+    for f in t.frames
+        out.push(row(f.line, f.col, "  {frame_text(f)}"))
+    out
+
+## The values at the trap line, for the inline note: the innermost frame's
+## arguments and locals. 0-based line to text.
+pub fn trap_notes(t Trap) Map[int, str]
+    mut out := Map[int, str]()
+    if t.frames.len() == 0
+        return out
+    f := t.frames[0]
+    mut vals := List[str]()
+    if f.args != ""
+        vals.push(f.args)
+    if f.locals != ""
+        vals.push(f.locals)
+    if vals.len() > 0
+        out[f.line - 1] = vals.join(", ")
+    out
+
+# ---- The trace tree --------------------------------------------------------
+
+## The filters, in the order `f` cycles through them.
+pub FILTERS := ["all", "calls", "effects", "contracts", "traps"]
+
+## One event of a trace. `parent` is the index of the call it happened in
+## (-1 at the top); a call's `text` ends with ` = VALUE` once it returned.
+pub struct Event
+    kind str
+    parent int
+    depth int
+    line int
+    col int
+    text str
+
+## The trace as a tree and what is folded or filtered away.
+pub struct View
+    events List[Event]
+    collapsed Set[int]
+    filter int
+    on bool
+
+pub fn View.new() View
+    View(events: [], collapsed: Set[int](), filter: 0, on: false)
+
+fn kind_of(j Json) str
+    k := jstr(j, "trace")
+    if k == ""
+        if jstr(j, "severity") == "trap"
+            return "trap"
+        return ""
+    k
+
+## The events of a run's standard error (`ail run --trace=all --json`) as a
+## tree: each call holds what happened until it returned, a trap holds its
+## frames, and the program's output follows as top-level rows.
+pub fn tree_of(err str, out str) View
+    mut v := View.new()
+    mut open := List[int]()
+    for l in err.lines()
+        j := parse_json(l) else continue
+        kind := kind_of(j)
+        if kind == "" or kind == "summary" or kind == "dropped"
+            continue
+        parent := if open.len() > 0 then open[open.len() - 1] else 0 - 1
+        line := jint(j, "line")
+        col := jint(j, "col")
+        if kind == "call"
+            args := pairs(j.get("args") else Json.Null)
+            v.events.push(Event(
+                kind: "call",
+                parent: parent,
+                depth: open.len(),
+                line: line,
+                col: col,
+                text: "{jstr(j, "fn")}({args})",
+            ))
+            open.push(v.events.len() - 1)
+        elif kind == "return"
+            top := open.pop() else continue
+            e := v.events[top]
+            v.events[top] = Event(
+                kind: e.kind,
+                parent: e.parent,
+                depth: e.depth,
+                line: e.line,
+                col: e.col,
+                text: "{e.text} = {jtext(j.get("value") else Json.Null)}",
+            )
+        elif kind == "trap"
+            v.events.push(Event(
+                kind: "trap",
+                parent: 0 - 1,
+                depth: 0,
+                line: line,
+                col: col,
+                text: "trap[{jstr(j, "rule")}] {jstr(j, "message")}",
+            ))
+            at := v.events.len() - 1
+            for f in jarr(j, "stack")
+                v.events.push(Event(
+                    kind: "frame",
+                    parent: at,
+                    depth: 1,
+                    line: jint(f, "line"),
+                    col: jint(f, "col"),
+                    text: frame_text(Frame(
+                        fn_name: jstr(f, "fn"),
+                        line: jint(f, "line"),
+                        col: jint(f, "col"),
+                        args: pairs(f.get("args") else Json.Null),
+                        locals: pairs(f.get("locals") else Json.Null),
+                    )),
+                ))
+        else
+            mut text := kind
+            if kind == "contract"
+                held := if (j.get("held") else Json.Null) == Json.Bool(true) then "held" else "FAILED"
+                text = "{jstr(j, "kind")} {jstr(j, "cond")} {held}"
+            elif kind == "effect"
+                text = "effect {jstr(j, "call")}"
+            elif jstr(j, "fn") != ""
+                text = "{kind} {jstr(j, "fn")}"
+            v.events.push(Event(
+                kind: kind,
+                parent: parent,
+                depth: open.len(),
+                line: line,
+                col: col,
+                text: text,
+            ))
+    for l in out.lines()
+        v.events.push(Event(kind: "output", parent: 0 - 1, depth: 0, line: 0, col: 0, text: "> {l}"))
+    v
+
+fn matches(kind str, filter str) bool
+    if filter == "all"
+        return true
+    if filter == "calls"
+        return kind == "call"
+    if filter == "effects"
+        return kind == "effect" or kind == "spawn" or kind == "wait"
+    if filter == "contracts"
+        return kind == "contract"
+    kind == "trap" or kind == "frame"
+
+fn has_children(v View, i int) bool
+    for k in i + 1..v.events.len()
+        if v.events[k].parent == i
+            return true
+    false
+
+## The indexes of the events shown: those the filter matches and their
+## ancestors, minus everything below a folded call.
+pub fn View.visible(self) List[int]
+    n := self.events.len()
+    want := FILTERS[self.filter]
+    mut keep := List[bool]()
+    for e in self.events
+        keep.push(matches(e.kind, want) or (e.kind == "output" and want == "all"))
+    mut i := n - 1
+    while i >= 0
+        if keep[i] and self.events[i].parent >= 0
+            keep[self.events[i].parent] = true
+        i -= 1
+    mut out := List[int]()
+    for k in 0..n
+        if not keep[k]
+            continue
+        mut hidden := false
+        mut p := self.events[k].parent
+        while p >= 0
+            if self.collapsed.contains(p)
+                hidden = true
+                break
+            p = self.events[p].parent
+        if not hidden
+            out.push(k)
+    out
+
+## The rows of the tree: indentation by depth, `[-]` on an open call that holds
+## events and `[+]` on a folded one.
+pub fn View.rows(self) List[Row]
+    mut out := List[Row]()
+    for k in self.visible()
+        e := self.events[k]
+        mut mark := "    "
+        if has_children(self, k)
+            mark = if self.collapsed.contains(k) then "[+] " else "[-] "
+        pad := "  ".repeat(e.depth)
+        out.push(row(e.line, e.col, "{pad}{mark}{e.text}"))
+    out
+
+## The panel's title: the filter and the event counts.
+pub fn View.title(self) str
+    "trace tree [{FILTERS[self.filter]}] {self.visible().len()}/{self.events.len()}; Left folds, Right opens, f filters"
+
+## Folds (`open` false) or opens the call at row `sel` of the visible rows. An
+## event with nothing under it stays as it is.
+pub fn View.fold(mut self, sel int, open bool)
+    shown := self.visible()
+    if sel < 0 or sel >= shown.len()
+        return
+    k := shown[sel]
+    if open
+        self.collapsed.remove(k)
+    elif has_children(self, k)
+        self.collapsed.add(k)
+
+## The next filter.
+pub fn View.next_filter(mut self)
+    self.filter = (self.filter + 1) % FILTERS.len()
+
+# ---- ail sanitize ----------------------------------------------------------
+
+## The rows of `ail sanitize --json` (san.sched.1): each schedule-dependent
+## run with its seed and replay command, then the summary.
+pub fn sanitize_rows(out str) List[Row]
+    mut rows := List[Row]()
+    for l in out.lines()
+        j := parse_json(l) else continue
+        if (j.get("summary") else Json.Null) == Json.Bool(true)
+            rows.push(row(0, 0, "{jint(j, "seeds")} schedules, {jint(j, "schedule_dependent")} differ from the fixed schedule"))
+        elif jstr(j, "rule") != ""
+            rows.push(row(0, 0, "{jstr(j, "rule")} seed {jint(j, "seed")}: {jstr(j, "message")}"))
+            if jstr(j, "replay") != ""
+                rows.push(row(0, 0, "  replay: {jstr(j, "replay")}"))
+    rows
+
+## The line and column in text such as `x.ail:12:5` (or `x.ail:12`), 0 for none.
+pub fn place_of(text str) Row
+    i := text.find(".ail:") else return row(0, 0, text)
+    rest := text.slice(i + 5, text.len()).chars()
+    mut j := 0
+    mut line := 0
+    while j < rest.len() and rest[j].is_digit()
+        line = line * 10 + (rest[j].to_digit(10) else 0)
+        j += 1
+    mut col := 1
+    if j + 1 < rest.len() and rest[j] == ':' and rest[j + 1].is_digit()
+        col = 0
+        j += 1
+        while j < rest.len() and rest[j].is_digit()
+            col = col * 10 + (rest[j].to_digit(10) else 0)
+            j += 1
+    row(line, col, text)
+
+## The rows of `ail sanitize --race` (san.race.1): each report's lines, those
+## naming an access jumping to it, then the `san.race:` summary.
+pub fn race_rows(err str) List[Row]
+    mut rows := List[Row]()
+    for l in err.lines()
+        if l.trim() == ""
+            continue
+        rows.push(place_of(l))
+    rows
+
+# ---- ail leak ----------------------------------------------------------------
+
+## A byte count as text: `1.5 MiB`, `300 KiB`, `12 B`.
+pub fn size_text(n int) str
+    if n >= 1048576
+        return "{(n * 10 / 1048576) / 10}.{(n * 10 / 1048576) % 10} MiB"
+    if n >= 1024
+        return "{n / 1024} KiB"
+    "{n} B"
+
+## The rows of `ail leak --json` (san.leak.1-3): the growth, each kind that
+## grew, the roots that hold it, and the summary.
+pub fn leak_rows(out str) List[Row]
+    mut rows := List[Row]()
+    for l in out.lines()
+        j := parse_json(l) else continue
+        if (j.get("summary") else Json.Null) == Json.Bool(true)
+            grew := (j.get("grew") else Json.Null) == Json.Bool(true)
+            verdict := if grew then "growing" else "no growth"
+            rows.push(row(0, 0, "{jint(j, "collections")} collections, {size_text(jint(j, "live_bytes"))} live at exit, {verdict}"))
+            continue
+        rule := jstr(j, "rule")
+        if rule == "san.leak.1"
+            rows.push(row(0, 0, "live memory grew over {jint(j, "collections")} collections: {size_text(jint(j, "first_bytes"))} to {size_text(jint(j, "live_bytes"))}"))
+            for k in jarr(j, "kinds")
+                rows.push(row(0, 0, "  {jstr(k, "kind")}: {size_text(jint(k, "first_bytes"))} to {size_text(jint(k, "bytes"))} ({jint(k, "objects")} objects)"))
+        elif rule == "san.leak.2"
+            mut root := jstr(j, "root")
+            if root == "global"
+                root = "global slot {jint(j, "slot")}"
+            rows.push(row(0, 0, "root {root} holds {size_text(jint(j, "bytes"))} in {jint(j, "objects")} objects, mostly {jstr(j, "kind")} ({size_text(jint(j, "first_bytes"))} at the first collection)"))
+    rows
+
+# ---- Tests ---------------------------------------------------------------------
+
+@test fn names_skip_keywords_calls_members_types_and_strings()
+    assert_eq(names_of("    total += xs[i] * scale(k)", ""), ["total", "xs", "i", "k"])
+    assert_eq(names_of("if a > b and p.x == \"skip me\"", ""), ["a", "b", "p"])
+    assert_eq(names_of("    n := List[int]()  # note", ""), ["n"])
+    assert_eq(names_of("anything", "a, b ,a"), ["a", "b"])
+
+@test fn probe_args_name_the_file_line_and_names()
+    assert_eq(
+        probe_args("m.ail", 12, ["i", "total"]),
+        ["run", "--at", "m.ail:12", "--show", "i,total", "--json"],
+    )
+    assert_eq(watch_args("n"), ["run", "--watch", "n", "--json"])
+    assert_eq(sanitize_args(false), ["sanitize", "--json"])
+    assert_eq(sanitize_args(true), ["sanitize", "--race"])
+    assert_eq(leak_args(), ["leak", "--json"])
+
+@test fn probe_hits_read_json_and_text_events()
+    err := "\{\"api\":1,\"trace\":\"probe\",\"at\":\"m.ail:3\",\"i\":\"0\",\"t\":\"<unset>\"}\nprobe: m.ail:3 i = 1, t = 5\n\{\"api\":1,\"trace\":\"summary\",\"shown\":2,\"dropped\":0}"
+    hits := probe_hits(err)
+    assert_eq(hits.len(), 2)
+    assert_eq(hits[0].values, "i = 0, t = <unset>")
+    assert_eq(hits[1].values, "i = 1, t = 5")
+    assert_eq(hits[1].line, 3)
+    rows := probe_rows(hits)
+    assert_eq(rows[0].text, "#1 m.ail:3  i = 0, t = <unset>")
+    assert_eq(rows[1].line, 3)
+    assert_eq(probe_note(hits), "i = 1, t = 5  (2 hits)")
+    assert_eq(probe_note([]), "")
+
+@test fn watch_writes_read_json_and_text_events()
+    err := "\{\"api\":1,\"trace\":\"watch\",\"name\":\"xs\",\"value\":\"[1, 2]\",\"op\":\"push\",\"element\":\"2\",\"index\":\"1\",\"line\":5,\"col\":5}\nwatch: n = 0 at 7:5 in bump (as `n`)"
+    ws := watch_writes(err)
+    assert_eq(ws.len(), 2)
+    assert_eq(ws[0].value, "[1, 2]")
+    assert_eq(ws[0].note, "push 2 at index 1")
+    assert_eq(ws[1].name, "n")
+    assert_eq(ws[1].line, 7)
+    rows := watch_rows(ws)
+    assert_eq(rows[0].text, "#1 xs = [1, 2]  5:5  [push 2 at index 1]")
+    assert_eq(watch_notes(ws)[4], "xs = [1, 2]")
+
+@test fn a_trap_gives_frames_and_inline_values()
+    json := "\{\"severity\":\"trap\",\"rule\":\"type.coll.4\",\"line\":15,\"col\":12,\"message\":\"index 2 is out of bounds\",\"stack\":[\{\"fn\":\"main\",\"line\":15,\"col\":12,\"args\":\{},\"locals\":\{\"x\":\"2\"}}]}"
+    t := trap_of(json)
+    assert_eq(t.rule, "type.coll.4")
+    assert_eq(trap_rows(t)[1].text, "  in main 15:12  locals: x = 2")
+    assert_eq(trap_notes(t)[14], "x = 2")
+    text := "m.ail:9:3: trap[type.coll.4]: index 5 is out of bounds\n  at 9:3 in inner(xs = [1]); n = 4"
+    u := trap_of(text)
+    assert_eq(u.line, 9)
+    assert_eq(u.frames.len(), 1)
+    assert_eq(u.frames[0].locals, "n = 4")
+    assert_eq(trap_rows(trap_of("fine")).len(), 0)
+
+TRACE := "\{\"api\":1,\"trace\":\"call\",\"fn\":\"main\",\"depth\":1,\"args\":\{},\"line\":1,\"col\":1}\n\{\"api\":1,\"trace\":\"call\",\"fn\":\"half\",\"depth\":2,\"args\":\{\"n\":\"4\"},\"line\":6,\"col\":9}\n\{\"api\":1,\"trace\":\"contract\",\"kind\":\"requires\",\"cond\":\"n > 0\",\"held\":true,\"line\":7,\"col\":5}\n\{\"api\":1,\"trace\":\"return\",\"fn\":\"half\",\"value\":\"2\"}\n\{\"api\":1,\"trace\":\"effect\",\"call\":\"fs.read_text\",\"args\":[],\"line\":8,\"col\":3}\n\{\"api\":1,\"trace\":\"return\",\"fn\":\"main\",\"value\":\"()\"}\n\{\"api\":1,\"trace\":\"summary\",\"shown\":6,\"dropped\":0}"
+
+@test fn the_trace_tree_nests_folds_and_filters()
+    mut v := tree_of(TRACE, "hi")
+    assert_eq(v.events.len(), 5)
+    rows := v.rows()
+    assert_eq(rows.len(), 5)
+    assert_eq(rows[0].text, "[-] main() = ()")
+    assert_eq(rows[1].text, "  [-] half(n = 4) = 2")
+    assert_eq(rows[2].text, "      requires n > 0 held")
+    assert_eq(rows[3].text, "    effect fs.read_text")
+    assert_eq(rows[4].text, "    > hi")
+    v.fold(1, false)
+    assert_eq(v.rows().len(), 4)
+    assert_eq(v.rows()[1].text, "  [+] half(n = 4) = 2")
+    v.fold(1, true)
+    assert_eq(v.rows().len(), 5)
+    v.fold(0, false)
+    assert_eq(v.rows().len(), 2)
+    v.fold(0, true)
+    v.next_filter()
+    assert_eq(v.rows().len(), 2)
+    v.next_filter()
+    v.next_filter()
+    assert_eq(FILTERS[v.filter], "contracts")
+    assert_eq(v.rows().len(), 3)
+    assert_eq(v.rows()[2].text, "      requires n > 0 held")
+
+@test fn sanitize_and_race_rows()
+    out := "\{\"api\":1,\"severity\":\"warning\",\"rule\":\"san.sched.1\",\"file\":\"m.ail\",\"seed\":3,\"message\":\"output differs\",\"replay\":\"ail run --schedule=random:3 m.ail\"}\n\{\"summary\":true,\"seeds\":8,\"schedule_dependent\":1}"
+    rows := sanitize_rows(out)
+    assert_eq(rows.len(), 3)
+    assert_eq(rows[0].text, "san.sched.1 seed 3: output differs")
+    assert_eq(rows[1].text, "  replay: ail run --schedule=random:3 m.ail")
+    assert_eq(rows[2].text, "8 schedules, 1 differ from the fixed schedule")
+    race := race_rows("error[san.race.1]: data race on address 80\n  write by task 2 at m.ail:12:5\n  read by task 1 at m.ail:9\n")
+    assert_eq(race.len(), 3)
+    assert_eq(race[1].line, 12)
+    assert_eq(race[1].col, 5)
+    assert_eq(race[2].line, 9)
+    assert_eq(race[0].line, 0)
+
+@test fn leak_rows_show_growth_kinds_roots_and_summary()
+    out := "\{\"api\":1,\"severity\":\"warning\",\"rule\":\"san.leak.1\",\"collections\":9,\"first_bytes\":1048576,\"live_bytes\":6291456,\"kinds\":[\{\"kind\":\"list\",\"first_bytes\":0,\"bytes\":5242880,\"objects\":40}]}\n\{\"api\":1,\"severity\":\"warning\",\"rule\":\"san.leak.2\",\"root\":\"global\",\"slot\":3,\"first_bytes\":0,\"bytes\":5242880,\"objects\":40,\"kind\":\"list\"}\n\{\"summary\":true,\"collections\":9,\"live_bytes\":6291456,\"grew\":true}"
+    rows := leak_rows(out)
+    assert_eq(rows.len(), 4)
+    assert_eq(rows[0].text, "live memory grew over 9 collections: 1.0 MiB to 6.0 MiB")
+    assert_eq(rows[1].text, "  list: 0 B to 5.0 MiB (40 objects)")
+    assert_eq(rows[2].text, "root global slot 3 holds 5.0 MiB in 40 objects, mostly list (0 B at the first collection)")
+    assert_eq(rows[3].text, "9 collections, 6.0 MiB live at exit, growing")
+    assert_eq(size_text(300 * 1024), "300 KiB")
+
+@test fn key_specs_name_the_probe_keys()
+    assert_eq(key_spec("J", true, true), "ctrl+shift+j")
+    assert_eq(key_spec("f6", false, true), "shift+f6")
+    assert(key_spec("f6", false, false) == none)
+    assert(key_spec("p", true, true) == none)

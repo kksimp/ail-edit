@@ -14,6 +14,7 @@ use std.ui
 use std.ui.widgets
 use std.screen.cells as scells
 use themes
+use features.probes as probes
 
 # Colors, 0xRRGGBB.
 BG := 0x1e1e1e
@@ -188,6 +189,9 @@ struct Editor
     rename RenamePlan
     ## Lines the tests never ran (Ctrl-Shift-C), 0-based; cleared by an edit.
     missed Set[int]
+    ## Values a probe, watch or trap showed at the end of a line (0-based line
+    ## to text); cleared by an edit (plan S7).
+    notes Map[int, str]
     ## Successful saves, so the workspace can check the other tabs.
     saves int
     ## The last tests-on-save result for the status line, or "" (ADR 0354).
@@ -234,6 +238,7 @@ fn Editor.new(path str, text str, cols int, rows int) Editor
         member_of: "",
         rename: RenamePlan(name: "", at: [], semantic: false),
         missed: Set[int](),
+        notes: Map[int, str](),
         saves: 0,
         tests: "",
         comp_sel: 0,
@@ -259,6 +264,7 @@ fn Editor.snapshot(mut self)
     indexed = false
     diags = []
     missed = Set[int]()
+    notes = Map[int, str]()
 
 fn Editor.set_col(mut self, c int)
     col = c
@@ -1446,6 +1452,13 @@ fn Editor.render(self) Screen
         mark_bracket(mut s, b.end_line, b.end_col)
     if completing
         render_popup(mut s)
+    # What a probe, watch or trap showed (plan S7) follows the line.
+    for r in 0..h
+        if l := notes.get(top + r)
+            if top + r < lines.len()
+                x := (gw + lines[top + r].len() - left + 3).max(gw)
+                if x < cols
+                    s.put(r, x, "=> {l}", GUTTER_FG, BG)
     # A diagnostic at the end of a line shows as one marked cell, and the
     # first diagnostic of each line shows its message after the line.
     mut shown := Set[int]()
@@ -2902,6 +2915,21 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     ws.on_event(Key(key: "w", ctrl: true, alt: false, shift: false))
     assert(ws.quit)
 
+@test fn probe_keys_reach_the_workspace_and_the_trace_tree_folds()
+    assert_eq(workspace_key("j", true, true), Probes("ctrl+shift+j"))
+    assert_eq(workspace_key("f6", false, true), Probes("shift+f6"))
+    assert(workspace_key("f6", false, false) == none)
+    mut ws := Workspace.new(Editor.new("a.ail", "fn main()\n    pass\n", 60, 20))
+    ws.probe_view = probes.tree_of("\{\"api\":1,\"trace\":\"call\",\"fn\":\"main\",\"depth\":1,\"args\":\{},\"line\":1,\"col\":1}\n\{\"api\":1,\"trace\":\"effect\",\"call\":\"time.now\",\"args\":[],\"line\":2,\"col\":5}", "")
+    ws.probe_view.on = true
+    ws.show_list(ws.probe_view.title(), hits_of("a.ail", ws.probe_view.rows()))
+    assert_eq(ws.hits.len(), 2)
+    assert(ws.probe_fold("left"))
+    assert_eq(ws.hits.len(), 1)
+    assert(ws.probe_fold("right"))
+    assert_eq(ws.hits.len(), 2)
+    assert(not ws.probe_fold("x"))
+
 @test fn every_palette_row_names_a_key_that_does_something()
     mut names := Set[str]()
     for r in key_rows()
@@ -3645,6 +3673,48 @@ fn key_rows() List[KeyRow]
             "Run with every trace event (`ail run --trace=all`): calls with arguments, returns, contracts, and a trap with each frame's locals; Up/Down, Enter jumps to an event (ADR 0312)",
         ),
         key_row(
+            "Ctrl-Shift-J",
+            "Probe line",
+            "ctrl+shift+j",
+            "Probe the cursor line (`ail run --at FILE:LINE --show NAMES`): the selection, else the line's variables; each hit is a row, the last hit's values follow the line",
+        ),
+        key_row(
+            "Ctrl-Shift-K",
+            "Watch variable",
+            "ctrl+shift+k",
+            "Watch the selected or word-at-cursor variable (`ail run --watch NAME`): each write is a row, its value follows the line",
+        ),
+        key_row(
+            "Shift-F6",
+            "Trap values",
+            "shift+f6",
+            "Run (`ail run --values`); a trap lists its frames with their values, the innermost frame's follow the trap line",
+        ),
+        key_row(
+            "Ctrl-Shift-Y",
+            "Trace tree",
+            "ctrl+shift+y",
+            "Run with every trace event as a tree: Left folds a call, Right opens it, `f` cycles the filter (all, calls, effects, contracts, traps)",
+        ),
+        key_row(
+            "Ctrl-Shift-S",
+            "Schedule sanitizer",
+            "ctrl+shift+s",
+            "`ail sanitize --json`: runs that differ under random schedules, with the replay command",
+        ),
+        key_row(
+            "Ctrl-Shift-R",
+            "Race detector",
+            "ctrl+shift+r",
+            "`ail sanitize --race`: unsynchronised unsafe accesses; Enter jumps to an access",
+        ),
+        key_row(
+            "Ctrl-Shift-L",
+            "Leak report",
+            "ctrl+shift+l",
+            "`ail leak --json`: live memory growth by kind and the roots that hold it",
+        ),
+        key_row(
             "Ctrl-Shift-E",
             "Failure paths",
             "ctrl+shift+e",
@@ -3786,6 +3856,7 @@ enum WsKey
     FailurePaths
     Coverage
     Card
+    Probes(spec str)
     Problems
     References
     ReplaceInFiles
@@ -3793,6 +3864,8 @@ enum WsKey
     Zoom(key str)
 
 fn workspace_key(k str, ctrl bool, shift bool) WsKey?
+    if spec := probes.key_spec(k, ctrl, shift)
+        return Probes(spec)
     if not ctrl
         if k == "f4" and not shift
             return NextHit
@@ -3930,6 +4003,8 @@ struct Workspace
     ## Ctrl-Shift-U: run the tab's tests after each save (ADR 0354).
     test_on_save bool
     typed_at int
+    ## The trace tree behind the list while it is shown (plan S7).
+    probe_view probes.View
 
 fn Workspace.new(ed Editor) Workspace
     Workspace(
@@ -3968,6 +4043,7 @@ fn Workspace.new(ed Editor) Workspace
         live_problems: false,
         test_on_save: false,
         typed_at: 0,
+        probe_view: probes.View.new(),
     )
 
 ## The file name a tab shows: the path after its last `/`.
@@ -4082,6 +4158,7 @@ fn Workspace.on_event(mut self, ev ui.Event)
                     Tree => toggle_tree()
                     Theme => next_theme()
                     Trace => trace_run()
+                    Probes(spec) => probe_key(spec)
                     FailurePaths => failure_paths()
                     Coverage => eds[active].coverage()
                     Card => card_view()
@@ -4546,6 +4623,8 @@ fn Workspace.jump_to_hit(mut self)
 
 ## Keys while the hits are focused; others go to the editor.
 fn Workspace.hits_key(mut self, k str) bool
+    if probe_fold(k)
+        return true
     if hits.len() == 0
         browsing = false
         return false
@@ -4597,6 +4676,98 @@ fn Workspace.render_search(self, mut s Screen)
             x := left()
             s.put(r, x, " ".repeat(cols - x), FG, SELECT_BG)
             s.put(r, x + 1, ed.pane_text[1 + hit_sel - hit_top], FG, SELECT_BG)
+
+# ---- Probes and diagnosis (plan S7; the rows come from features/probes) ----
+
+fn hits_of(path str, rows List[probes.Row]) List[Hit]
+    mut out := List[Hit]()
+    for r in rows
+        out.push(Hit(loc: Loc(path: path, line: r.line, col: r.col), text: r.text))
+    out
+
+## Left/Right fold or open the trace tree's selected call and `f` cycles its
+## filter, while the tree is the list shown.
+fn Workspace.probe_fold(mut self, k str) bool
+    if not probe_view.on or not hits_title.starts_with("trace tree")
+        return false
+    if k == "left" or k == "right"
+        probe_view.fold(hit_sel, k == "right")
+    elif k == "f"
+        probe_view.next_filter()
+    else
+        return false
+    hits = hits_of(eds[active].path, probe_view.rows())
+    hits_title = probe_view.title()
+    hit_sel = hit_sel.min(hits.len() - 1).max(0)
+    fill_hits()
+    true
+
+## The key of a probe command (`probes.key_spec`): runs the `ail` command it
+## names on the buffer and shows its rows in the list; probes, watches and
+## trap values also leave a note after the line.
+fn Workspace.probe_key(mut self, spec str)
+    path := eds[active].path
+    at := eds[active].line
+    # The file `ail_on_buffer` runs, so `--at` names it.
+    file := if eds[active].dirty then "{path}.edit-check.ail" else path
+    probe_view.on = false
+    if spec == "ctrl+shift+j"
+        names := probes.names_of(eds[active].lines[at], eds[active].selected_text())
+        if names.len() == 0
+            message = "probe: select the variable names to show (a, b), or put the cursor on a line that uses some"
+            return
+        r := eds[active].ail_on_buffer(probes.probe_args(file, at + 1, names)) else return
+        found := probes.probe_hits(r.err)
+        eds[active].notes = Map[int, str]()
+        if found.len() == 0
+            message = "probe: line {at + 1} never ran (exit {r.status})"
+            return
+        eds[active].notes[at] = probes.probe_note(found)
+        show_list("probe {names.join(", ")} at line {at + 1}: {found.len()} hits", hits_of(path, probes.probe_rows(found)))
+    elif spec == "ctrl+shift+k"
+        mut name := eds[active].selected_text().trim()
+        if name == ""
+            name = eds[active].word_here()
+        if name == ""
+            message = "watch: put the cursor on a variable"
+            return
+        r := eds[active].ail_on_buffer(probes.watch_args(name)) else return
+        writes := probes.watch_writes(r.err)
+        eds[active].notes = probes.watch_notes(writes)
+        if writes.len() == 0
+            message = "watch: `{name}` was never written (exit {r.status})"
+            return
+        show_list("watch {name}: {writes.len()} writes", hits_of(path, probes.watch_rows(writes)))
+    elif spec == "shift+f6"
+        r := eds[active].ail_on_buffer(probes.values_args()) else return
+        t := probes.trap_of(r.err)
+        if t.rule == ""
+            message = "trap values: the run did not trap (exit {r.status})"
+            return
+        eds[active].notes = probes.trap_notes(t)
+        show_list("trap values", hits_of(path, probes.trap_rows(t)))
+    elif spec == "ctrl+shift+y"
+        r := eds[active].ail_on_buffer(probes.trace_args()) else return
+        probe_view = probes.tree_of(r.err, r.out)
+        probe_view.on = true
+        show_list(probe_view.title(), hits_of(path, probe_view.rows()))
+    elif spec == "ctrl+shift+s" or spec == "ctrl+shift+r"
+        race := spec == "ctrl+shift+r"
+        r := eds[active].ail_on_buffer(probes.sanitize_args(race)) else return
+        mut rows := probes.sanitize_rows(r.out)
+        if race
+            rows = probes.race_rows(r.err)
+        if rows.len() == 0
+            message = "sanitize: nothing to report (exit {r.status})"
+            return
+        show_list(if race then "race report" else "schedule sanitizer", hits_of(path, rows))
+    else
+        r := eds[active].ail_on_buffer(probes.leak_args()) else return
+        rows := probes.leak_rows(r.err)
+        if rows.len() == 0
+            message = "leak: no report (exit {r.status})"
+            return
+        show_list("leak report", hits_of(path, rows))
 
 # ---- The agent panel: trace, failure paths, coverage ----------------------
 
