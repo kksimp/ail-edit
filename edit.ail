@@ -3691,9 +3691,9 @@ fn key_rows() List[KeyRow]
             "List what changed in the saved file since git HEAD by meaning (`ail diff --rev HEAD`): declarations added, removed, changed (with their body lines), diagnostics and tests; Enter jumps to a declaration",
         ),
         key_row(
-            "Palette",
+            "palette",
             "API diff",
-            "palette+api-diff",
+            "",
             "List the public API changes since git HEAD (`ail api --diff --rev HEAD`), `breaking:` ones marked",
         ),
         key_row(
@@ -3703,9 +3703,9 @@ fn key_rows() List[KeyRow]
             "The four-part report of `ail verify --diff --rev HEAD`: proved, tested, unverified, failures",
         ),
         key_row(
-            "Palette",
+            "palette",
             "Git change gutter",
-            "palette+git-gutter",
+            "",
             "Mark the lines that differ from git HEAD with `+` in the gutter (`git diff -U0`), until the next edit",
         ),
         key_row(
@@ -3841,11 +3841,6 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
             return Trace
         if k == "f12" and shift
             return References
-        # Palette-only commands: key names no keyboard sends (key_rows spec `palette+NAME`).
-        if k == "api-diff"
-            return Diff("api")
-        if k == "git-gutter"
-            return Diff("gutter")
         return none
     if k == "tab"
         if shift
@@ -3919,6 +3914,8 @@ fn Workspace.choose(mut self)
 ## `key_rows()` and one arm here, which a slice adds for its own command.
 fn Workspace.run_command(mut self, name str)
     match name
+        "API diff" => diff_view("api")
+        "Git change gutter" => diff_view("gutter")
         _ => message = "no command `{name}`"
 
 # ---- Tabs ---------------------------------------------------------------
