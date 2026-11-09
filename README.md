@@ -11,7 +11,8 @@ is headless: an `Editor` value, `Command`s that change it, and a pure
 ([ADR 0181](https://github.com/kksimp/ail/blob/main/docs/decisions/0181-editor-screen-as-text-runs.md)).
 
 ```sh
-../ail/ail run edit.ail FILE                     # the editor, in a window
+../ail/ail run edit.ail FILE                     # the editor, in a std.app window (macOS host: tools/app-host/macos/run.sh edit.ail FILE)
+../ail/ail run edit.ail --grid FILE              # the old std.ui cell-grid window
 ../ail/ail run edit.ail --font 15 FILE           # ...with a smaller font (10 to 40)
 ../ail/ail run edit.ail --theme light FILE       # ...in a theme (see Themes)
 ../ail/ail run edit.ail --print FILE             # print one screen as text
@@ -92,6 +93,18 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-Shift-P | Command palette: every command here with its key; type part of its name, Up/Down, Enter runs it |
 | Ctrl-B | Show the file tree (`.ail` files first) and focus it; again hides it. Up/Down select, Enter or Right opens a file or expands a directory, Left collapses, Esc returns to the editor; a click opens (ADR 0293) |
 | Ctrl-Shift-U | Toggle running the tab's tests (`ail test --json`) after each save; the status line shows the pass and fail counts (ADR 0354) |
+| Ctrl-Shift-J | The tab's tests as a tree (`ail test --json --bundle-failure`): the totals, then `ok` and `FAIL` rows (a property failure with its input) and the bundles written; Up/Down, Enter jumps to a failed test (S6) |
+| Shift-F6 | Run the tests and show only the test the caret is in (S6) |
+| Ctrl-Shift-Y | With a FAIL row of the test tree selected, run its bundle again (`ail test --bundle`) from the recording (S6) |
+| Ctrl-Shift-Z | With a FAIL row selected, cut the bundle's recorded texts line by line (`ail replay --shrink`, 20 s budget) and list the smaller `.min` bundle's calls as a trace; Enter jumps to the call's line (S6) |
+| Ctrl-Shift-X | Check `requires` and `ensures` with generated inputs (`ail test --contracts --json`); a failure shows the smallest input, Enter jumps to it (S6) |
+| palette | Preview what `ail test --update` would rewrite (`--dry-run --json`): every stale expectation as old -> new; Enter jumps to it (S6) |
+| palette | Run `ail test --update` on the saved file and reload the tab (refused with unsaved changes) (S6) |
+| palette | Record the failed tests' captured calls (`ail test --record last-test.rec.json`) beside the file (S6) |
+| palette | As replay, with every trace event (`ail test --trace=all --bundle`) (S6) |
+| Ctrl-Shift-K | The open `ail task` (`.ail-task`): goal, base, last verify, and the impact since the base (`ail ask --affected --json`): changed and affected declarations, affected tests, changed effects; Up/Down, Enter jumps; V verifies, F finishes, X aborts (`ail task`). After each save, affected declarations are marked `~` in the gutter until the next edit (S4) |
+| F8 | Run only the tests the changes since the base can reach (`ail test --affected`, since the open task's base, else `HEAD`); the saved file is compared, so save first (S4) |
+| F7 | Run `ail task verify` (check, then the affected tests) and show the answer: result, failing stage, last lines, next step (S4) |
 | Ctrl-Shift-H | Type what to find, Enter, the replacement, Enter: every changed line of the project's `.ail` files is previewed old -> new; Space skips or accepts a row, A accepts all; Ctrl-Enter applies the accepted rows to the buffers (files open as tabs, nothing saved, Ctrl-Z undoes per tab), Esc cancels (ADRs 0339, 0353) |
 | Ctrl-Shift-F | Search every `.ail` file under the directory (open tabs as edited); the matches fill the pane, Up/Down select, Enter jumps, Esc closes (ADR 0292) |
 | F4 | Jump to the next match of the last project search |
@@ -104,6 +117,8 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-0 | Default font size |
 | Ctrl-Shift-T | Next theme: dark, light, solarized, high-contrast; remembered for the next start |
 | Ctrl-Q | Quit; with unsaved changes in any tab, press it twice. Closing the window counts as Ctrl-Q |
+| Palette | Show or hide the minimap beside the text (window) |
+| Palette | Hide the tab strip and status bar (window) |
 | Mouse | Click places the caret, drag or Shift-click selects, the wheel scrolls, a click on a diagnostic or an output location jumps to it |
 
 ## macOS sanity check
