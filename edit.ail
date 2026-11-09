@@ -5471,7 +5471,7 @@ impl app.App for Shell
             "paste" =>
                 if ws.picking or ws.searching
                     for c in ev.text.chars()
-                        ws.on_event(press(c))
+                        ws.on_event(press("{c}"))
                 else
                     ws.eds[ws.active].clip = ev.text
                     ws.on_event(key_event("ctrl+v"))
