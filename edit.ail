@@ -26,6 +26,7 @@ use features.pairs
 use features.semantic as sem
 use features.tests as ttree
 use features.taskpanel as tp
+use features.agent
 use features.ask
 
 # Colors, 0xRRGGBB.
@@ -4748,6 +4749,30 @@ fn key_rows() List[KeyRow]
             "Run `ail task verify` (check, then the affected tests) and show the answer: result, failing stage, last lines, next step (S4)",
         ),
         key_row(
+            "Alt-Shift-C",
+            "Copy for agent",
+            "alt+shift+c",
+            "Copy the selection (else the line) with the diagnostics and card entries on it, cut to a token budget, to the clipboard, for pasting into an agent",
+        ),
+        key_row(
+            "Alt-Shift-V",
+            "Apply agent edit",
+            "alt+shift+v",
+            "Preview the `ail edit` hunks on the clipboard (else in `.agent-edit`) as a diff; press again to apply them to the buffer (Ctrl-Z undoes), Esc cancels",
+        ),
+        key_row(
+            "palette",
+            "Agent changes",
+            "",
+            "List the files an agent changed beside the editor and the lines it changed (marked `+` in the gutter until you save); Enter jumps",
+        ),
+        key_row(
+            "palette",
+            "Toggle agent marks",
+            "",
+            "Show or hide the `+` gutter marks on lines an agent changed",
+        ),
+        key_row(
             "Ctrl-Shift-H",
             "Replace in files",
             "ctrl+shift+h",
@@ -4956,6 +4981,8 @@ enum WsKey
     TaskPanel
     AffectedTests
     TaskVerify
+    AgentPack
+    AgentApply
     AskBar
     Symbols
     Hierarchy
@@ -4963,8 +4990,12 @@ enum WsKey
     Diff(kind str)
 
 fn workspace_key(k str, ctrl bool, alt bool, shift bool) WsKey?
-    if alt and shift and (k == "h" or k == "H")
-        return Hierarchy
+    if alt and shift and not ctrl
+        return match k
+            "c" | "C" => AgentPack
+            "v" | "V" => AgentApply
+            "h" | "H" => Hierarchy
+            _ => none
     if not ctrl
         if k == "f4" and not shift
             return NextHit
@@ -5110,6 +5141,10 @@ fn Workspace.run_command(mut self, name str)
         "Apply test update" => test_tool("apply")
         "Record tests" => test_tool("record")
         "Trace replay" => test_tool("trace")
+        "Agent changes" => agent_changes()
+        "Toggle agent marks" =>
+            watch.hidden = not watch.hidden
+            message = "agent marks {on_off(not watch.hidden)}"
         "Count tokens" => token_report()
         "Toggle token meter" => askbar.toggle()
         _ => message = "no command `{name}`"
@@ -5190,6 +5225,8 @@ struct Workspace
     ## Palette toggles of the window: the minimap and zen mode.
     minimap bool
     zen bool
+    ## Agent co-editing (S9): file stamps, agent marks, a pending edit preview.
+    watch agent.State
     ## The ask bar and the token meter (features/ask, plan S8).
     askbar ask.Bar
 
@@ -5239,6 +5276,7 @@ fn Workspace.new(ed Editor) Workspace
         splitting: false,
         minimap: false,
         zen: false,
+        watch: agent.new_state(),
         askbar: ask.Bar.new(),
     )
 
@@ -5389,6 +5427,8 @@ fn Workspace.dispatch(mut self, ev ui.Event)
                     TaskPanel => task_panel()
                     AffectedTests => eds[active].affected_tests()
                     TaskVerify => task_action("verify")
+                    AgentPack => agent_pack()
+                    AgentApply => agent_apply()
                     AskBar => askbar.start(0)
                     Symbols => askbar.start(1)
                     Hierarchy => show_hierarchy()
@@ -5402,6 +5442,7 @@ fn Workspace.dispatch(mut self, ev ui.Event)
             saves := eds[active].saves
             eds[active].on_event(ev)
             if eds[active].saves != saves
+                watch.saved(eds[active].path)
                 refresh_git()
                 check_other_tabs()
                 eds[active].impact_refresh()
@@ -6564,6 +6605,173 @@ fn Workspace.show_references(mut self)
         return
     show_list("references: {found.len()}", found)
 
+# ---- Agent co-editing (Ctrl-Shift-A, L, D; S9) -----------------------------
+
+## The token budget of "Copy for agent".
+PACK_BUDGET := 1500
+
+## Called while the window waits: reloads open files an agent changed on
+## disk (marking the changed lines; a tab with unsaved edits keeps its buffer),
+## and once a second notes changed `.ail` files that are not open.
+fn Workspace.agent_poll(mut self, now int)
+    for i in 0..eds.len()
+        p := watch.poll(eds[i].path, eds[i].lines, eds[i].dirty) else continue
+        if p.reload
+            mut e := eds[i]
+            e.lines = p.lines
+            e.line = e.line.min(e.lines.len() - 1)
+            e.set_col(e.col.min(e.cur().len()))
+            e.indexed = false
+            e.diags = []
+            e.scroll()
+            eds[i] = e
+        message = p.note
+    if now - watch.scanned < 1000
+        return
+    watch.scanned = now
+    mut open := List[str]()
+    for e in eds
+        open.push(e.path)
+    mut names := List[str]()
+    for f in list_files(tree_root, 3, 300)
+        if f.ends_with(".ail") and not open.contains(f)
+            names.push(f)
+    found := watch.changed_files(names)
+    if found.len() > 0
+        message = "agent changed {found.join(", ")}; Ctrl-Shift-D lists"
+
+## The gutter mark of lines an agent changed: `+` after the line number.
+fn Workspace.agent_marks(self, mut s Screen)
+    if watch.hidden
+        return
+    ed := eds[active]
+    x0 := left()
+    for r in 0..ed.text_rows()
+        l := ed.top + r
+        if r + 1 < rows and watch.marked(ed.path, l)
+            mut bg := BG
+            if l == ed.line
+                bg = LINE_BG
+            s.put(r + 1, x0 + ed.gutter_width() - 1, "+", COMMENT_FG, bg)
+
+## Ctrl-Shift-A: the selection (else the cursor's line), the diagnostics on
+## it and the card entries it touches, to the clipboard under the budget.
+fn Workspace.agent_pack(mut self)
+    ed := eds[active]
+    mut a := ed.line
+    mut b := ed.line
+    if r := ed.selection()
+        a = r.line
+        b = r.end_line
+    mut rows_out := List[str]()
+    for d in ed.diags
+        if d.line - 1 >= a and d.line - 1 <= b
+            rows_out.push("{ed.path}:{d.line}:{d.col}: {d.severity}[{d.rule}] {d.message}")
+    mut facts := List[str]()
+    for sy in ed.symbols
+        if sy.line - 1 >= a and sy.line - 1 <= b
+            facts.push(sy.signature)
+            for f in sy.facts
+                facts.push("  {f}")
+    text := agent.pack(ed.path, a, ed.lines[a..b + 1], rows_out, facts, PACK_BUDGET)
+    eds[active].clip = text
+    ui.clipboard_set(text)
+    message = "copied for agent: {agent.tokens(text)} tokens"
+
+fn text_lines(text str) List[str]
+    mut out := text.split("\n")
+    if out.len() > 1 and out[out.len() - 1] == ""
+        out.pop()
+    out
+
+fn Workspace.agent_rows(self, report str) List[Hit]
+    mut out := List[Hit]()
+    for l in report.lines()
+        out.push(Hit(loc: Loc(path: eds[active].path, line: 0, col: 0), text: l))
+    out
+
+## Ctrl-Shift-L: previews the `ail edit` hunks on the clipboard (else in
+## `.agent-edit`) as a diff; pressed again, applies them to the buffer as one
+## undoable edit. A refused edit applies nothing.
+fn Workspace.agent_apply(mut self)
+    ed := eds[active]
+    if watch.pending != "" and hits_title.starts_with("agent edit preview")
+        out := agent.apply_buffer(ail_command(), ed.path, ed.text(), watch.pending, false)
+        watch.pending = ""
+        if not out.ok
+            show_list("agent edit refused; nothing applied", agent_rows(out.report))
+            return
+        mut e := eds[active]
+        old := e.lines
+        e.snapshot()
+        e.lines = text_lines(out.text)
+        e.line = e.line.min(e.lines.len() - 1)
+        e.set_col(e.col.min(e.cur().len()))
+        e.pane = Diags
+        e.scroll()
+        eds[active] = e
+        watch.mark(e.path, agent.changed_lines(old, e.lines))
+        browsing = false
+        message = "applied agent edit; Ctrl-Z undoes"
+        return
+    mut hunks := ""
+    if t := ui.clipboard_get()
+        hunks = t
+    if not agent.looks_like_edit(hunks)
+        hunks = ""
+        file := "{tree_root}/.agent-edit"
+        if fs.exists(file)
+            hunks = fs.read_text(file) else ""
+    if not agent.looks_like_edit(hunks)
+        message = "no edit hunks on the clipboard or in .agent-edit"
+        return
+    out := agent.apply_buffer(ail_command(), ed.path, ed.text(), hunks, true)
+    if not out.ok
+        show_list("agent edit refused", agent_rows(out.report))
+        return
+    if out.report.trim() == ""
+        message = "the agent edit changes nothing"
+        return
+    watch.pending = hunks
+    show_list("agent edit preview; Ctrl-Shift-L applies", agent_rows(out.report))
+
+## Ctrl-Shift-D: open tabs with agent marks and files changed on disk, as a
+## list Enter jumps from.
+fn Workspace.agent_changes(mut self)
+    mut found := List[Hit]()
+    for e in eds
+        n := watch.marked_count(e.path)
+        if n > 0
+            at := Loc(path: e.path, line: watch.first_mark(e.path) + 1, col: 1)
+            found.push(Hit(loc: at, text: "{e.path}: {n} line(s) changed by an agent"))
+    for f in watch.recent
+        found.push(Hit(loc: Loc(path: f, line: 1, col: 1), text: "{f}: changed on disk"))
+    if found.len() == 0
+        message = "no agent changes seen"
+        return
+    show_list("agent changes: {found.len()}", found)
+
+## The active tab's pane as JSON (`--print --json`, D4): what a person sees,
+## for an agent.
+fn Workspace.panel_json(self) str
+    ed := eds[active]
+    mut title := "none"
+    mut found := List[str]()
+    if ed.pane == Text
+        title = hits_title
+        if title == ""
+            title = "text"
+        found = ed.pane_text
+    elif ed.pane == Diags
+        title = "diagnostics"
+        for d in ed.diags
+            found.push("{ed.path}:{d.line}:{d.col}: {d.severity}[{d.rule}] {d.message}")
+    else
+        title = "outline"
+        for o in ed.outline
+            found.push("{o.line}: {o.text}")
+    agent.json_panel(title, found)
+
 # ---- Problems (Ctrl-Shift-M) ----------------------------------------------
 
 ## The rows of `ail check --json` output (standard error), one per
@@ -6803,6 +7011,7 @@ fn Workspace.render_askbar(self, mut s Screen)
 ## Called while the window waits: refreshes the live problems list once
 ## 500 ms have passed since the last edit.
 fn Workspace.idle(mut self, now int)
+    agent_poll(now)
     if live_problems and typed_at > 0 and now - typed_at >= 500
         refresh_problems()
 
@@ -6832,6 +7041,77 @@ fn Workspace.idle(mut self, now int)
 
 ## The files under `dir`, to `depth` levels, skipping hidden and build
 ## directories, at most `limit` of them.
+@test fn agent_changes_reload_and_mark_lines()
+    d := "edit-agent-test.tmp"
+    fs.make_dir(d) else err
+        assert(false)
+    p := "{d}/a.ail"
+    fs.write_text(p, "fn a()\n    1\n") else err
+        assert(false)
+    mut ws := Workspace.new(Editor.new(p, "fn a()\n    1\n", 40, 10))
+    ws.tree_root = d
+    ws.idle(time.now_ms())
+    # Pretend the file was last seen long ago, so the write below counts as a change.
+    ws.watch.stamps = [agent.Stamp(path: p, ms: 1)]
+    fs.write_text(p, "fn a()\n    2\n    3\n") else err
+        assert(false)
+    ws.idle(time.now_ms())
+    assert_eq(ws.eds[0].lines, ["fn a()", "    2", "    3"])
+    assert(not ws.eds[0].dirty)
+    assert(ws.watch.marked(p, 1) and ws.watch.marked(p, 2))
+    assert(not ws.watch.marked(p, 0))
+    assert(ws.message.contains("agent changed"))
+    shown := ws.render()
+    assert(shown.text[2].starts_with("  2+"))
+    assert(not shown.text[1].starts_with("  1+"))
+    ws.start_palette()
+    for c in "agent changes".chars()
+        ws.on_event(press("{c}"))
+    ws.on_event(press("enter"))
+    assert(ws.hits_title.starts_with("agent changes: 1"))
+    assert(ws.hits[0].text.contains("2 line(s)"))
+    assert_eq(ws.hits[0].loc.line, 2)
+    # Unsaved edits are kept when the file changes under them.
+    ws.on_event(press("Z"))
+    ws.watch.stamps = [agent.Stamp(path: p, ms: 1)]
+    fs.write_text(p, "fn a()\n    9\n") else err
+        assert(false)
+    ws.idle(time.now_ms() + 2000)
+    assert(ws.message.contains("unsaved edits kept"))
+    assert_eq(ws.eds[0].lines[0], "Zfn a()")
+    ws.run_command("Toggle agent marks")
+    assert(not ws.render().text[2].starts_with("  2+"))
+    ws.run_command("Toggle agent marks")
+    # A human save makes the file the baseline.
+    ws.watch.saved(p)
+    assert(not ws.watch.marked(p, 1))
+    for f in ["a.ail", ""]
+        fs.remove("{d}/{f}") else err
+            assert(false)
+
+@test fn copy_for_agent_packs_the_selection_and_its_diagnostics()
+    mut ed := Editor.new("t.ail", "fn main()\n    print(1)\n", 40, 10)
+    ed.diags = parse_diags("\{\"severity\":\"error\",\"rule\":\"type.x.1\",\"line\":2,\"col\":5,\"end_line\":2,\"end_col\":10,\"message\":\"bad\"}")
+    mut ws := Workspace.new(ed)
+    ws.eds[0].line = 1
+    ws.on_event(key_event("alt+shift+c"))
+    clip := ws.eds[0].clip
+    assert_eq(clip.split("\n")[0], "t.ail:2")
+    assert(clip.contains("    print(1)"))
+    assert(not clip.contains("fn main()"))
+    assert(clip.contains("t.ail:2:5: error[type.x.1] bad"))
+    assert(ws.message.contains("copied for agent"))
+
+@test fn apply_agent_edit_needs_hunks_and_panels_print_json()
+    mut ws := Workspace.new(typed("x", []))
+    ws.on_event(key_event("alt+shift+v"))
+    assert(ws.message.contains("no edit hunks"))
+    ws.eds[0].pane = Text
+    ws.eds[0].pane_text = ["a", "b"]
+    ws.hits_title = "demo"
+    assert_eq(ws.panel_json(), "\{\"panel\":\"demo\",\"rows\":[\"a\",\"b\"]}")
+    assert_eq(text_lines("a\nb\n"), ["a", "b"])
+
 fn list_files(dir str, depth int, limit int) List[str]
     mut out := List[str]()
     names := fs.list_dir(dir) else return out
@@ -7086,6 +7366,7 @@ fn Workspace.render(self) Screen
     if inner.cursor_row >= 0
         s.cursor_row = inner.cursor_row + 1
         s.cursor_col = inner.cursor_col + x0
+    agent_marks(mut s)
     if tree_open
         render_tree(mut s)
     render_search(mut s)
@@ -7147,6 +7428,7 @@ fn Workspace.window(mut self) ! ui.UiError
     size := w.size()
     on_event(Resize(cols: size.cols, rows: size.rows))
     mut title := ""
+    mut redraw := true
     while not quit
         ed := eds[active]
         mut t := "{ed.path} - edit"
@@ -7158,19 +7440,18 @@ fn Workspace.window(mut self) ! ui.UiError
         if font != w.font_size()
             w.set_font_size(font)
             font = w.font_size()
-        draw_themed(mut w, render(), pal)
-        if live_problems and typed_at > 0
-            # Wait for an event without blocking, so the idle refresh runs.
-            if ev := w.poll_event()
-                on_window_event(ev, w.modifiers())
-            else
-                idle(time.now_ms())
-                time.sleep_ms(25)
-            continue
-        on_window_event(w.next_event(), w.modifiers())
-        while not quit
-            ev := w.poll_event() else break
+        if redraw
+            draw_themed(mut w, render(), pal)
+        redraw = true
+        # Wait for events without blocking, so the idle work runs: the
+        # problems refresh and the agent file watch (S9).
+        if ev := w.poll_event()
             on_window_event(ev, w.modifiers())
+        else
+            before := message
+            idle(time.now_ms())
+            redraw = message != before or live_problems
+            time.sleep_ms(50)
     if remember
         save_session()
     w.close()
@@ -7653,6 +7934,9 @@ fn print_screen(ed Editor, flags List[str])
         elif f == "--task-json"
             print(ws.task_json())
             return
+    if flags.contains("--json")
+        print(ws.panel_json())
+        return
     shown := ws.render()
     if flags.contains("--screen")
         runs := [
@@ -7690,7 +7974,7 @@ fn bench(mut ed Editor)
 fn main() !
     args := env.args()
     if args.contains("--help")
-        print("usage: ail run edit.ail [--font N] [--keys] [--grid] [--welcome] [--git] [--print [--screen] [--check] [--outline] [--explain] [--at=L:C] [--type=TEXT] [--key=KEY]...] [FILE]")
+        print("usage: ail run edit.ail [--font N] [--keys] [--grid] [--welcome] [--git] [--print [--screen] [--check] [--outline] [--explain] [--at=L:C] [--type=TEXT] [--key=KEY]... [--idle] [--json]] [FILE]")
         return
     if args.contains("--keys")
         for l in key_table()
