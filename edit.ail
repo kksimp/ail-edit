@@ -1409,6 +1409,19 @@ fn Editor.diag_here(self) Diag?
         return none
     found[found.len() - 1]
 
+## What a probe, watch or trap showed (plan S7) follows the line.
+fn Editor.render_notes(self, mut s Screen, h int, gw int)
+    if notes.len() == 0
+        return
+    for row in 0..h
+        at := top + row
+        note := notes.get(at) else continue
+        if at >= lines.len()
+            continue
+        col_at := (gw + lines[at].len() - left + 3).max(gw)
+        if col_at < cols
+            s.put(row, col_at, "=> {note}", GUTTER_FG, BG)
+
 fn Editor.render(self) Screen
     mut s := Screen.new(cols, rows)
     h := text_rows()
@@ -1470,13 +1483,7 @@ fn Editor.render(self) Screen
         mark_bracket(mut s, b.end_line, b.end_col)
     if completing
         render_popup(mut s)
-    # What a probe, watch or trap showed (plan S7) follows the line.
-    for r in 0..h
-        if l := notes.get(top + r)
-            if top + r < lines.len()
-                x := (gw + lines[top + r].len() - left + 3).max(gw)
-                if x < cols
-                    s.put(r, x, "=> {l}", GUTTER_FG, BG)
+    render_notes(mut s, h, gw)
     # A diagnostic at the end of a line shows as one marked cell, and the
     # first diagnostic of each line shows its message after the line.
     mut shown := Set[int]()
