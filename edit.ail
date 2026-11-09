@@ -18,10 +18,15 @@ use std.screen.cells as scells
 use themes
 use window as win
 use features.diff as sdiff
+use features.scope
+use features.fold
+use features.multi
+use features.pairs
 use features.semantic as sem
 use features.tests as ttree
 use features.taskpanel as tp
 use features.agent
+use features.ask
 
 # Colors, 0xRRGGBB.
 BG := 0x1e1e1e
@@ -47,6 +52,9 @@ WARN_BG := 0x4d4a1d
 SELECT_BG := 0x264f78
 BRACKET_BG := 0x3b514d
 OCCUR_BG := 0x343a40
+GUIDE_FG := 0x404040
+## Bracket pair colors by depth (features/pairs).
+PAIR_FGS := [0xffd700, 0xda70d6, 0x179fff]
 ## Colors of the semantic layer (slice S3): functions, constants, fields, variants.
 FN_FG := 0xdcdcaa
 CONST_FG := 0x4fc1ff
@@ -125,6 +133,8 @@ struct Snapshot
     lines List[str]
     line int
     col int
+    ## The folded header lines, so undo and redo bring folds back (S2).
+    folded Set[int]
 
 ## What typing goes to while a prompt is open on the status line.
 enum Prompt
@@ -214,6 +224,11 @@ struct Editor
     ## The last tests-on-save result for the status line, or "" (ADR 0354).
     tests str
     comp_sel int
+    ## Editing depth (features/): folded header lines (0-based), the carets
+    ## besides the main one, and zen mode (no panes, no tree).
+    folded Set[int]
+    extra List[multi.Caret]
+    zen bool
     ## The semantic layer (Ctrl-Shift-L): kind colors, code lens, inlay hints, pending fix preview.
     layer sem.State
 
@@ -262,6 +277,9 @@ fn Editor.new(path str, text str, cols int, rows int) Editor
         saves: 0,
         tests: "",
         comp_sel: 0,
+        folded: Set[int](),
+        extra: [],
+        zen: false,
         layer: sem.State.new(),
         selecting: false,
         anchor_line: 0,
@@ -277,7 +295,7 @@ fn Editor.cur(self) List[char]
     lines[line].chars()
 
 fn Editor.snapshot(mut self)
-    undo.push(Snapshot(lines: lines, line: line, col: col))
+    undo.push(Snapshot(lines: lines, line: line, col: col, folded: folded))
     if undo.len() > UNDO_LIMIT
         undo = undo[1..]
     redo = []
@@ -307,6 +325,7 @@ fn Editor.replace(mut self, l1 int, c1 int, l2 int, c2 int, s str)
 
 ## `replace` without an undo snapshot.
 fn Editor.edit(mut self, l1 int, c1 int, l2 int, c2 int, s str)
+    old_n := lines.len()
     before := lines[l1].slice(0, c1)
     after := lines[l2].slice(c2, lines[l2].len())
     mut parts := s.split("\n")
@@ -322,6 +341,8 @@ fn Editor.edit(mut self, l1 int, c1 int, l2 int, c2 int, s str)
     lines.extend(tail)
     line = l1 + end
     set_col(end_col)
+    if folded.len() > 0 and lines.len() != old_n
+        folded = fold.shift(folded, l2, lines.len() - old_n)
 
 fn Editor.insert(mut self, s str)
     replace(line, col, line, col, s)
@@ -383,19 +404,21 @@ fn Editor.undo_last(mut self)
     s := undo.pop() else
         message = "nothing to undo"
         return
-    redo.push(Snapshot(lines: lines, line: line, col: col))
+    redo.push(Snapshot(lines: lines, line: line, col: col, folded: folded))
     restore(s)
 
 fn Editor.redo_last(mut self)
     s := redo.pop() else
         message = "nothing to redo"
         return
-    undo.push(Snapshot(lines: lines, line: line, col: col))
+    undo.push(Snapshot(lines: lines, line: line, col: col, folded: folded))
     restore(s)
 
 fn Editor.restore(mut self, s Snapshot)
     selecting = false
     lines = s.lines
+    folded = s.folded
+    extra = []
     line = s.line
     set_col(s.col)
     diags = []
@@ -629,9 +652,9 @@ fn Editor.bracket_match(self) Range?
     if c < 0 or c >= cs.len()
         return none
     ch := cs[c]
-    pairs := "()[]\{}".chars()
-    i := pairs.index_of(ch) else return none
-    other := pairs[i + 1 - 2 * (i % 2)]
+    brackets := "()[]\{}".chars()
+    i := brackets.index_of(ch) else return none
+    other := brackets[i + 1 - 2 * (i % 2)]
     mut step := 1
     if i % 2 == 1
         step = -1
@@ -935,7 +958,7 @@ fn typed_word(cmd Command) str?
             t
         Newline | Tab | Backspace | Delete | Go(_) | Select(_) | SelectAll | Copy | Cut => none
         Paste | Undo | Redo | Find | FindNext | Fix | Escape | Quit | Resize(_, _) => none
-        Replace | ReplaceAll | GoToLine | ToggleComment | DuplicateLine | MoveLine(_) => none
+        Replace | ReplaceAll | GoToLine | ToggleComment | DuplicateLine | MoveLine(_) | Depth(_) => none
         Complete | GoToDefinition | Hover | Format | Rename | Save | Check | Explain | Outline | ToggleRegex => none
 
 fn Editor.accept_completion(mut self)
@@ -1138,7 +1161,7 @@ fn Editor.text_rows(self) int
     (rows - 1 - pane_rows()).max(1)
 
 fn Editor.pane_rows(self) int
-    if rows < 10
+    if rows < 10 or zen
         return 0
     if pane == Outline or pane == Text
         return (rows / 3).max(4)
@@ -1163,8 +1186,8 @@ fn Editor.go(mut self, d Dir)
             elif line + 1 < lines.len()
                 line += 1
                 set_col(0)
-        Up => move_to_line(line - 1)
-        Down => move_to_line(line + 1)
+        Up => move_to_line(visible_step(-1))
+        Down => move_to_line(visible_step(1))
         PageUp => move_to_line(line - text_rows())
         PageDown => move_to_line(line + text_rows())
         Top =>
@@ -1200,10 +1223,20 @@ fn Editor.go(mut self, d Dir)
 ## Scrolls so the cursor is inside the view.
 fn Editor.scroll(mut self)
     h := text_rows()
-    if line < top
-        top = line
-    if line >= top + h
-        top = line - h + 1
+    if folded.len() > 0
+        folded = fold.reveal(lines, fold.prune(lines, folded), line)
+        ht := fold.hidden(lines, folded)
+        rt := fold.rank(ht, top)
+        rl := fold.rank(ht, line)
+        if rl < rt
+            top = fold.nth(ht, rl)
+        if rl >= rt + h
+            top = fold.nth(ht, rl - h + 1)
+    else
+        if line < top
+            top = line
+        if line >= top + h
+            top = line - h + 1
     w := (cols - gutter_width()).max(1)
     if col < left
         left = col
@@ -1376,6 +1409,12 @@ fn Screen.band(mut self, row int, bg int)
     spans.push(Span(row: row, col: 0, text: " ".repeat(cols), fg: bg, bg: bg))
 
 ## Writes `s` at `col` of `row`, clipped to the screen.
+## Restyles `s` at `col` of `row` without changing the row's plain text.
+fn Screen.mark(mut self, row int, col int, s str, fg int, bg int)
+    if row < 0 or row >= rows or col < 0 or col >= cols
+        return
+    spans.push(Span(row: row, col: col, text: s, fg: fg, bg: bg))
+
 fn Screen.put(mut self, row int, col int, s str, fg int, bg int)
     if row < 0 or row >= rows or col >= cols
         return
@@ -1440,9 +1479,21 @@ fn Editor.render(self) Screen
     for l in 0..top.min(lines.len())
         if lines[l].contains(TRIPLE)
             inside = ends_in_triple(lines[l].chars(), inside)
+    ht := fold.hidden(lines, folded)
+    first_row := fold.rank(ht, top)
+    mut scanned := 0
+    mut depth := 0
+    mut extra_sel := List[Range]()
+    for c in extra
+        extra_sel.push(Range(
+            line: multi.start_line(c),
+            col: multi.start_col(c),
+            end_line: multi.end_line(c),
+            end_col: multi.end_col(c),
+        ))
     for r in 0..h
-        l := top + r
-        if l >= lines.len()
+        l := fold.nth(ht, first_row + r)
+        if l < 0
             break
         starts_inside := inside
         if lines[l].contains(TRIPLE)
@@ -1454,6 +1505,8 @@ fn Editor.render(self) Screen
         num := "{l + 1}"
         if missed.contains(l)
             s.put(r, 0, "{num.pad_left(gw - 1, ' ')}!", ERROR_FG, bg)
+        elif folded.contains(l)
+            s.put(r, 0, "{num.pad_left(gw - 1, ' ')}>", GUTTER_FG, bg)
         elif git_marks.contains(l)
             s.put(r, 0, "{num.pad_left(gw - 1, ' ')}+", COMMENT_FG, bg)
         elif impact.contains(l)
@@ -1461,6 +1514,15 @@ fn Editor.render(self) Screen
         else
             s.put(r, 0, "{num.pad_left(gw - 1, ' ')} ", GUTTER_FG, bg)
         cs := lines[l].chars()
+        while scanned < l
+            depth = pairs.scan(lines[scanned], depth).depth
+            scanned += 1
+        sc := pairs.scan(lines[l], depth)
+        depth = sc.depth
+        scanned = l + 1
+        if folded.contains(l)
+            hidden_n := fold.end_of(lines, l) - l
+            s.put(r, (gw + cs.len() - left + 1).max(gw), "... {hidden_n} lines", GUTTER_FG, bg)
         if left >= cs.len()
             continue
         mut fgs := line_colors(cs, starts_inside)
@@ -1473,7 +1535,12 @@ fn Editor.render(self) Screen
             mut cell := bg
             if marks[k]
                 cell = OCCUR_BG
-            bgs.push(sel_bg(sel, l, k, diag_bg(diags, l, k, cell)))
+            mut shade := sel_bg(sel, l, k, diag_bg(diags, l, k, cell))
+            for xr in extra_sel
+                shade = sel_bg(xr, l, k, shade)
+            bgs.push(shade)
+            if sc.levels[k] > 0
+                fgs[k] = PAIR_FGS[(sc.levels[k] - 1) % PAIR_FGS.len()]
         mut i := left
         while i < end
             fg := fgs[i]
@@ -1483,6 +1550,13 @@ fn Editor.render(self) Screen
                 j += 1
             s.put(r, gw + i - left, cs[i..j].join(""), fg, b)
             i = j
+        # Indent guides: styled cells only, so the row's text is unchanged.
+        if cs.len() > 0 and cs[0] == ' '
+            mut g := 0
+            while g < indent_of(lines[l])
+                if g >= left and gw + g - left < cols
+                    s.mark(r, gw + g - left, "|", GUIDE_FG, bg)
+                g += INDENT
     # The bracket at the cursor and its match.
     for b in brackets
         mark_bracket(mut s, b.line, b.col)
@@ -1513,6 +1587,22 @@ fn Editor.render(self) Screen
             x := (gw + n - left + 3).max(gw)
             if x < cols
                 s.put(r, x, "-- {d.message}", fg, line_bg)
+    # Extra carets are drawn as inverted cells.
+    for c in extra
+        xr := c.line - top
+        if xr >= 0 and xr < h and not ht[c.line]
+            n_chars := lines[c.line].len()
+            mut ch := lines[c.line].slice(c.col.min(n_chars), (c.col + 1).min(n_chars))
+            if ch == ""
+                ch = " "
+            xc := gw + c.col - left
+            if xc >= gw and xc < cols
+                s.mark(xr, xc, ch, BG, FG)
+    # The enclosing declaration stays on the first row once its line scrolls off.
+    if top > 0 and top < lines.len() and first_row == top
+        if hd := scope.sticky(lines, top)
+            s.put(0, 0, " ".repeat(gw), GUTTER_FG, PANE_BG)
+            s.put(0, gw, lines[hd].pad_right((cols - gw).max(0), ' '), KEYWORD_FG, PANE_BG)
     if layer.level > 0 or layer.hints_on
         render_ghosts(mut s, h, gw, shown)
     status_row := h
@@ -1531,6 +1621,13 @@ fn Editor.render(self) Screen
     s.put(status_row, 0, left_part, STATUS_FG, STATUS_BG)
     if message != ""
         s.put(status_row, left_part.len() + 2, "| {message}", STATUS_FG, STATUS_BG)
+    # The breadcrumbs sit at the right when there is room.
+    mut trail := scope.crumbs(lines, line)
+    used := left_part.chars().len() + 4 + message.chars().len()
+    if extra.len() > 0
+        trail = "{extra.len() + 1} carets  {trail}"
+    if trail != "" and used + trail.chars().len() + 2 < cols
+        s.put(status_row, cols - trail.chars().len() - 1, trail, STATUS_FG, STATUS_BG)
     render_pane(mut s, status_row + 1)
     if line >= top and line < top + h
         s.cursor_row = line - top
@@ -1640,6 +1737,226 @@ fn Editor.render_pane(self, mut s Screen, first int)
                 s.put(r, 1, "{item.line:>5}  {item.text}", FG, bg)
                 r += 1
 
+# ---- Editing depth (features/; editor plan S2) ----------------------------
+
+## The line `d` (-1 or 1) rows from the cursor in the folded view.
+fn Editor.visible_step(self, d int) int
+    if folded.len() == 0
+        return line + d
+    ht := fold.hidden(lines, folded)
+    n := lines.len()
+    mut l := line + d
+    while l > 0 and l < n - 1 and ht[l]
+        l += d
+    l = l.max(0).min(n - 1)
+    if ht[l]
+        return line
+    l
+
+## The main caret as a `multi.Caret`, with the selection when there is one.
+fn Editor.main_caret(self) multi.Caret
+    if selecting
+        return multi.span(anchor_line, anchor_col, line, col, 1)
+    multi.at(line, col, 1)
+
+## Takes carets back from `features/multi`: the one tagged 1 is the main caret.
+fn Editor.set_carets(mut self, cs List[multi.Caret])
+    mut rest := List[multi.Caret]()
+    for c in cs
+        if c.tag == 1
+            line = c.line
+            set_col(c.col)
+            selecting = not multi.empty(c)
+            anchor_line = c.anchor_line
+            anchor_col = c.anchor_col
+        else
+            rest.push(multi.span(c.anchor_line, c.anchor_col, c.line, c.col, 0))
+    extra = rest
+
+## Makes the result of a multi-caret edit the buffer, as one undo step.
+fn Editor.multi_apply(mut self, e multi.Edited)
+    snapshot()
+    lines = e.lines
+    set_carets(e.carets)
+    folded = fold.prune(lines, folded)
+
+fn dir_name(d Dir) str
+    match d
+        Left => "left"
+        Right => "right"
+        Up => "up"
+        Down => "down"
+        WordLeft => "word_left"
+        WordRight => "word_right"
+        Home => "home"
+        End => "end"
+        PageUp | PageDown | Top | Bottom => ""
+
+## Keys while there are extra carets: typing, deleting and moving happen at
+## every caret. True if `cmd` was handled; anything else drops the extras.
+fn Editor.multi_key(mut self, cmd Command) bool
+    all := multi.prepare(main_caret(), extra)
+    match cmd
+        Insert(t) => multi_apply(multi.replace_all(lines, all, t))
+        Paste => multi_apply(multi.replace_all(lines, all, clip))
+        Tab =>
+            mut texts := List[str]()
+            for c in all
+                texts.push(" ".repeat(INDENT - multi.start_col(c) % INDENT))
+            multi_apply(multi.replace_each(lines, all, texts))
+        Newline =>
+            mut texts := List[str]()
+            for c in all
+                head := lines[multi.start_line(c)].slice(0, multi.start_col(c))
+                mut n := indent_of(head).min(multi.start_col(c))
+                if opens_block(head)
+                    n += INDENT
+                texts.push("\n{" ".repeat(n)}")
+            multi_apply(multi.replace_each(lines, all, texts))
+        Backspace => multi_apply(multi.replace_all(lines, multi.grow_back(lines, all), ""))
+        Delete => multi_apply(multi.replace_all(lines, multi.grow_forward(lines, all), ""))
+        Go(d) =>
+            name := dir_name(d)
+            if name == ""
+                extra = []
+                return false
+            set_carets(multi.move_each(lines, all, name, false))
+        Select(d) =>
+            name := dir_name(d)
+            if name == ""
+                extra = []
+                return false
+            set_carets(multi.move_each(lines, all, name, true))
+        Escape =>
+            extra = []
+            selecting = false
+        Depth(_) | Resize(_, _) | Quit => return false
+        _ =>
+            extra = []
+            return false
+    true
+
+## Alt-D: select the word under the cursor, then each next occurrence of the
+## selection as another caret (the newest is the main one).
+fn Editor.add_next(mut self)
+    if selection() == none
+        w := word_at() else
+            message = "no word here"
+            return
+        selecting = true
+        anchor_line = w.line
+        anchor_col = w.col
+        line = w.end_line
+        set_col(w.end_col)
+        return
+    word := selected_text()
+    if word.contains("\n")
+        message = "select within one line to add the next one"
+        return
+    all := multi.prepare(main_caret(), extra)
+    last := all[all.len() - 1]
+    found := multi.occurrence_after(lines, word, multi.end_line(last), multi.end_col(last)) else
+        message = "no other `{word}`"
+        return
+    for c in all
+        if multi.start_line(c) == multi.start_line(found)
+            and multi.start_col(c) == multi.start_col(found)
+            message = "all {all.len()} `{word}` are selected"
+            return
+    mut cs := List[multi.Caret]()
+    for c in all
+        cs.push(multi.span(c.anchor_line, c.anchor_col, c.line, c.col, 0))
+    cs.push(multi.span(found.anchor_line, found.anchor_col, found.line, found.col, 1))
+    set_carets(cs)
+    message = "{cs.len()} carets"
+
+## Alt-A: a caret on every occurrence of the selection (or the word here).
+fn Editor.select_occurrences(mut self)
+    mut word := selected_text()
+    if selection() == none
+        w := word_at() else
+            message = "no word here"
+            return
+        word = lines[w.line].slice(w.col, w.end_col)
+    if word == "" or word.contains("\n")
+        message = "select a word first"
+        return
+    found := multi.occurrences(lines, word)
+    mut cs := List[multi.Caret]()
+    for k in 0..found.len()
+        c := found[k]
+        mut tag := 0
+        if k == found.len() - 1
+            tag = 1
+        cs.push(multi.span(c.anchor_line, c.anchor_col, c.line, c.col, tag))
+    set_carets(cs)
+    message = "{cs.len()} carets on `{word}`"
+
+## Alt-Shift-Up and Alt-Shift-Down: another caret one line above or below.
+fn Editor.add_vertical(mut self, d int)
+    all := multi.prepare(main_caret(), extra)
+    mut base := all[0]
+    if d > 0
+        base = all[all.len() - 1]
+    c := multi.vertical(lines, base, d) else
+        message = "no line there"
+        return
+    mut cs := List[multi.Caret]()
+    for o in all
+        cs.push(multi.span(o.anchor_line, o.anchor_col, o.line, o.col, 0))
+    cs.push(multi.span(c.anchor_line, c.anchor_col, c.line, c.col, 1))
+    set_carets(cs)
+    message = "{cs.len()} carets"
+
+## Alt-click: a caret at the clicked place.
+fn Editor.add_caret_at(mut self, c int, r int)
+    p := position_at(c, r) else return
+    mut cs := List[multi.Caret]()
+    for o in multi.prepare(main_caret(), extra)
+        cs.push(multi.span(o.anchor_line, o.anchor_col, o.line, o.col, 0))
+    cs.push(multi.at(p.line, p.col, 1))
+    set_carets(cs)
+
+## Folds the block at the cursor, or unfolds it.
+fn Editor.toggle_fold(mut self)
+    h := fold.header_for(lines, line) else
+        message = "nothing to fold here"
+        return
+    if folded.contains(h)
+        folded.remove(h)
+        message = "unfolded line {h + 1}"
+        return
+    folded.add(h)
+    line = h
+    col = col.min(lines[h].len())
+    message = "folded line {h + 1}: {fold.end_of(lines, h) - h} lines (Ctrl-Shift-[ opens)"
+
+## The editing-depth commands: one dispatch for `features/`.
+fn Editor.depth(mut self, act str)
+    if act == "next"
+        add_next()
+    elif act == "all"
+        select_occurrences()
+    elif act == "above"
+        add_vertical(-1)
+    elif act == "below"
+        add_vertical(1)
+    elif act == "fold"
+        toggle_fold()
+    elif act == "unfold_all"
+        folded = Set[int]()
+        message = "all folds open"
+    elif act == "fold_all"
+        folded = fold.top_level(lines)
+        ht := fold.hidden(lines, folded)
+        while line > 0 and ht[line]
+            line -= 1
+        col = col.min(lines[line].len())
+        message = "folded {folded.len()} blocks (Ctrl-Shift-] opens them)"
+    elif act == "zen"
+        zen = not zen
+        message = "zen mode {on_off(zen)}"
+
 # ---- Commands -----------------------------------------------------------
 
 enum Command
@@ -1669,6 +1986,9 @@ enum Command
     ToggleComment
     DuplicateLine
     MoveLine(down bool)
+    ## Editing depth (features/): next, all, above, below, fold, unfold_all,
+    ## fold_all or zen.
+    Depth(act str)
     # These reach the file system or run `ail`; `Editor.run` handles them.
     Complete
     GoToDefinition
@@ -1694,6 +2014,9 @@ fn Editor.apply(mut self, cmd Command)
         scroll()
         return
     if prompt != NoPrompt and prompt_key(cmd)
+        scroll()
+        return
+    if extra.len() > 0 and multi_key(cmd)
         scroll()
         return
     match cmd
@@ -1758,6 +2081,7 @@ fn Editor.apply(mut self, cmd Command)
         ToggleComment => toggle_comment()
         DuplicateLine => duplicate_line()
         MoveLine(down) => move_line(down)
+        Depth(act) => depth(act)
         Complete => open_completion()
         GoToDefinition => go_to_definition()
         Hover => hover()
@@ -1899,7 +2223,7 @@ fn Editor.prompt_key(mut self, cmd Command) bool
             message = ""
         Tab | Delete | Go(_) | Select(_) | SelectAll | Copy | Cut | Paste => return close_prompt()
         Undo | Redo | Find | Fix | GoToLine | ToggleComment | DuplicateLine => return close_prompt()
-        MoveLine(_) | Complete | GoToDefinition | Hover | Format | Rename => return close_prompt()
+        MoveLine(_) | Depth(_) | Complete | GoToDefinition | Hover | Format | Rename => return close_prompt()
         Quit | Resize(_, _) | Save | Check | Explain | Outline => return close_prompt()
     true
 
@@ -2025,6 +2349,14 @@ fn go_or_select(d Dir, shift bool) Command
         return Select(d)
     Go(d)
 
+## Alt-Up and Alt-Down move the line; with Shift they add a caret there.
+fn alt_vertical(down bool, shift bool) Command
+    if shift and down
+        return Depth("below")
+    if shift
+        return Depth("above")
+    MoveLine(down)
+
 ## The command for a key from `std.ui` (`Event.Key`), or `none`.
 fn key_command(key str, ctrl bool, alt bool, shift bool) Command?
     if alt and shift and (key == "f" or key == "F")
@@ -2049,6 +2381,8 @@ fn key_command(key str, ctrl bool, alt bool, shift bool) Command?
             "g" | "G" => GoToLine
             "d" | "D" => DuplicateLine
             "i" | "I" => Hover
+            "[" | "\{" => Depth("fold")
+            "]" | "}" => Depth("unfold_all")
             "/" => ToggleComment
             " " => Complete
             "enter" => ReplaceAll
@@ -2059,8 +2393,9 @@ fn key_command(key str, ctrl bool, alt bool, shift bool) Command?
             _ => none
     if alt
         return match key
-            "up" => MoveLine(false)
-            "down" => MoveLine(true)
+            "up" => alt_vertical(false, shift)
+            "down" => alt_vertical(true, shift)
+            "d" | "D" => Depth("next")
             _ => none
     match key
         "enter" => Newline
@@ -2079,6 +2414,7 @@ fn key_command(key str, ctrl bool, alt bool, shift bool) Command?
         "f1" => Explain
         "f3" => FindNext
         "f12" => GoToDefinition
+        "f11" => Depth("zen")
         "f2" => Rename
         _ =>
             if key.len() == 1
@@ -3299,6 +3635,45 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     ws.on_event(key_event("ctrl+p"))
     assert(ws.picking and not ws.commanding)
 
+@test fn the_ask_bar_types_and_shows_its_prompt()
+    mut ws := Workspace.new(typed("fn main()\n    print(1)", []))
+    ws.on_event(key_event("ctrl+shift+a"))
+    assert(ws.askbar.open)
+    for k in ["w", "h", "o"]
+        ws.on_event(press(k))
+    assert(ws.render().text[0].contains(" ask: who"))
+    ws.on_event(press("escape"))
+    assert(not ws.askbar.open)
+    ws.on_event(key_event("ctrl+t"))
+    assert(ws.render().text[0].starts_with(" go to symbol: "))
+    ws.on_event(press("enter"))
+    assert(not ws.askbar.open)
+
+@test fn ask_rows_become_jumpable_hits()
+    got := ask_hits([
+        ask.Site(file: "", line: 0, col: 0, id: "fn:f", kind: "head", text: "fn:f  (1)"),
+        ask.Site(
+            file: "a.ail",
+            line: 3,
+            col: 2,
+            id: "fn:g",
+            kind: "site",
+            text: "  a.ail:3:2: fn:g  call",
+        ),
+    ])
+    assert_eq(got.len(), 2)
+    assert_eq(got[0].loc.line, 0)
+    assert_eq(got[1].loc, Loc(path: "a.ail", line: 3, col: 2))
+    assert_eq(got[1].text, "  a.ail:3:2: fn:g  call")
+
+@test fn the_token_meter_sits_on_the_status_row()
+    mut ws := Workspace.new(typed("fn main()\n    print(1)", []))
+    ws.askbar.counted("", 0, 42)
+    row := ws.render().text[1 + ws.eds[0].text_rows()]
+    assert(row.ends_with(" tok 42 "))
+    ws.askbar.selected(7)
+    assert(ws.render().text[1 + ws.eds[0].text_rows()].ends_with(" tok 42 (sel 7) "))
+
 @test fn project_search_fills_the_pane_and_jumps()
     hits := search_text("a.ail", "fn main()\n    total := 1\n    print(total)", "total")
     assert_eq(hits.len(), 2)
@@ -3759,6 +4134,7 @@ fn Editor.on_mouse(mut self, c int, r int, button str, kind str)
         return
     if p := position_at(c, r)
         if kind == "down"
+            extra = []
             selecting = true
             anchor_line = p.line
             anchor_col = p.col
@@ -4044,6 +4420,41 @@ fn key_rows() List[KeyRow]
         key_row("Ctrl-D", "Duplicate line", "ctrl+d", "Duplicate the line or selected lines"),
         key_row("Alt-Up", "Move line up", "alt+up", "Move the line or selected lines up"),
         key_row("Alt-Down", "Move line down", "alt+down", "Move the line or selected lines down"),
+        key_row(
+            "Alt-D",
+            "Add next occurrence",
+            "alt+d",
+            "Select the word under the cursor; again, add a caret at its next occurrence. With several carets typing, Enter, Tab, Backspace, Delete, paste and moves act at every caret; Escape or a click drops the extras",
+        ),
+        key_row("Alt-Shift-Up", "Add caret above", "alt+shift+up", "Add a caret on the line above"),
+        key_row(
+            "Alt-Shift-Down",
+            "Add caret below",
+            "alt+shift+down",
+            "Add a caret on the line below",
+        ),
+        key_row("Alt-click", "", "", "Add a caret at the clicked place (window)"),
+        key_row(
+            "Ctrl-Shift-[",
+            "Fold or unfold block",
+            "ctrl+shift+[",
+            "Fold the block the cursor is in (AIL blocks are indentation), or open it; the gutter shows `+` on a folded line. Folds survive edits and undo",
+        ),
+        key_row("Ctrl-Shift-]", "Unfold all", "ctrl+shift+]", "Open every fold"),
+        key_row(
+            "palette",
+            "Select all occurrences",
+            "",
+            "A caret on every occurrence of the selection (or the word here)",
+        ),
+        key_row("palette", "Fold all", "", "Fold every top-level block; Ctrl-Shift-] opens them"),
+        key_row("F11", "Zen mode", "f11", "Hide the file tree and the pane"),
+        key_row(
+            "Ctrl-\\",
+            "Split view",
+            "ctrl+\\",
+            "Show the next tab beside this one; again closes the split (Ctrl-Tab changes which tab is edited)",
+        ),
         key_row("Ctrl-G", "Go to line", "ctrl+g", "Go to a line number"),
         key_row("Ctrl-Z", "Undo", "ctrl+z", "Undo"),
         key_row("Ctrl-Y", "Redo", "ctrl+y", "Redo"),
@@ -4280,6 +4691,36 @@ fn key_rows() List[KeyRow]
             "Search every `.ail` file under the directory (open tabs as edited); the matches fill the pane, Up/Down select, Enter jumps, Esc closes (ADR 0292)",
         ),
         key_row(
+            "Ctrl-Shift-A",
+            "Ask",
+            "ctrl+shift+a",
+            "Ask the program a question in plain words (`ail ask`: who writes F, who reads F, what calls f, what does f call, which effects reach f, who uses T); the answers fill the pane, Up/Down select, Enter jumps (api.ask.1-6)",
+        ),
+        key_row(
+            "Alt-Shift-H",
+            "Call hierarchy",
+            "alt+shift+h",
+            "The callers and callees of the function under the cursor, three levels down (`ail ask`); Up/Down, Enter jumps to a call",
+        ),
+        key_row(
+            "Ctrl-T",
+            "Go to symbol",
+            "ctrl+t",
+            "Type part of a declaration's text: matches in every `.ail` file under the directory (`ail api --text`); Up/Down, Enter jumps",
+        ),
+        key_row(
+            "palette",
+            "Count tokens",
+            "",
+            "Count the tokens of the buffer and of the selection (`ail api --tokens`) and say so in the message",
+        ),
+        key_row(
+            "palette",
+            "Toggle token meter",
+            "",
+            "Show or hide the file's token count at the right of the status row (shown by default; refreshed on save)",
+        ),
+        key_row(
             "F4",
             "Next search result",
             "f4",
@@ -4408,6 +4849,7 @@ enum WsKey
     References
     ReplaceInFiles
     TestOnSave
+    Split
     Sem(key str)
     TestTool(mode str)
     TaskPanel
@@ -4415,6 +4857,9 @@ enum WsKey
     TaskVerify
     AgentPack
     AgentApply
+    AskBar
+    Symbols
+    Hierarchy
     Zoom(key str)
     Diff(kind str)
 
@@ -4423,6 +4868,7 @@ fn workspace_key(k str, ctrl bool, alt bool, shift bool) WsKey?
         return match k
             "c" | "C" => AgentPack
             "v" | "V" => AgentApply
+            "h" | "H" => Hierarchy
             _ => none
     if not ctrl
         if k == "f4" and not shift
@@ -4444,6 +4890,8 @@ fn workspace_key(k str, ctrl bool, alt bool, shift bool) WsKey?
         return NextTab
     if k == "=" or k == "+" or k == "-" or k == "0"
         return Zoom(k)
+    if k == "\\"
+        return Split
     if shift
         return match k
             "." | ">" => Sem("x")
@@ -4463,12 +4911,14 @@ fn workspace_key(k str, ctrl bool, alt bool, shift bool) WsKey?
             "z" | "Z" => TestTool("shrink")
             "x" | "X" => TestTool("contracts")
             "k" | "K" => TaskPanel
+            "a" | "A" => AskBar
             _ => none
     match k
         "b" | "B" => Tree
         "w" | "W" => CloseTab
         "q" | "Q" => QuitAll
         "p" | "P" => OpenFile
+        "t" | "T" => Symbols
         _ => none
 
 ## The palette's rows matching what is typed: those that run a command
@@ -4520,6 +4970,8 @@ fn Workspace.run_command(mut self, name str)
         "Toggle zen mode" => zen = not zen
         "API diff" => diff_view("api")
         "Git change gutter" => diff_view("gutter")
+        "Select all occurrences" => eds[active].run(Depth("all"))
+        "Fold all" => eds[active].run(Depth("fold_all"))
         "Semantic layer" => eds[active].layer_key("l")
         "Fix with ail fix" => eds[active].layer_key("y")
         "Update preview" => test_tool("preview")
@@ -4530,6 +4982,8 @@ fn Workspace.run_command(mut self, name str)
         "Toggle agent marks" =>
             watch.hidden = not watch.hidden
             message = "agent marks {on_off(not watch.hidden)}"
+        "Count tokens" => token_report()
+        "Toggle token meter" => askbar.toggle()
         _ => message = "no command `{name}`"
 
 # ---- Tabs ---------------------------------------------------------------
@@ -4589,11 +5043,15 @@ struct Workspace
     ## Ctrl-Shift-U: run the tab's tests after each save (ADR 0354).
     test_on_save bool
     typed_at int
+    ## Ctrl-\\: show the next tab beside this one (features/ split view).
+    splitting bool
     ## Palette toggles of the window: the minimap and zen mode.
     minimap bool
     zen bool
     ## Agent co-editing (S9): file stamps, agent marks, a pending edit preview.
     watch agent.State
+    ## The ask bar and the token meter (features/ask, plan S8).
+    askbar ask.Bar
 
 fn Workspace.new(ed Editor) Workspace
     Workspace(
@@ -4632,9 +5090,11 @@ fn Workspace.new(ed Editor) Workspace
         live_problems: false,
         test_on_save: false,
         typed_at: 0,
+        splitting: false,
         minimap: false,
         zen: false,
         watch: agent.new_state(),
+        askbar: ask.Bar.new(),
     )
 
 ## The file name a tab shows: the path after its last `/`.
@@ -4708,6 +5168,9 @@ fn Workspace.on_event(mut self, ev ui.Event)
     if searching
         search_event(ev)
         return
+    if askbar.open
+        askbar_event(ev)
+        return
     if browsing and repl_step == 3
         if ev == Key(key: "enter", ctrl: true, alt: false, shift: false)
             apply_replace()
@@ -4744,6 +5207,7 @@ fn Workspace.on_event(mut self, ev ui.Event)
                     OpenFile => start_picking()
                     Palette => start_palette()
                     Zoom(z) => zoom(z)
+                    Split => split_view()
                     Sem(z) => eds[active].layer_key(z)
                     Search => start_search()
                     NextHit => next_hit()
@@ -4763,6 +5227,9 @@ fn Workspace.on_event(mut self, ev ui.Event)
                     TaskVerify => task_action("verify")
                     AgentPack => agent_pack()
                     AgentApply => agent_apply()
+                    AskBar => askbar.start(0)
+                    Symbols => askbar.start(1)
+                    Hierarchy => show_hierarchy()
                     TestOnSave =>
                         test_on_save = not test_on_save
                         if test_on_save
@@ -4796,6 +5263,8 @@ fn Workspace.on_event(mut self, ev ui.Event)
                     click_tree(r)
                 return
             tree_focus = false
+            if splitting and c >= left() + split_half()
+                return
             if kind == "down" and button == "left"
                 ed := eds[active]
                 if loc := ed.pane_location(r - 1 - ed.text_rows() - 1)
@@ -4807,6 +5276,20 @@ fn Workspace.on_event(mut self, ev ui.Event)
         Scroll(_) => eds[active].on_event(ev)
     if eds[active].quit
         close_tab()
+        return
+    askbar_refresh()
+
+## Ctrl-\\: shows the next tab beside this one, or closes the split.
+fn Workspace.split_view(mut self)
+    if eds.len() < 2
+        message = "open a second file (Ctrl-P) to split the view"
+        return
+    splitting = not splitting
+    message = "split view {on_off(splitting)}: the next tab is on the right"
+
+## The columns the left pane gets when the view is split.
+fn Workspace.split_half(self) int
+    ((cols - left()) / 2).max(10)
 
 ## After a save, checks every other open tab too, since a change can break
 ## a file that uses it; each tab's label shows its counts (ADR 0293).
@@ -4950,7 +5433,7 @@ struct TreeRow
 
 ## The tree's width in columns, the separator included; 0 when closed.
 fn Workspace.left(self) int
-    if not tree_open
+    if not tree_open or eds[active].zen
         return 0
     TREE_W + 1
 
@@ -6166,6 +6649,156 @@ fn Workspace.refresh_problems(mut self)
     hit_sel = sel
     fill_hits()
 
+# ---- Ask bar, call hierarchy, symbols, tokens (features/ask, plan S8) -------
+
+## The rows of an answer as hits; heading rows have line 0 and don't jump.
+fn ask_hits(rows List[ask.Site]) List[Hit]
+    mut out := List[Hit]()
+    for s in rows
+        out.push(Hit(loc: Loc(path: s.file, line: s.line, col: s.col), text: s.text))
+    out
+
+## The file `ail` should read for the active tab: the saved file, or a copy
+## beside it when the buffer has unsaved changes (so imports still resolve).
+fn Workspace.ask_source(mut self) str?
+    ed := eds[active]
+    if not ed.dirty
+        return ed.path
+    file := "{ed.path}.edit-check.ail"
+    fs.write_text(file, ed.text()) else err
+        message = "can't write {err.path}: {err.kind}"
+        return none
+    file
+
+fn Workspace.ask_release(mut self, file str)
+    if file != eds[active].path
+        fs.remove(file) else err
+            message = "can't remove {err.path}: {err.kind}"
+
+fn Workspace.askbar_event(mut self, ev ui.Event)
+    match ev
+        Key(k, ctrl, _, _) =>
+            if ctrl
+                return
+            if askbar.key(k) == "run"
+                askbar_run()
+        Close => quit_all()
+        Resize(_, _) => on_resize(ev)
+        Mouse(_, _, _, _) | Scroll(_) => return
+
+## Enter in the bar: asks the question, or searches the symbols.
+fn Workspace.askbar_run(mut self)
+    q := askbar.text.trim()
+    if q == ""
+        return
+    if askbar.mode == 1
+        go_symbols(q)
+        return
+    if eds[active].path == ""
+        message = "ask needs a saved file"
+        return
+    file := ask_source() else return
+    got := ask.query(ail_command(), file, eds[active].path, q)
+    ask_release(file)
+    if got.problem != ""
+        message = got.problem
+        return
+    if not ask.has_sites(got.rows)
+        message = "no answers for `{q}`"
+        return
+    show_list("ask `{q}`", ask_hits(got.rows))
+
+## Declarations matching `q` in every `.ail` file under the directory.
+fn Workspace.go_symbols(mut self, q str)
+    mut found := List[ask.Site]()
+    for f in list_files(tree_root, 4, 300)
+        if not f.ends_with(".ail") or f.ends_with(".edit-check.ail")
+            continue
+        r := proc.run(ail_command(), ["api", "--text", f]) else continue
+        for s in ask.symbol_rows(r.out, f, q)
+            if found.len() < 200
+                found.push(s)
+    if found.len() == 0
+        message = "no declaration matches `{q}`"
+        return
+    show_list("symbols `{q}`: {found.len()}", ask_hits(found))
+
+## Ctrl-Shift-Y: callers, then callees, of the function under the cursor.
+fn Workspace.show_hierarchy(mut self)
+    name := eds[active].word_here()
+    if name == "" or eds[active].path == ""
+        message = "call hierarchy: put the cursor on a function name in a saved file"
+        return
+    file := ask_source() else return
+    cmd := ail_command()
+    path := eds[active].path
+    callers := ask.hierarchy(cmd, file, path, name, true, 3)
+    callees := ask.hierarchy(cmd, file, path, name, false, 3)
+    ask_release(file)
+    mut found := List[Hit]()
+    found.push(Hit(loc: Loc(path: "", line: 0, col: 0), text: "-- who calls {name}"))
+    for h in ask_hits(callers)
+        found.push(h)
+    found.push(Hit(loc: Loc(path: "", line: 0, col: 0), text: "-- what {name} calls"))
+    for h in ask_hits(callees)
+        found.push(h)
+    show_list("call hierarchy of `{name}`", found)
+
+## The tokens of `text`, through a temporary file beside `path`.
+fn Workspace.count_text(mut self, path str, text str) int
+    file := "{path}.edit-tokens.ail"
+    fs.write_text(file, text) else err
+        message = "can't write {err.path}: {err.kind}"
+        return -1
+    mut n := -1
+    if t := ask.tokens_of(ail_command(), file)
+        n = t
+    fs.remove(file) else err
+        message = "can't remove {err.path}: {err.kind}"
+    n
+
+## Ctrl-Shift-K: counts the buffer as edited and the selection.
+fn Workspace.token_report(mut self)
+    ed := eds[active]
+    whole := count_text(ed.path, ed.text())
+    if whole < 0
+        return
+    mut picked := -1
+    sel := ed.selected_text()
+    if sel != ""
+        picked = count_text(ed.path, sel)
+    askbar.counted(ed.path, ed.saves, whole)
+    askbar.selected(picked)
+    if picked >= 0
+        message = "tokens: {whole} in the file, {picked} selected"
+    else
+        message = "tokens: {whole} in the file"
+
+## After an event: counts the saved file again when the tab or the save
+## count changed. Files that don't exist yet aren't counted.
+fn Workspace.askbar_refresh(mut self)
+    ed := eds[active]
+    if not askbar.stale(ed.path, ed.saves)
+        return
+    mut n := -1
+    if ed.path != "" and fs.exists(ed.path)
+        if t := ask.tokens_of(ail_command(), ed.path)
+            n = t
+    askbar.counted(ed.path, ed.saves, n)
+
+## The prompt on the tab bar while the bar is open, and the token count at
+## the right end of the status row.
+fn Workspace.render_askbar(self, mut s Screen)
+    if askbar.open
+        head := askbar.prompt()
+        s.put(0, 0, "{head}{askbar.text} ".pad_right(cols, ' '), STATUS_FG, SELECT_BG)
+        s.cursor_row = 0
+        s.cursor_col = head.chars().len() + askbar.text.chars().len()
+        return
+    seg := askbar.segment()
+    if seg != ""
+        s.put(1 + eds[active].text_rows(), cols - seg.chars().len(), seg, STATUS_FG, STATUS_BG)
+
 ## Called while the window waits: refreshes the live problems list once
 ## 500 ms have passed since the last edit.
 fn Workspace.idle(mut self, now int)
@@ -6357,13 +6990,25 @@ fn Workspace.render(self) Screen
         x += labels[i].chars().len() + 1
     if message != ""
         s.put(0, x + 1, message, FG, PANE_BG)
-    inner := eds[active].render()
     x0 := left()
+    mut shown := eds[active]
+    if splitting and eds.len() > 1
+        shown.cols = split_half() - 1
+    inner := shown.render()
     for sp in inner.spans
         s.spans.push(Span(row: sp.row + 1, col: sp.col + x0, text: sp.text, fg: sp.fg, bg: sp.bg))
     for r in 0..inner.text.len()
         if r + 1 < rows
             s.text[r + 1] = inner.text[r]
+    if splitting and eds.len() > 1
+        half := split_half()
+        mut beside := eds[(active + 1) % eds.len()]
+        beside.cols = (cols - x0 - half).max(10)
+        second := beside.render()
+        for sp in second.spans
+            s.put(sp.row + 1, sp.col + x0 + half, sp.text, sp.fg, sp.bg)
+        for r in 1..rows
+            s.mark(r, x0 + half - 1, "|", GUIDE_FG, PANE_BG)
     s.text[0] = labels.join(" ")
     if inner.cursor_row >= 0
         s.cursor_row = inner.cursor_row + 1
@@ -6372,6 +7017,7 @@ fn Workspace.render(self) Screen
     if tree_open
         render_tree(mut s)
     render_search(mut s)
+    render_askbar(mut s)
     if picking
         render_picker(mut s)
     s
@@ -6460,7 +7106,10 @@ fn Workspace.window(mut self) ! ui.UiError
 fn Workspace.on_window_event(mut self, ev ui.Event, m ui.Modifiers)
     shift_click := match ev
         Mouse(c, r, button, kind) =>
-            if m.shift and not picking and button == "left" and kind == "down" and r > 0
+            if m.alt and not picking and button == "left" and kind == "down" and r > 0
+                eds[active].add_caret_at(c - left(), r - 1)
+                true
+            elif m.shift and not picking and button == "left" and kind == "down" and r > 0
                 eds[active].extend_to(c - left(), r - 1)
                 true
             else
@@ -6468,6 +7117,143 @@ fn Workspace.on_window_event(mut self, ev ui.Event, m ui.Modifiers)
         Key(_, _, _, _) | Resize(_, _) | Close | Scroll(_) => false
     if not shift_click
         on_event(ev)
+
+# ---- Editing depth tests (features/) ------------------------------------
+
+DEPTH_SAMPLE := "fn main()\n    x := 1\n    if x > 0\n        print(x)\n\nfn other()\n    y := 2\n"
+
+@test fn breadcrumbs_and_enclosing_scopes()
+    ls := DEPTH_SAMPLE.split("\n")
+    assert_eq(scope.chain(ls, 3), [0, 2])
+    assert_eq(scope.crumbs(ls, 3), "main")
+    assert_eq(scope.crumbs(ls, 0), "main")
+    assert_eq(scope.crumbs(ls, 4), "main")
+    assert_eq(scope.crumbs(ls, 6), "other")
+    assert_eq(scope.name_of("pub fn Editor.go(self, d Dir)"), "Editor.go")
+    assert_eq(scope.name_of("@test fn t()"), "t")
+    assert_eq(scope.name_of("struct Point"), "Point")
+    assert_eq(scope.name_of("x := 1"), "")
+    h := scope.sticky(ls, 3) else -1
+    assert_eq(h, 0)
+    assert(scope.sticky(ls, 0) == none)
+
+@test fn sticky_header_and_crumbs_render()
+    mut text := "fn big()\n"
+    for _ in 0..20
+        text = "{text}    x := 1\n"
+    mut ed := typed(text, [Command.Resize(cols: 100, rows: 12), Go(Bottom)])
+    assert(ed.top > 0)
+    s := ed.render()
+    assert_eq(s.text[0].trim(), "fn big()")
+    assert(s.text[ed.text_rows()].contains("big"))
+
+@test fn folding_hides_a_block_and_survives_undo()
+    mut ed := typed(DEPTH_SAMPLE, [])
+    ed.apply(Depth("fold"))
+    assert(ed.folded.contains(0))
+    assert_eq(fold.end_of(ed.lines, 0), 3)
+    s := ed.render()
+    assert(s.text[0].starts_with("  1>fn main()"))
+    assert(s.text[0].contains("3 lines"))
+    assert(s.text[1].starts_with("  5 "))
+    assert(s.text[2].starts_with("  6 fn other()"))
+    ed.apply(Go(Down))
+    assert_eq(ed.line, 4)
+    ed.apply(Insert("x"))
+    assert(ed.folded.contains(0))
+    ed.apply(Depth("unfold_all"))
+    assert_eq(ed.folded.len(), 0)
+    ed.apply(Undo)
+    assert(ed.folded.contains(0))
+    ed.apply(Depth("fold_all"))
+    assert(ed.folded.contains(0) and ed.folded.contains(5))
+
+@test fn folds_move_with_their_text()
+    mut ed := typed("x := 0\nfn main()\n    y := 1\n", [])
+    ed.apply(Go(Down))
+    ed.apply(Depth("fold"))
+    assert(ed.folded.contains(1))
+    ed.apply(Go(Top))
+    ed.apply(Go(End))
+    ed.apply(Newline)
+    assert(ed.folded.contains(2))
+    assert_eq(ed.folded.len(), 1)
+    ed.apply(Go(Bottom))
+    assert(not ed.folded.contains(2))
+
+@test fn multi_cursor_types_at_every_occurrence()
+    mut ed := typed("a1 a1\nb a1\n", [])
+    ed.apply(Depth("next"))
+    assert_eq(ed.selected_text(), "a1")
+    ed.apply(Depth("next"))
+    ed.apply(Depth("next"))
+    assert_eq(ed.extra.len(), 2)
+    ed.apply(Insert("zz"))
+    assert_eq(ed.lines, ["zz zz", "b zz"])
+    ed.apply(Insert("!"))
+    assert_eq(ed.lines, ["zz! zz!", "b zz!"])
+    ed.apply(Backspace)
+    assert_eq(ed.lines, ["zz zz", "b zz"])
+    ed.apply(Go(Left))
+    assert_eq(ed.lines, ["zz zz", "b zz"])
+    assert_eq(ed.extra.len(), 2)
+    ed.apply(Escape)
+    assert_eq(ed.extra.len(), 0)
+
+@test fn multi_cursor_lines_and_undo()
+    mut ed := typed("a\nb\nc\n", [])
+    ed.apply(Depth("below"))
+    ed.apply(Depth("below"))
+    assert_eq(ed.extra.len(), 2)
+    ed.apply(Insert("-"))
+    assert_eq(ed.lines, ["-a", "-b", "-c"])
+    ed.apply(Newline)
+    assert_eq(ed.lines.len(), 6)
+    ed.apply(Undo)
+    assert_eq(ed.lines, ["-a", "-b", "-c"])
+    ed.apply(Depth("all"))
+    assert_eq(ed.extra.len(), 0)
+
+@test fn multi_core_edits()
+    ls := ["ab", "cd"]
+    cs := multi.prepare(multi.span(0, 1, 0, 2, 1), [multi.at(1, 0, 0), multi.at(0, 1, 0)])
+    assert_eq(cs.len(), 3)
+    e := multi.replace_all(ls, cs, "XY")
+    assert_eq(e.lines, ["aXYXY", "XYcd"])
+    assert_eq(e.carets[0].col, 3)
+    assert_eq(e.carets[1].col, 5)
+    assert_eq(e.carets[2].line, 1)
+    assert_eq(e.carets[1].tag, 1)
+    back := multi.grow_back(["ab", "cd"], [multi.at(1, 0, 1), multi.at(0, 2, 0)])
+    assert_eq(multi.replace_all(["ab", "cd"], back, "").lines, ["acd"])
+    assert_eq(multi.occurrences(["abab"], "ab").len(), 2)
+
+@test fn bracket_pairs_are_colored_by_depth()
+    sc := pairs.scan("f(a[1], \"(\")", 0)
+    assert_eq(sc.levels[1], 1)
+    assert_eq(sc.levels[3], 2)
+    assert_eq(sc.levels[5], 2)
+    assert_eq(sc.levels[9], 0)
+    assert_eq(sc.levels[11], 1)
+    assert_eq(sc.depth, 0)
+    assert_eq(pairs.scan("x(  # (", 0).depth, 1)
+
+@test fn zen_and_split_view_and_their_keys()
+    mut ed := typed("x", [])
+    ed.apply(Depth("zen"))
+    assert_eq(ed.pane_rows(), 0)
+    assert_eq(key_command("d", false, true, false), Depth("next"))
+    assert_eq(key_command("f11", false, false, false), Depth("zen"))
+    assert_eq(key_command("[", true, false, true), Depth("fold"))
+    assert_eq(key_command("up", false, true, true), Depth("above"))
+    assert_eq(key_command("up", false, true, false), MoveLine(false))
+    mut ws := Workspace.new(typed("alpha", []))
+    ws.eds.push(typed("beta", []))
+    ws.on_event(key_event("ctrl+\\"))
+    assert(ws.splitting)
+    s := ws.render()
+    assert(s.text[1].contains("alpha"))
+    assert(s.text[1].contains("beta"))
 
 # ---- Window front end (std.app, S1) --------------------------------------
 
