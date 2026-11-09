@@ -3691,21 +3691,21 @@ fn key_rows() List[KeyRow]
             "List what changed in the saved file since git HEAD by meaning (`ail diff --rev HEAD`): declarations added, removed, changed (with their body lines), diagnostics and tests; Enter jumps to a declaration",
         ),
         key_row(
-            "Ctrl-Shift-A",
+            "Palette",
             "API diff",
-            "ctrl+shift+a",
+            "palette+api-diff",
             "List the public API changes since git HEAD (`ail api --diff --rev HEAD`), `breaking:` ones marked",
         ),
         key_row(
-            "Ctrl-Shift-R",
+            "Ctrl-Shift-V",
             "Verify change",
-            "ctrl+shift+r",
+            "ctrl+shift+v",
             "The four-part report of `ail verify --diff --rev HEAD`: proved, tested, unverified, failures",
         ),
         key_row(
-            "Ctrl-Shift-G",
+            "Palette",
             "Git change gutter",
-            "ctrl+shift+g",
+            "palette+git-gutter",
             "Mark the lines that differ from git HEAD with `+` in the gutter (`git diff -U0`), until the next edit",
         ),
         key_row(
@@ -3841,6 +3841,11 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
             return Trace
         if k == "f12" and shift
             return References
+        # Palette-only commands: key names no keyboard sends (key_rows spec `palette+NAME`).
+        if k == "api-diff"
+            return Diff("api")
+        if k == "git-gutter"
+            return Diff("gutter")
         return none
     if k == "tab"
         if shift
@@ -3860,9 +3865,7 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
             "h" | "H" => ReplaceInFiles
             "u" | "U" => TestOnSave
             "d" | "D" => Diff("diff")
-            "a" | "A" => Diff("api")
-            "r" | "R" => Diff("verify")
-            "g" | "G" => Diff("gutter")
+            "v" | "V" => Diff("verify")
             _ => none
     match k
         "b" | "B" => Tree

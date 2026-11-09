@@ -78,9 +78,9 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | Ctrl-Shift-I | The program card (`ail api --card`) of the file's program, its modules included: entry point, tests, and every declaration with effects, contracts and error sets; Up/Down, Enter jumps to a declaration; refreshed on save (ADR 0331) |
 | Ctrl-Shift-C | Run the tests with line coverage (`ail test --coverage=lines`) and mark the lines they never ran in the gutter, until the next edit (ADR 0313) |
 | Ctrl-Shift-D | List what changed in the saved file since git HEAD by meaning (`ail diff --rev HEAD`): declarations added, removed, changed (with their body lines), diagnostics and tests; Enter jumps to a declaration |
-| Ctrl-Shift-A | List the public API changes since git HEAD (`ail api --diff --rev HEAD`), `breaking:` ones marked |
-| Ctrl-Shift-R | The four-part report of `ail verify --diff --rev HEAD`: proved, tested, unverified, failures |
-| Ctrl-Shift-G | Mark the lines that differ from git HEAD with `+` in the gutter (`git diff -U0`), until the next edit |
+| Palette | List the public API changes since git HEAD (`ail api --diff --rev HEAD`), `breaking:` ones marked |
+| Ctrl-Shift-V | The four-part report of `ail verify --diff --rev HEAD`: proved, tested, unverified, failures |
+| Palette | Mark the lines that differ from git HEAD with `+` in the gutter (`git diff -U0`), until the next edit |
 | Ctrl-Shift-P | Command palette: every command here with its key; type part of its name, Up/Down, Enter runs it |
 | Ctrl-B | Show the file tree (`.ail` files first) and focus it; again hides it. Up/Down select, Enter or Right opens a file or expands a directory, Left collapses, Esc returns to the editor; a click opens (ADR 0293) |
 | Ctrl-Shift-U | Toggle running the tab's tests (`ail test --json`) after each save; the status line shows the pass and fail counts (ADR 0354) |
