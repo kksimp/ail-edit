@@ -1,0 +1,361 @@
+## Tests, replay and shrink (S6 of docs/plan-2026-11.md). Everything here is
+## pure except `result_rows` for a shrink, which reads the smaller bundle: the
+## editor runs the `ail` command that `plan` names and shows the `Row`s that
+## `result_rows` makes from its output (D2, D3: no analysis here, only the owning
+## command's `--json`).
+
+use std.fs
+
+## How long `ail replay --shrink` may search, in milliseconds.
+pub SHRINK_MS := "20000"
+
+## Where `ail test --bundle-failure` writes bundles (bundle.write.1).
+BUNDLE_DIR := ".ail/bundles"
+
+## One row of a result list: a position (line 0 when it has none) and text.
+pub struct Row
+    pub path str
+    pub line int
+    pub col int
+    pub text str
+
+## What to run for a mode: the `ail` arguments, the list's title, whether
+## the editor adds the file (else the arguments are complete), or why the
+## mode can't run now (`problem`, empty when it can).
+pub struct Plan
+    pub args List[str]
+    pub title str
+    pub on_file bool
+    pub problem str
+
+fn str_of(j Json, key str) str
+    (j.get(key) else Json.Null).as_str() else ""
+
+fn int_of(j Json, key str) int
+    ((j.get(key) else Json.Null).as_num() else 0.0).to_int()
+
+fn refuse(why str) Plan
+    Plan(args: [], title: "", on_file: false, problem: why)
+
+fn file_plan(args List[str], title str) Plan
+    Plan(args: args, title: title, on_file: true, problem: "")
+
+fn bundle_plan(args List[str], title str, bundle str) Plan
+    if bundle == ""
+        return refuse("select a FAIL row of the test tree (Ctrl-Shift-J) first")
+    mut all := args
+    all.push(bundle)
+    Plan(args: all, title: title, on_file: false, problem: "")
+
+## The test a `FAIL NAME: ...` row names.
+pub fn test_of_row(text str) str?
+    rest := text.strip_prefix("FAIL ") else return none
+    parts := rest.split(":")
+    name := parts[0].trim()
+    if name == ""
+        return none
+    name
+
+## The file `ail test --bundle-failure` writes for a test: letters, digits
+## and `_` stay, anything else becomes `-` (bundle.write.1).
+pub fn bundle_path(test str) str
+    mut name := ""
+    for c in test.chars()
+        keep := (c >= 'a' and c <= 'z')
+            or (c >= 'A' and c <= 'Z')
+            or (c >= '0' and c <= '9')
+            or c == '_'
+        if keep
+            name = "{name}{c}"
+        else
+            name = "{name}-"
+    "{BUNDLE_DIR}/{name}.json"
+
+## The bundle a selected row stands for: a `bundle PATH` row, or a failed
+## test's file; empty for any other row.
+pub fn bundle_of_row(text str) str
+    if p := text.strip_prefix("bundle ")
+        return p.trim()
+    if t := test_of_row(text)
+        return bundle_path(t)
+    ""
+
+## What each mode runs. `sel` is the text of the selected row of the list
+## on screen; `dirty` says the buffer differs from the file on disk.
+pub fn plan(mode str, sel str, dirty bool) Plan
+    b := bundle_of_row(sel)
+    match mode
+        "tree" | "one" => file_plan(["test", "--json", "--bundle-failure"], "test tree")
+        "contracts" => file_plan(
+            ["test", "--contracts", "--json"],
+            "contracts (smallest failing input)",
+        )
+        "preview" => file_plan(
+            ["test", "--update", "--dry-run", "--json"],
+            "update preview (Ctrl-Shift-A applies)",
+        )
+        "apply" =>
+            if dirty
+                return refuse("save first: --update rewrites the file on disk")
+            file_plan(["test", "--update"], "update")
+        "record" =>
+            if dirty
+                return refuse("save first: the recording is of the file on disk")
+            file_plan(["test", "--record", "last-test.rec.json"], "record")
+        "replay" => bundle_plan(["test", "--bundle"], "replay", b)
+        "trace" => bundle_plan(["test", "--trace=all", "--bundle"], "trace over replay", b)
+        "shrink" => bundle_plan(["replay", "--shrink", "--time", SHRINK_MS], "shrink", b)
+        _ => refuse("unknown test tool {mode}")
+
+## Rows for `ail test --json` or `--contracts --json` output: the summary
+## first, a row per test, `bundle PATH` rows for the bundles written (on
+## standard error), and any other line as it is.
+pub fn test_rows(path str, out str, err str) List[Row]
+    mut tests := List[Row]()
+    mut summary := ""
+    for l in out.lines()
+        j := parse_json(l) else Json.Null
+        if j.get("summary") != none
+            ok := int_of(j, "passed")
+            bad := int_of(j, "failed")
+            summary = "{ok} passed, {bad} failed"
+        elif j.get("test") != none
+            name := str_of(j, "test")
+            if str_of(j, "status") == "fail"
+                mut why := str_of(j, "message")
+                given := str_of(j, "input")
+                if given != ""
+                    why = "{why} (input: {given})"
+                ln := int_of(j, "line")
+                cl := int_of(j, "col")
+                tests.push(Row(
+                    path: path,
+                    line: ln,
+                    col: cl,
+                    text: "FAIL {name}: {why} at {ln}:{cl}",
+                ))
+            else
+                tests.push(Row(path: path, line: 0, col: 0, text: "ok   {name}"))
+        elif l.trim() != ""
+            tests.push(Row(path: path, line: 0, col: 0, text: l.trim()))
+    mut rows := List[Row]()
+    if summary != ""
+        rows.push(Row(path: path, line: 0, col: 0, text: summary))
+    for r in tests
+        rows.push(r)
+    for l in err.lines()
+        if p := l.strip_prefix("bundle: ")
+            rows.push(Row(path: path, line: 0, col: 0, text: "bundle {p.trim()}"))
+    rows
+
+## The rows that are `name`'s: its `ok` or `FAIL` row and its bundle.
+pub fn only_test(all List[Row], name str) List[Row]
+    mut kept := List[Row]()
+    for r in all
+        if r.text.starts_with("ok   {name}") or r.text.starts_with("FAIL {name}:")
+            kept.push(r)
+    if kept.len() == 0
+        kept.push(Row(path: "", line: 0, col: 0, text: "no result for {name}"))
+    kept
+
+## The test the caret (0-based `at`) is in: the nearest `fn NAME(` at or above
+## it whose line, or the line before, is `@test`.
+pub fn test_at(lines List[str], at int) str?
+    mut i := at.min(lines.len() - 1)
+    while i >= 0
+        t := lines[i].trim()
+        mut decl := ""
+        if x := t.strip_prefix("@test fn ")
+            decl = x
+        elif y := t.strip_prefix("fn ")
+            decl = y
+        if decl != ""
+            if t.starts_with("@test") or (i > 0 and lines[i - 1].trim() == "@test")
+                parts := decl.split("(")
+                return parts[0].trim()
+            return none
+        i -= 1
+    none
+
+## Rows for `ail test --update --dry-run --json`: each stale expectation as
+## `KIND FILE:L:C: old -> new` (snap.update.6), then the totals.
+pub fn snapshot_rows(path str, out str) List[Row]
+    mut found := List[Row]()
+    mut total := List[Row]()
+    for l in out.lines()
+        j := parse_json(l) else Json.Null
+        if j.get("snapshot") != none
+            file := str_of(j, "file")
+            ln := int_of(j, "line")
+            cl := int_of(j, "col")
+            found.push(Row(
+                path: file,
+                line: ln,
+                col: cl,
+                text: "{str_of(j, "snapshot")} {file}:{ln}:{cl}: {str_of(j, "old")} -> {str_of(j, "new")}",
+            ))
+        elif j.get("snapshots") != none
+            total.push(Row(
+                path: path,
+                line: 0,
+                col: 0,
+                text: "would update {int_of(j, "updated")} in {int_of(j, "files")} files, {int_of(j, "skipped")} skipped",
+            ))
+        elif l.trim() != ""
+            found.push(Row(path: path, line: 0, col: 0, text: l.trim()))
+    for r in found
+        total.push(r)
+    total
+
+## One row per line of `text`, with no position.
+pub fn plain_rows(path str, out str, err str) List[Row]
+    mut rows := List[Row]()
+    for l in out.lines()
+        rows.push(Row(path: path, line: 0, col: 0, text: l))
+    for l in err.lines()
+        rows.push(Row(path: path, line: 0, col: 0, text: l))
+    rows
+
+## A recorded result in a few characters.
+fn shown_result(j Json) str
+    if j.get("trap") != none
+        return "trap {str_of(j, "message")}"
+    if r := j.get("result")
+        if s := r.as_str()
+            if s.len() > 40
+                return "\"{s.slice(0, 40)}...\""
+            return "\"{s}\""
+        if n := r.as_num()
+            return "{n.to_int()}"
+        return "(value)"
+    "(uncaptured)"
+
+## Rows for a bundle (JSON lines, bundle.write.2): its test and message,
+## then each recorded call at the line of the program that made it, so the
+## smaller bundle of a shrink reads as a trace.
+pub fn bundle_rows(text str) List[Row]
+    mut rows := List[Row]()
+    mut program := ""
+    for l in text.lines()
+        j := parse_json(l) else continue
+        if j.get("ail_bundle") != none
+            program = str_of(j, "program")
+            rows.push(Row(
+                path: program,
+                line: 0,
+                col: 0,
+                text: "bundle {str_of(j, "test")}: {str_of(j, "message")}",
+            ))
+        elif j.get("call") != none
+            rows.push(Row(
+                path: program,
+                line: int_of(j, "line"),
+                col: int_of(j, "col"),
+                text: "{str_of(j, "call")} -> {shown_result(j)}",
+            ))
+    rows
+
+## The rows a mode shows for the output of its command. After a shrink the
+## smaller bundle (`BUNDLE.min`) follows the command's own line.
+pub fn result_rows(mode str, path str, sel str, out str, err str) List[Row]
+    match mode
+        "tree" | "contracts" => test_rows(path, out, err)
+        "one" => only_test(test_rows(path, out, err), sel)
+        "preview" => snapshot_rows(path, out)
+        "shrink" =>
+            mut rs := plain_rows(path, out, err)
+            min := "{bundle_of_row(sel)}.min"
+            if fs.exists(min)
+                got := fs.read_text(min) else e
+                    rs.push(Row(path: path, line: 0, col: 0, text: "can't read {e.path}: {e.kind}"))
+                    return rs
+                for r in bundle_rows(got)
+                    rs.push(r)
+            rs
+        _ => plain_rows(path, out, err)
+
+# ---- Tests --------------------------------------------------------------
+
+@test fn rows_name_the_failed_test_and_its_bundle()
+    out := "\{\"test\":\"a\",\"status\":\"pass\",\"line\":0,\"col\":0,\"message\":\"\"}\n\{\"test\":\"b\",\"status\":\"fail\",\"line\":7,\"col\":5,\"message\":\"trap[x]: no\"}\n\{\"summary\":true,\"passed\":1,\"failed\":1}\n"
+    rs := test_rows("t.ail", out, "bundle: .ail/bundles/b.json\n")
+    assert_eq(rs.len(), 4)
+    assert_eq(rs[0].text, "1 passed, 1 failed")
+    assert_eq(rs[1].text, "ok   a")
+    assert_eq(rs[2].text, "FAIL b: trap[x]: no at 7:5")
+    assert_eq(rs[2].line, 7)
+    assert_eq(rs[3].text, "bundle .ail/bundles/b.json")
+
+@test fn a_property_failure_shows_its_input()
+    out := "\{\"test\":\"p\",\"status\":\"fail\",\"line\":3,\"col\":1,\"message\":\"m\",\"input\":\"n = 1\"}\n"
+    rs := test_rows("t.ail", out, "")
+    assert_eq(rs[0].text, "FAIL p: m (input: n = 1) at 3:1")
+    assert_eq(test_rows("t.ail", "no contracts to check\n", "")[0].text, "no contracts to check")
+
+@test fn bundle_paths_follow_the_bundle_rule()
+    assert_eq(bundle_path("adds"), ".ail/bundles/adds.json")
+    assert_eq(bundle_path("doc:f#2"), ".ail/bundles/doc-f-2.json")
+    assert_eq(test_of_row("FAIL adds: boom at 3:1"), "adds")
+    assert_eq(test_of_row("ok   adds") == none, true)
+    assert_eq(bundle_of_row("bundle .ail/bundles/x.json"), ".ail/bundles/x.json")
+    assert_eq(bundle_of_row("FAIL adds: boom at 3:1"), ".ail/bundles/adds.json")
+    assert_eq(bundle_of_row("ok   adds"), "")
+
+@test fn plans_run_the_owning_command()
+    t := plan("tree", "", false)
+    assert_eq(t.args, ["test", "--json", "--bundle-failure"])
+    assert(t.on_file)
+    s := plan("shrink", "FAIL adds: boom at 3:1", false)
+    assert_eq(s.args, ["replay", "--shrink", "--time", "20000", ".ail/bundles/adds.json"])
+    assert(not s.on_file)
+    assert_eq(
+        plan("replay", "FAIL adds: x", false).args,
+        ["test", "--bundle", ".ail/bundles/adds.json"],
+    )
+    assert_eq(plan("trace", "FAIL adds: x", false).args, [
+        "test",
+        "--trace=all",
+        "--bundle",
+        ".ail/bundles/adds.json",
+    ])
+    assert_eq(plan("contracts", "", false).args, ["test", "--contracts", "--json"])
+
+@test fn plans_refuse_what_cannot_run()
+    assert(plan("replay", "ok   adds", false).problem.starts_with("select a FAIL row"))
+    assert(plan("apply", "", true).problem.starts_with("save first"))
+    assert_eq(plan("apply", "", false).args, ["test", "--update"])
+    assert(plan("record", "", true).problem.starts_with("save first"))
+    assert(plan("nope", "", false).problem.starts_with("unknown"))
+
+@test fn the_update_preview_lists_each_stale_expectation()
+    out := "\{\"snapshot\":\"assert_eq\",\"file\":\"t.ail\",\"line\":4,\"col\":22,\"old\":\"\\\"a\\\"\",\"new\":\"\\\"b\\\"\"}\n\{\"snapshots\":true,\"dry_run\":true,\"updated\":1,\"files\":1,\"skipped\":0}\n"
+    rs := snapshot_rows("t.ail", out)
+    assert_eq(rs.len(), 2)
+    assert_eq(rs[0].text, "would update 1 in 1 files, 0 skipped")
+    assert_eq(rs[1].line, 4)
+    assert(rs[1].text.starts_with("assert_eq t.ail:4:22: "))
+
+@test fn a_bundle_reads_as_a_trace()
+    text := "\{\"ail_bundle\":1,\"test\":\"t\",\"program\":\"p.ail\",\"message\":\"boom\"}\n\{\"test\":\"t\"}\n\{\"call\":\"fs.read_text\",\"line\":3,\"col\":9,\"result\":\"hello\"}\n\{\"call\":\"env.get\",\"line\":5,\"col\":1,\"trap\":\"x\",\"message\":\"m\"}\n"
+    rs := bundle_rows(text)
+    assert_eq(rs.len(), 3)
+    assert_eq(rs[0].text, "bundle t: boom")
+    assert_eq(rs[1].text, "fs.read_text -> \"hello\"")
+    assert_eq(rs[1].path, "p.ail")
+    assert_eq(rs[1].line, 3)
+    assert_eq(rs[2].text, "env.get -> trap m")
+
+@test fn only_the_named_test_is_kept()
+    rs := test_rows(
+        "t.ail",
+        "\{\"test\":\"a\",\"status\":\"pass\",\"line\":0,\"col\":0,\"message\":\"\"}\n\{\"test\":\"ab\",\"status\":\"pass\",\"line\":0,\"col\":0,\"message\":\"\"}\n",
+        "",
+    )
+    assert_eq(only_test(rs, "ab").len(), 1)
+    assert_eq(only_test(rs, "zz")[0].text, "no result for zz")
+
+@test fn the_caret_finds_its_test()
+    src := ["@test", "fn adds()", "    assert(true)", "", "fn helper()", "    1"]
+    assert_eq(test_at(src, 2), "adds")
+    assert_eq(test_at(src, 5) == none, true)
+    assert_eq(test_at(["@test fn one()", "    x"], 1), "one")
