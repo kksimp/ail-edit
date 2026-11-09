@@ -7,9 +7,9 @@
 
 ## One row of a panel: where it jumps to (`line` 0 for none) and its text.
 pub struct Row
-    line int
-    col int
-    text str
+    pub line int
+    pub col int
+    pub text str
 
 ## A JSON value as short text: strings as they are, others as JSON.
 fn jtext(j Json) str
@@ -170,9 +170,9 @@ pub fn names_of(line str, selection str) List[str]
 
 ## A probe hit: the values shown at the line, `a = 1, b = 2`.
 pub struct Hit
-    at str
-    values str
-    line int
+    pub at str
+    pub values str
+    pub line int
 
 fn probe_json(j Json) Hit
     at := jstr(j, "at")
@@ -224,11 +224,11 @@ pub fn probe_note(hits List[Hit]) str
 
 ## One watch event: the variable's new value where it was written.
 pub struct Write
-    name str
-    value str
-    line int
-    col int
-    note str
+    pub name str
+    pub value str
+    pub line int
+    pub col int
+    pub note str
 
 fn write_json(j Json) Write
     mut note := ""
@@ -293,20 +293,20 @@ pub fn watch_notes(writes List[Write]) Map[int, str]
 
 ## A trap frame: the function, where it was, and its values.
 pub struct Frame
-    fn_name str
-    line int
-    col int
-    args str
-    locals str
+    pub fn_name str
+    pub line int
+    pub col int
+    pub args str
+    pub locals str
 
 ## The trap of a run (`ail run --json --values`): the message and its frames,
 ## innermost first. `rule` is "" when the run did not trap.
 pub struct Trap
-    rule str
-    message str
-    line int
-    col int
-    frames List[Frame]
+    pub rule str
+    pub message str
+    pub line int
+    pub col int
+    pub frames List[Frame]
 
 fn text_frame(l str) Frame?
     if not l.starts_with("  at ") or not l.contains(" in ")
@@ -410,19 +410,19 @@ pub FILTERS := ["all", "calls", "effects", "contracts", "traps"]
 ## One event of a trace. `parent` is the index of the call it happened in
 ## (-1 at the top); a call's `text` ends with ` = VALUE` once it returned.
 pub struct Event
-    kind str
-    parent int
-    depth int
-    line int
-    col int
-    text str
+    pub kind str
+    pub parent int
+    pub depth int
+    pub line int
+    pub col int
+    pub text str
 
 ## The trace as a tree and what is folded or filtered away.
 pub struct View
-    events List[Event]
-    collapsed Set[int]
-    filter int
-    on bool
+    pub events List[Event]
+    pub collapsed Set[int]
+    pub filter int
+    pub on bool
 
 pub fn View.new() View
     View(events: [], collapsed: Set[int](), filter: 0, on: false)
