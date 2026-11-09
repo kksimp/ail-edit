@@ -1,0 +1,214 @@
+## The task panel and the impact gutter (editor plan S4, D2-D4).
+## It parses what the owning commands print and builds rows; it runs nothing
+## itself: `edit.ail` shells out to `ail ask FILE --affected --json` (api.impact.4),
+## `ail test --affected` (test.affected.1) and `ail task` (task.*, ADR 0917), so
+## the panel shows the facts an agent's `ail task status` shows.
+
+## The open task, read from `.ail-task` (task.state.1).
+pub struct Job
+    pub open bool
+    pub program str
+    pub goal str
+    pub rev str
+    ## `none`, `green` or `red`: the last `ail task verify`.
+    pub last str
+
+## What the edit can reach (api.impact.4).
+pub struct Impact
+    pub ok bool
+    pub partial bool
+    pub changed List[str]
+    pub affected List[str]
+    pub tests List[str]
+    ## One row per function whose effects differ: `id: old -> new`.
+    pub effects List[str]
+
+## A panel row: its text, and the declaration id it jumps to ("" for none).
+pub struct Row
+    pub text str
+    pub id str
+
+## The task in the text of a `.ail-task` file; `open` is false without a program.
+pub fn parse_job(text str) Job
+    mut t := Job(open: false, program: "", goal: "", rev: "HEAD", last: "none")
+    for l in text.lines()
+        at := l.find("=") else continue
+        k := l.slice(0, at)
+        v := l.slice(at + 1, l.len())
+        if k == "program"
+            t.program = v
+        elif k == "goal"
+            t.goal = v
+        elif k == "rev"
+            t.rev = v
+        elif k == "last"
+            t.last = v
+    t.open = not t.program.is_empty()
+    t
+
+fn strings_of(j Json, key str) List[str]
+    mut out := List[str]()
+    for it in (j.get(key) else Json.Null).as_arr() else List[Json]()
+        if s := it.as_str()
+            out.push(s)
+    out
+
+fn text_of(j Json, key str) str
+    (j.get(key) else Json.Null).as_str() else ""
+
+## The impact in `ail ask FILE --affected --json` output; `ok` is false when
+## the text isn't an impact (no git revision, a program that doesn't check).
+pub fn parse_impact(text str) Impact
+    none_found := Impact(
+        ok: false,
+        partial: false,
+        changed: [],
+        affected: [],
+        tests: [],
+        effects: [],
+    )
+    j := parse_json(text.trim()) else return none_found
+    if j.get("changed") == none
+        return none_found
+    mut fx := List[str]()
+    for e in (j.get("effects") else Json.Null).as_arr() else List[Json]()
+        old := strings_of(e, "old").join(",")
+        new := strings_of(e, "new").join(",")
+        fx.push("{text_of(e, "id")}: {old} -> {new}")
+    Impact(
+        ok: true,
+        partial: (j.get("partial") else Json.Null) == Json.Bool(true),
+        changed: strings_of(j, "changed"),
+        affected: strings_of(j, "affected"),
+        tests: strings_of(j, "tests"),
+        effects: fx,
+    )
+
+## The 0-based lines of the declarations the edit affected (api.impact.2):
+## `ids` and `lines` are the file's symbols, in step.
+pub fn marked_lines(ids List[str], lines List[int], imp Impact) Set[int]
+    mut out := Set[int]()
+    for i in 0..ids.len()
+        if imp.affected.contains(ids[i]) or imp.changed.contains(ids[i])
+            out.add(lines[i] - 1)
+    out
+
+## The panel: the task, then the impact. Every declaration row names its id.
+pub fn panel_rows(job Job, imp Impact) List[Row]
+    mut out := List[Row]()
+    if not job.open
+        out.push(Row(text: "no open task here", id: ""))
+        out.push(Row(text: "next: ail task start PROGRAM GOAL...", id: ""))
+    else
+        out.push(Row(text: "task: {job.goal}", id: ""))
+        out.push(Row(text: "program {job.program}, base {job.rev}", id: ""))
+        out.push(Row(text: "verified: {job.last}", id: ""))
+    if not imp.ok
+        out.push(Row(
+            text: "impact: not available (needs a git revision and a program that checks)",
+            id: "",
+        ))
+    else
+        mut head := "impact: {imp.changed.len()} changed, {imp.affected.len()} affected, {imp.tests.len()} tests"
+        if imp.partial
+            head = "{head} (partial: the program has check errors)"
+        out.push(Row(text: head, id: ""))
+        for c in imp.changed
+            out.push(Row(text: "  changed {c}", id: c))
+        for a in imp.affected
+            if not imp.changed.contains(a)
+                out.push(Row(text: "  affected {a}", id: a))
+        for t in imp.tests
+            out.push(Row(text: "  test {t}", id: "fn:{t}"))
+        for e in imp.effects
+            out.push(Row(text: "  effects {e}", id: ""))
+    if job.open
+        mut next := "v verifies"
+        if job.last == "green"
+            next = "f finishes (last verify green)"
+        out.push(Row(text: "keys: {next}, x aborts", id: ""))
+    out
+
+fn quoted(s str) str
+    "\"{s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")}\""
+
+fn list_json(xs List[str]) str
+    "[{[quoted(x) for x in xs].join(",")}]"
+
+## The panel as one JSON object (`--print --json`, D4).
+pub fn panel_json(job Job, imp Impact) str
+    state := if job.open then "open" else "none"
+    "\{\"task\":{quoted(state)},\"goal\":{quoted(job.goal)},\"program\":{quoted(job.program)},\"rev\":{quoted(job.rev)},\"verified\":{quoted(job.last)},\"impact\":\{\"ok\":{imp.ok},\"partial\":{imp.partial},\"changed\":{list_json(imp.changed)},\"affected\":{list_json(imp.affected)},\"tests\":{list_json(imp.tests)},\"effects\":{list_json(imp.effects)}}}"
+
+## The panel key to the `ail task` subcommand it runs, or "".
+pub fn action_for(k str) str
+    if k == "v"
+        return "verify"
+    if k == "f"
+        return "finish"
+    if k == "x"
+        return "abort"
+    ""
+
+## What `ail task verify --json` or `finish --json` says, as rows.
+pub fn answer_rows(out str) List[str]
+    j := parse_json(out.trim()) else return [l for l in out.lines() if l.trim() != ""]
+    mut rows := List[str]()
+    r := text_of(j, "result")
+    if r != ""
+        rows.push("verify {r} at {text_of(j, "stage")}")
+    elif text_of(j, "task") != ""
+        rows.push("task {text_of(j, "task")}: {text_of(j, "goal")}")
+    for l in text_of(j, "output").lines()
+        rows.push(l)
+    rows.push("next: {text_of(j, "next")}")
+    rows
+
+IMPACT_JSON := "\{\"changed\":[\"fn:add\"],\"affected\":[\"fn:add\",\"fn:main\",\"fn:adds\"],\"tests\":[\"adds\"],\"effects\":[\{\"id\":\"fn:main\",\"old\":[],\"new\":[\"io\"]}]}"
+
+@test fn the_task_file_is_read()
+    t := parse_job("program=a.ail\ngoal=make it fast\nrev=HEAD~1\nlast=red\n")
+    assert(t.open)
+    assert_eq(t.goal, "make it fast")
+    assert_eq(t.rev, "HEAD~1")
+    assert_eq(t.last, "red")
+    assert(not parse_job("").open)
+
+@test fn impact_json_is_parsed_and_marked()
+    imp := parse_impact(IMPACT_JSON)
+    assert(imp.ok)
+    assert(not imp.partial)
+    assert_eq(imp.tests, ["adds"])
+    assert_eq(imp.effects, ["fn:main:  -> io"])
+    marks := marked_lines(["fn:add", "fn:main", "fn:other"], [5, 8, 12], imp)
+    assert_eq(marks.len(), 2)
+    assert(marks.contains(4) and marks.contains(7))
+    assert(not parse_impact("error: nosuch").ok)
+
+@test fn the_panel_shows_what_task_status_shows()
+    rows := panel_rows(
+        parse_job("program=a.ail\ngoal=g\nrev=HEAD\nlast=green\n"),
+        parse_impact(IMPACT_JSON),
+    )
+    assert_eq(rows[0].text, "task: g")
+    assert_eq(rows[2].text, "verified: green")
+    assert_eq(rows[3].text, "impact: 1 changed, 3 affected, 1 tests")
+    assert_eq(rows[4].id, "fn:add")
+    assert_eq(rows[rows.len() - 1].text, "keys: f finishes (last verify green), x aborts")
+    none_open := panel_rows(parse_job(""), parse_impact(""))
+    assert_eq(none_open[0].text, "no open task here")
+
+@test fn the_panel_is_json_for_agents()
+    js := panel_json(
+        parse_job("program=a.ail\ngoal=g\nrev=HEAD\nlast=none\n"),
+        parse_impact(IMPACT_JSON),
+    )
+    j := parse_json(js) else Json.Null
+    assert_eq(text_of(j, "task"), "open")
+    assert_eq(strings_of((j.get("impact") else Json.Null), "tests"), ["adds"])
+
+@test fn verify_answers_become_rows()
+    rows := answer_rows("\{\"result\":\"red\",\"stage\":\"test\",\"output\":\"a\\nb\",\"next\":\"fix it\"}")
+    assert_eq(rows, ["verify red at test", "a", "b", "next: fix it"])
+    assert_eq(action_for("v"), "verify")
+    assert_eq(action_for("q"), "")
