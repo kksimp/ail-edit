@@ -1,0 +1,345 @@
+## features/ask (plan S8, api.ask.1-6, api.tok.1): the ask bar, the call
+## hierarchy, workspace go-to-symbol and the token meter. Each one runs the
+## `ail` command that owns it (`ail ask`, `ail api --text`, `ail api
+## --tokens`) and turns the output into rows; nothing here analyses a
+## program. The module knows no editor type: `edit.ail` converts a `Site`
+## into its own hit.
+use std.proc
+
+## One row of an answer. `line` 0 is a heading or a note that can't be
+## jumped to. `kind` is `head`, `site` or `effect`; `id` is the declaration
+## the row names (`fn:pay`), when it has one.
+pub struct Site
+    pub file str
+    pub line int
+    pub col int
+    pub id str
+    pub kind str
+    pub text str
+
+## What `ail ask` said: the rows, or the reason there are none. ## empty when the question was answered or had no answers.
+pub struct Asked
+    pub rows List[Site]
+    pub problem str
+
+fn jstr(j Json, key str) str
+    (j.get(key) else Json.Null).as_str() else ""
+
+fn jint(j Json, key str) int
+    ((j.get(key) else Json.Null).as_num() else 0.0).to_int()
+
+fn jarr(j Json, key str) List[Json]
+    (j.get(key) else Json.Null).as_arr() else List[Json]()
+
+## The rows of `ail ask --json` output (api.ask.2-5): per target a heading
+## `ID  (N)`, then its sites, or for `effects` one row per effect. `file`
+## is the path `ail ask` was given; `real` is shown instead.
+pub fn parse_answers(text str, file str, real str) List[Site]
+    mut out := List[Site]()
+    j := parse_json(text.trim()) else return out
+    for t in j.as_arr() else List[Json]()
+        id := jstr(t, "target")
+        answers := jarr(t, "answers")
+        out.push(note(id, "head", "{id}  ({answers.len()})"))
+        for a in answers
+            if jstr(a, "effect") != ""
+                out.push(note(id, "effect", "  {jstr(a, "effect")}: {jstr(a, "via")}"))
+                continue
+            mut f := jstr(a, "file")
+            if f == file
+                f = real
+            at := "{f}:{jint(a, "line")}:{jint(a, "col")}"
+            from := jstr(a, "in")
+            kind := jstr(a, "kind")
+            mut who := from
+            mut next := from
+            if kind == "callee"
+                who = jstr(a, "target")
+                next = who
+            elif from == ""
+                who = "(top level)"
+            out.push(Site(
+                file: f,
+                line: jint(a, "line"),
+                col: jint(a, "col"),
+                id: next,
+                kind: "site",
+                text: "  {at}: {who}  {kind}",
+            ))
+    out
+
+## The reason `ail ask` failed: its last `error:` line.
+fn error_line(stderr str) str
+    mut found := ""
+    for l in stderr.lines()
+        if l.starts_with("error:")
+            found = l.trim()
+    if found == ""
+        return "ail ask failed"
+    found
+
+## Runs `ail ask FILE QUESTION --json` (the question is plain words,
+## api.ask.1). `real` is the file as the editor knows it, when `file` is a
+## copy of an unsaved buffer.
+pub fn query(ail str, file str, real str, question str) Asked
+    r := proc.run(ail, ["ask", file, question, "--json"]) else err
+        return Asked(rows: [], problem: "can't run {err.cmd}: {err.kind}")
+    if r.status == 2
+        return Asked(rows: [], problem: error_line(r.err))
+    Asked(rows: parse_answers(r.out, file, real), problem: "")
+
+## True when a row of `rows` is a site, not a heading.
+pub fn has_sites(rows List[Site]) bool
+    for s in rows
+        if s.kind != "head"
+            return true
+    false
+
+# ---- Call hierarchy -------------------------------------------------------
+
+## The most declarations one hierarchy lists, so it costs a bounded number
+## of `ail ask` runs.
+MAX_NODES := 24
+
+## What a hierarchy run needs: the `ail` command, the file `ail ask` is
+## given, the file shown, and the direction.
+struct Ctx
+    ail str
+    file str
+    real str
+    incoming bool
+
+## A row that is only text.
+fn note(id str, kind str, text str) Site
+    Site(file: "", line: 0, col: 0, id: id, kind: kind, text: text)
+
+fn grow(c Ctx, subject str, depth int, indent str, mut seen Set[str], mut out List[Site])
+    if depth == 0 or seen.len() >= MAX_NODES
+        return
+    mut q := "what does {subject} call"
+    if c.incoming
+        q = "what calls {subject}"
+    got := query(c.ail, c.file, c.real, q)
+    if got.problem != ""
+        out.push(note("", "head", "{indent}{got.problem}"))
+        return
+    for s in got.rows
+        if s.kind == "head"
+            if indent == ""
+                out.push(note(s.id, "head", s.text))
+            continue
+        out.push(Site(
+            file: s.file,
+            line: s.line,
+            col: s.col,
+            id: s.id,
+            kind: "site",
+            text: "{indent}{s.id}  {s.file}:{s.line}:{s.col}",
+        ))
+        if s.id != "" and seen.add(s.id)
+            grow(c, s.id, depth - 1, "{indent}  ", mut seen, mut out)
+
+## The call hierarchy of `name`: who calls it (`incoming`) or what it calls,
+## `depth` levels down, each declaration expanded once (api.ask.3).
+pub fn hierarchy(ail str, file str, real str, name str, incoming bool, depth int) List[Site]
+    c := Ctx(ail: ail, file: file, real: real, incoming: incoming)
+    mut seen := Set[str]()
+    mut out := List[Site]()
+    grow(c, name, depth, "", mut seen, mut out)
+    out
+
+# ---- Workspace go-to-symbol -----------------------------------------------
+
+## The declarations in `ail api --text` output whose text contains `query`
+## (any case) as rows in `file`; every declaration for an empty query.
+pub fn symbol_rows(outline str, file str, needle str) List[Site]
+    mut out := List[Site]()
+    want := needle.to_lower()
+    for l in outline.lines()
+        t := l.trim()
+        if t == ""
+            continue
+        words := t.split(" ")
+        n := words[0].to_int() else continue
+        sig := words[1..].join(" ").trim()
+        if sig == "" or sig.starts_with("##")
+            continue
+        if want != "" and not sig.to_lower().contains(want)
+            continue
+        out.push(Site(file: file, line: n, col: 1, id: "", kind: "site", text: "{file}:{n}: {sig}"))
+    out
+
+# ---- Token meter ----------------------------------------------------------
+
+## The layout and bracketing lines of `ail api --tokens` that are not
+## tokens a person reads (api.tok.2).
+NOT_TOKENS := ["nl", "indent", "dedent", "eof", "end", "lit", "code", "fmt", "comment", "diag"]
+
+## The tokens in `ail api --tokens` output (api.tok.1-3): the lexer's
+## tokens without layout, comments and diagnostics. An interpolated string
+## is one token.
+pub fn count_tokens(text str) int
+    mut n := 0
+    for l in text.lines()
+        words := l.split(" ")
+        if words.len() < 2 or not words[0].contains(":")
+            continue
+        if NOT_TOKENS.contains(words[1])
+            continue
+        n += 1
+    n
+
+## The token count of the file `file`, or `none` when `ail` can't be run.
+pub fn tokens_of(ail str, file str) int?
+    r := proc.run(ail, ["api", "--tokens", file]) else return none
+    if r.out.trim() == ""
+        return none
+    count_tokens(r.out)
+
+# ---- The bar's state ------------------------------------------------------
+
+## The ask bar and the token meter's numbers, one field of the workspace.
+## `mode` is 0 for a question, 1 for go-to-symbol.
+pub struct Bar
+    pub open bool
+    pub mode int
+    pub text str
+    ## The file the meter counted, its save count then, and the counts; -1
+    ## is not counted.
+    pub path str
+    pub saves int
+    pub file_tokens int
+    pub sel_tokens int
+    ## The palette hides the meter.
+    pub hidden bool
+
+pub fn Bar.new() Bar
+    Bar(
+        open: false,
+        mode: 0,
+        text: "",
+        path: "",
+        saves: -1,
+        file_tokens: -1,
+        sel_tokens: -1,
+        hidden: false,
+    )
+
+## Opens the bar for a question (mode 0) or a symbol (mode 1).
+pub fn Bar.start(mut self, how int)
+    open = true
+    mode = how
+    text = ""
+
+## The prompt the bar shows before what is typed.
+pub fn Bar.prompt(self) str
+    if mode == 1
+        return " go to symbol: "
+    " ask: "
+
+## One key in the bar: `run` for Enter, `close` for Escape, else empty.
+pub fn Bar.key(mut self, k str) str
+    if k == "escape"
+        open = false
+        return "close"
+    if k == "enter"
+        open = false
+        return "run"
+    if k == "backspace"
+        cs := text.chars()
+        if cs.len() > 0
+            text = cs[..cs.len() - 1].join("")
+    elif k.chars().len() == 1
+        text = "{text}{k}"
+    ""
+
+## Whether the meter has to count again: another file or a new save.
+pub fn Bar.stale(self, now_path str, now_saves int) bool
+    now_path != path or now_saves != saves
+
+## Records a count of the file `now_path` as of `now_saves` saves.
+pub fn Bar.counted(mut self, now_path str, now_saves int, tokens int)
+    path = now_path
+    saves = now_saves
+    file_tokens = tokens
+    sel_tokens = -1
+
+## Records the count of the selection (-1 for none).
+pub fn Bar.selected(mut self, tokens int)
+    sel_tokens = tokens
+
+## The meter on the status row: `tok 1234`, with the selection's after it.
+pub fn Bar.toggle(mut self)
+    hidden = not hidden
+
+pub fn Bar.segment(self) str
+    if file_tokens < 0 or hidden
+        return ""
+    if sel_tokens >= 0
+        return " tok {file_tokens} (sel {sel_tokens}) "
+    " tok {file_tokens} "
+
+@test fn answers_from_ask_json()
+    out := "[\{\"target\":\"field:Cart.total\",\"answers\":[\{\"in\":\"fn:add\",\"target\":\"field:Cart.total\",\"kind\":\"write\",\"file\":\"a.ail.edit-check.ail\",\"line\":5,\"col\":5}]}]"
+    rows := parse_answers(out, "a.ail.edit-check.ail", "a.ail")
+    assert_eq(rows.len(), 2)
+    assert_eq(rows[0].text, "field:Cart.total  (1)")
+    assert_eq(rows[0].line, 0)
+    assert_eq(rows[1].file, "a.ail")
+    assert_eq(rows[1].line, 5)
+    assert_eq(rows[1].id, "fn:add")
+    assert_eq(rows[1].text, "  a.ail:5:5: fn:add  write")
+
+@test fn callees_and_effects_rows()
+    out := "[\{\"target\":\"fn:main\",\"answers\":[\{\"in\":\"fn:main\",\"target\":\"fn:pay\",\"kind\":\"callee\",\"file\":\"a.ail\",\"line\":9,\"col\":5}]},\{\"target\":\"fn:run\",\"answers\":[\{\"effect\":\"io\",\"via\":\"fn:run > fn:log\"}]}]"
+    rows := parse_answers(out, "a.ail", "a.ail")
+    assert_eq(rows.len(), 4)
+    assert_eq(rows[1].id, "fn:pay")
+    assert_eq(rows[1].text, "  a.ail:9:5: fn:pay  callee")
+    assert_eq(rows[3].kind, "effect")
+    assert_eq(rows[3].text, "  io: fn:run > fn:log")
+    assert_eq(rows[3].line, 0)
+    assert_eq(has_sites(rows), true)
+    assert_eq(has_sites(parse_answers("[]", "a", "a")), false)
+
+@test fn errors_read_the_last_error_line()
+    assert_eq(
+        error_line("x\nerror: no function named `f` (api.ask.1)\n"),
+        "error: no function named `f` (api.ask.1)",
+    )
+    assert_eq(error_line(""), "ail ask failed")
+
+@test fn symbols_filter_the_outline()
+    outline := "    1  struct Cart\n    4  fn add(c Cart)\n        ## Adds.\n    9  fn main()\n"
+    assert_eq(symbol_rows(outline, "a.ail", "").len(), 3)
+    got := symbol_rows(outline, "a.ail", "ADD")
+    assert_eq(got.len(), 1)
+    assert_eq(got[0].line, 4)
+    assert_eq(got[0].text, "a.ail:4: fn add(c Cart)")
+
+@test fn tokens_skip_layout_and_comments()
+    out := "1:1 kw fn\n1:4 id main\n1:8 sym (\n1:9 sym )\n1:10 nl\n2:1 indent\n2:5 id print\n2:11 interp\n2:12 lit hi\n2:15 end\n3:1 dedent\n3:1 eof\n1:12 comment x\n1:1 diag lex.x.1\n"
+    assert_eq(count_tokens(out), 6)
+    assert_eq(count_tokens(""), 0)
+
+@test fn the_bar_types_and_ends()
+    mut b := Bar.new()
+    b.start(0)
+    assert_eq(b.key("w"), "")
+    assert_eq(b.key("x"), "")
+    assert_eq(b.key("backspace"), "")
+    assert_eq(b.text, "w")
+    assert_eq(b.key("enter"), "run")
+    assert_eq(b.open, false)
+    b.start(1)
+    assert_eq(b.key("escape"), "close")
+    assert_eq(b.segment(), "")
+    b.file_tokens = 12
+    assert_eq(b.segment(), " tok 12 ")
+    b.sel_tokens = 3
+    assert_eq(b.segment(), " tok 12 (sel 3) ")
+    b.toggle()
+    assert_eq(b.segment(), "")
+    b.toggle()
+    assert_eq(b.stale("", -1), false)
+    assert_eq(b.stale("a.ail", 0), true)

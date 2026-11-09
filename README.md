@@ -109,6 +109,11 @@ The same list is the command palette (Ctrl-Shift-P, ADR 0291).
 | F7 | Run `ail task verify` (check, then the affected tests) and show the answer: result, failing stage, last lines, next step (S4) |
 | Ctrl-Shift-H | Type what to find, Enter, the replacement, Enter: every changed line of the project's `.ail` files is previewed old -> new; Space skips or accepts a row, A accepts all; Ctrl-Enter applies the accepted rows to the buffers (files open as tabs, nothing saved, Ctrl-Z undoes per tab), Esc cancels (ADRs 0339, 0353) |
 | Ctrl-Shift-F | Search every `.ail` file under the directory (open tabs as edited); the matches fill the pane, Up/Down select, Enter jumps, Esc closes (ADR 0292) |
+| Ctrl-Shift-A | Ask the program a question in plain words (`ail ask`: who writes F, who reads F, what calls f, what does f call, which effects reach f, who uses T); the answers fill the pane, Up/Down select, Enter jumps (api.ask.1-6) |
+| Alt-Shift-H | The callers and callees of the function under the cursor, three levels down (`ail ask`); Up/Down, Enter jumps to a call |
+| Ctrl-T | Type part of a declaration's text: matches in every `.ail` file under the directory (`ail api --text`); Up/Down, Enter jumps |
+| palette | Count the tokens of the buffer and of the selection (`ail api --tokens`) and say so in the message |
+| palette | Show or hide the file's token count at the right of the status row (shown by default; refreshed on save) |
 | F4 | Jump to the next match of the last project search |
 | Ctrl-P | Open a file: type part of its path (letters in order), Up/Down, Enter |
 | Ctrl-Tab | Next tab; a click on a tab selects it |
