@@ -109,7 +109,15 @@ pub struct Metrics
 
 ## The metrics for a canvas of `w` by `h` points. `cell_w` and `cell_h` are the
 ## host's measure of one `mono` character at 13 points (std.app.5).
-pub fn metrics(w float, h float, cell_w float, cell_h float, size float, minimap bool, x0 float) Metrics
+pub fn metrics(
+    w float,
+    h float,
+    cell_w float,
+    cell_h float,
+    size float,
+    minimap bool,
+    x0 float,
+) Metrics
     k := size / 13.0
     cw := (cell_w * k).max(1.0)
     ch := (cell_h * k).max(MIN_LINE_H)
@@ -242,7 +250,14 @@ pub fn tab_ops(f Frame, m Metrics) List[app.Op]
         elif i == f.hover_tab
             ops.push(app.Op.Shade(x: x, y: 0.0, w: w, h: m.tab_h, color: c.fg, alpha: 0.08))
         if i == f.hover_tab and f.hover_close
-            ops.push(app.Op.Shade(x: x + w - TAB_CLOSE_W, y: 4.0, w: TAB_CLOSE_W - 2.0, h: m.tab_h - 8.0, color: c.fg, alpha: 0.15))
+            ops.push(app.Op.Shade(
+                x: x + w - TAB_CLOSE_W,
+                y: 4.0,
+                w: TAB_CLOSE_W - 2.0,
+                h: m.tab_h - 8.0,
+                color: c.fg,
+                alpha: 0.15,
+            ))
         if i == f.drag_tab
             ops.push(app.Op.Shade(x: x, y: 0.0, w: w, h: m.tab_h, color: c.select_bg, alpha: 0.35))
         mut fg := c.gutter_fg
@@ -278,7 +293,11 @@ pub fn tab_ops(f Frame, m Metrics) List[app.Op]
             ))
         x += w
     if f.drag_tab >= 0 and f.drop_tab >= 0
-        dx := tab_x(f.tabs, size, f.drop_tab) + (if f.drop_tab > f.drag_tab then tab_w(f.tabs[f.drop_tab], size) else 0.0)
+        dx := tab_x(
+            f.tabs,
+            size,
+            f.drop_tab,
+        ) + (if f.drop_tab > f.drag_tab then tab_w(f.tabs[f.drop_tab], size) else 0.0)
         ops.push(app.draw_rect(dx - 1.0, 2.0, 2.0, m.tab_h - 4.0, c.status_bg))
     ops
 
@@ -299,13 +318,55 @@ pub fn activity_ops(f Frame, m Metrics) List[app.Op]
         if i == 0
             for k in 0..3
                 ky := cy - 6.0 + k.to_float() * 6.0
-                ops.push(app.Op.Stroke(x1: cx - 8.0, y1: ky, x2: cx + 8.0, y2: ky, color: fg, width: 1.6))
+                ops.push(app.Op.Stroke(
+                    x1: cx - 8.0,
+                    y1: ky,
+                    x2: cx + 8.0,
+                    y2: ky,
+                    color: fg,
+                    width: 1.6,
+                ))
         elif i == 1
-            ops.push(app.Op.Stroke(x1: cx - 6.0, y1: cy - 6.0, x2: cx + 2.0, y2: cy - 6.0, color: fg, width: 1.6))
-            ops.push(app.Op.Stroke(x1: cx + 2.0, y1: cy - 6.0, x2: cx + 2.0, y2: cy + 2.0, color: fg, width: 1.6))
-            ops.push(app.Op.Stroke(x1: cx + 2.0, y1: cy + 2.0, x2: cx - 6.0, y2: cy + 2.0, color: fg, width: 1.6))
-            ops.push(app.Op.Stroke(x1: cx - 6.0, y1: cy + 2.0, x2: cx - 6.0, y2: cy - 6.0, color: fg, width: 1.6))
-            ops.push(app.Op.Stroke(x1: cx + 2.0, y1: cy + 2.0, x2: cx + 8.0, y2: cy + 8.0, color: fg, width: 1.8))
+            ops.push(app.Op.Stroke(
+                x1: cx - 6.0,
+                y1: cy - 6.0,
+                x2: cx + 2.0,
+                y2: cy - 6.0,
+                color: fg,
+                width: 1.6,
+            ))
+            ops.push(app.Op.Stroke(
+                x1: cx + 2.0,
+                y1: cy - 6.0,
+                x2: cx + 2.0,
+                y2: cy + 2.0,
+                color: fg,
+                width: 1.6,
+            ))
+            ops.push(app.Op.Stroke(
+                x1: cx + 2.0,
+                y1: cy + 2.0,
+                x2: cx - 6.0,
+                y2: cy + 2.0,
+                color: fg,
+                width: 1.6,
+            ))
+            ops.push(app.Op.Stroke(
+                x1: cx - 6.0,
+                y1: cy + 2.0,
+                x2: cx - 6.0,
+                y2: cy - 6.0,
+                color: fg,
+                width: 1.6,
+            ))
+            ops.push(app.Op.Stroke(
+                x1: cx + 2.0,
+                y1: cy + 2.0,
+                x2: cx + 8.0,
+                y2: cy + 8.0,
+                color: fg,
+                width: 1.8,
+            ))
         else
             mark := if f.hover_act == i then c.error_fg else fg
             ops.push(txt(cx - 3.0, cy - 9.0, "!", mark, 16.0, true))
@@ -322,7 +383,13 @@ pub fn grid_ops(f Frame, m Metrics) List[app.Op]
             continue
         if r.bg != c.bg
             n := r.text.chars().len().to_float()
-            ops.push(app.draw_rect(m.x0 + r.col.to_float() * m.cw, row_y(m, r.row), n * m.cw, m.ch, r.bg))
+            ops.push(app.draw_rect(
+                m.x0 + r.col.to_float() * m.cw,
+                row_y(m, r.row),
+                n * m.cw,
+                m.ch,
+                r.bg,
+            ))
     for r in f.runs
         if r.row <= 0 or r.row == f.status_row
             continue
@@ -334,7 +401,13 @@ pub fn grid_ops(f Frame, m Metrics) List[app.Op]
 pub fn caret_ops(f Frame, m Metrics) List[app.Op]
     if f.cursor_row <= 0 or f.cursor_col < 0
         return []
-    [app.draw_rect(m.x0 + f.cursor_col.to_float() * m.cw, row_y(m, f.cursor_row), 2.0, m.ch, f.colors.fg)]
+    [app.draw_rect(
+        m.x0 + f.cursor_col.to_float() * m.cw,
+        row_y(m, f.cursor_row),
+        2.0,
+        m.ch,
+        f.colors.fg,
+    )]
 
 ## The status bar: `status` in sans type on the status color, across the window.
 pub fn status_ops(f Frame, m Metrics) List[app.Op]
