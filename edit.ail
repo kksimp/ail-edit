@@ -11,12 +11,16 @@ use std.proc
 use std.regex
 use std.time
 use std.ui
+use std.app
+use std.io
 use std.ui.widgets
 use std.screen.cells as scells
 use themes
 use features.workspace
+use window as win
 use features.diff as sdiff
 use features.tests as ttree
+use features.taskpanel as tp
 
 # Colors, 0xRRGGBB.
 BG := 0x1e1e1e
@@ -193,6 +197,8 @@ struct Editor
     missed Set[int]
     ## Lines that differ from git HEAD (Ctrl-Shift-G, S5), 0-based; cleared by an edit.
     git_marks Set[int]
+    ## Lines of declarations the edit since the base revision affects (S4), 0-based; cleared by an edit.
+    impact Set[int]
     ## Successful saves, so the workspace can check the other tabs.
     saves int
     ## The last tests-on-save result for the status line, or "" (ADR 0354).
@@ -240,6 +246,7 @@ fn Editor.new(path str, text str, cols int, rows int) Editor
         rename: RenamePlan(name: "", at: [], semantic: false),
         missed: Set[int](),
         git_marks: Set[int](),
+        impact: Set[int](),
         saves: 0,
         tests: "",
         comp_sel: 0,
@@ -266,6 +273,7 @@ fn Editor.snapshot(mut self)
     diags = []
     missed = Set[int]()
     git_marks = Set[int]()
+    impact = Set[int]()
 
 fn Editor.set_col(mut self, c int)
     col = c
@@ -1426,6 +1434,8 @@ fn Editor.render(self) Screen
             s.put(r, 0, "{num.pad_left(gw - 1, ' ')}!", ERROR_FG, bg)
         elif git_marks.contains(l)
             s.put(r, 0, "{num.pad_left(gw - 1, ' ')}+", COMMENT_FG, bg)
+        elif impact.contains(l)
+            s.put(r, 0, "{num.pad_left(gw - 1, ' ')}~", WARN_FG, bg)
         else
             s.put(r, 0, "{num.pad_left(gw - 1, ' ')} ", GUTTER_FG, bg)
         cs := lines[l].chars()
@@ -2525,6 +2535,11 @@ ADD_REFS_JSON := "\{\"api\":1,\"symbol\":\"fn:add\",\"refs\":[\{\"file\":\"t.ail
         assert(r.name != "")
     ws.run_command("nonesuch")
     assert_eq(ws.message, "no command `nonesuch`")
+    ws.run_command("Toggle minimap")
+    ws.run_command("Toggle zen mode")
+    assert(ws.minimap and ws.zen)
+    ws.run_command("Toggle zen mode")
+    assert(not ws.zen)
 
 @test fn changed_lines_show_in_the_gutter()
     mut ed := Editor.new("t.ail", "a\nb\nc\n", 40, 10)
@@ -3876,6 +3891,24 @@ fn key_rows() List[KeyRow]
             "As replay, with every trace event (`ail test --trace=all --bundle`) (S6)",
         ),
         key_row(
+            "Ctrl-Shift-K",
+            "Task panel",
+            "ctrl+shift+k",
+            "The open `ail task` (`.ail-task`): goal, base, last verify, and the impact since the base (`ail ask --affected --json`): changed and affected declarations, affected tests, changed effects; Up/Down, Enter jumps; V verifies, F finishes, X aborts (`ail task`). After each save, affected declarations are marked `~` in the gutter until the next edit (S4)",
+        ),
+        key_row(
+            "F8",
+            "Affected tests",
+            "f8",
+            "Run only the tests the changes since the base can reach (`ail test --affected`, since the open task's base, else `HEAD`); the saved file is compared, so save first (S4)",
+        ),
+        key_row(
+            "F7",
+            "Task verify",
+            "f7",
+            "Run `ail task verify` (check, then the affected tests) and show the answer: result, failing stage, last lines, next step (S4)",
+        ),
+        key_row(
             "Ctrl-Shift-H",
             "Replace in files",
             "ctrl+shift+h",
@@ -3953,6 +3986,13 @@ fn key_rows() List[KeyRow]
             "Quit; with unsaved changes in any tab, press it twice. Closing the window counts as Ctrl-Q",
         ),
         key_row(
+            "Palette",
+            "Toggle minimap",
+            "",
+            "Show or hide the minimap beside the text (window)",
+        ),
+        key_row("Palette", "Toggle zen mode", "", "Hide the tab strip and status bar (window)"),
+        key_row(
             "Mouse",
             "",
             "",
@@ -4012,6 +4052,9 @@ enum WsKey
     Settings
     NewProject
     TestTool(mode str)
+    TaskPanel
+    AffectedTests
+    TaskVerify
     Zoom(key str)
     Diff(kind str)
 
@@ -4023,6 +4066,10 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
             return Trace
         if k == "f6" and shift
             return TestTool("one")
+        if k == "f7" and not shift
+            return TaskVerify
+        if k == "f8" and not shift
+            return AffectedTests
         if k == "f12" and shift
             return References
         return none
@@ -4050,6 +4097,7 @@ fn workspace_key(k str, ctrl bool, shift bool) WsKey?
             "y" | "Y" => TestTool("replay")
             "z" | "Z" => TestTool("shrink")
             "x" | "X" => TestTool("contracts")
+            "k" | "K" => TaskPanel
             _ => none
     match k
         "b" | "B" => Tree
@@ -4139,6 +4187,8 @@ fn Workspace.run_command(mut self, name str)
         "Rebind a key" => start_mode("bind", "rebind: ")
         "Welcome screen" => welcome = true
         "New file" => start_new_file()
+        "Toggle minimap" => minimap = not minimap
+        "Toggle zen mode" => zen = not zen
         "API diff" => diff_view("api")
         "Git change gutter" => diff_view("gutter")
         "Update preview" => test_tool("preview")
@@ -4218,6 +4268,9 @@ struct Workspace
     gitmarks bool
     git Map[str, str]
     welcome bool
+    ## Palette toggles of the window: the minimap and zen mode.
+    minimap bool
+    zen bool
 
 fn Workspace.new(ed Editor) Workspace
     Workspace(
@@ -4262,6 +4315,8 @@ fn Workspace.new(ed Editor) Workspace
         gitmarks: false,
         git: Map[str, str](),
         welcome: false,
+        minimap: false,
+        zen: false,
     )
 
 ## The file name a tab shows: the path after its last `/`.
@@ -4403,6 +4458,9 @@ fn Workspace.dispatch(mut self, ev ui.Event)
                     Problems => problems()
                     References => show_references()
                     ReplaceInFiles => start_replace()
+                    TaskPanel => task_panel()
+                    AffectedTests => eds[active].affected_tests()
+                    TaskVerify => task_action("verify")
                     TestOnSave =>
                         test_on_save = not test_on_save
                         if test_on_save
@@ -4415,6 +4473,7 @@ fn Workspace.dispatch(mut self, ev ui.Event)
             if eds[active].saves != saves
                 refresh_git()
                 check_other_tabs()
+                eds[active].impact_refresh()
                 if hits_title.starts_with("program card")
                     card_view()
                 if live_problems
@@ -4871,6 +4930,9 @@ fn Workspace.hits_key(mut self, k str) bool
     if hits.len() == 0
         browsing = false
         return false
+    if hits_title.starts_with("task") and tp.action_for(k) != ""
+        task_action(tp.action_for(k))
+        return true
     if k == "up"
         hit_sel = (hit_sel - 1).max(0)
     elif k == "down"
@@ -5171,6 +5233,114 @@ fn Editor.coverage(mut self)
             message = "coverage: lines {jint(j, "lines_hit")}/{jint(j, "lines")}, functions {jint(j, "functions_hit")}/{jint(j, "functions")}; unrun lines are marked; an edit clears them"
             return
     message = "no coverage: does the file have @test functions? (exit {r.status})"
+
+# ---- The task panel and impact gutter (S4, features/taskpanel) ---------------
+
+## The open task, from `.ail-task` in the working directory (task.state.1).
+fn task_job() tp.Job
+    text := fs.read_text(".ail-task") else return tp.parse_job("")
+    tp.parse_job(text)
+
+## `ail ask FILE --affected --json` against `rev` (api.impact.3-4).
+fn impact_of(file str, rev str) tp.Impact
+    r := proc.run(ail_command(), [
+        "ask",
+        file,
+        "--affected",
+        "--rev",
+        rev,
+        "--json",
+    ]) else return tp.parse_impact("")
+    tp.parse_impact(r.out)
+
+## After a save: marks the affected declarations in the gutter. Nothing is
+## marked when the file can't be compared (no git revision, or errors).
+fn Editor.impact_refresh(mut self)
+    if dirty
+        return
+    job := task_job()
+    mut rev := "HEAD"
+    if job.open and job.program == path
+        rev = job.rev
+    imp := impact_of(path, rev)
+    mut ids := List[str]()
+    mut at := List[int]()
+    for sym in symbols
+        ids.push(sym.id)
+        at.push(sym.line)
+    impact = tp.marked_lines(ids, at, imp)
+
+## Ctrl-Shift-Y: only the tests the changes can reach (test.affected.1).
+fn Editor.affected_tests(mut self)
+    if dirty
+        message = "affected tests compare the saved file: save first"
+        return
+    job := task_job()
+    mut args := ["test", path, "--affected"]
+    if job.open and job.program == path
+        args.push("--since")
+        args.push(job.rev)
+    r := proc.run(ail_command(), args) else err
+        message = "can't run {err.cmd}: {err.kind}"
+        return
+    show_output("test --affected", r)
+
+## The panel's task and impact: the open task's program, else the active tab.
+fn Workspace.task_impact(self, job tp.Job) tp.Impact
+    if job.open
+        return impact_of(job.program, job.rev)
+    if eds[active].dirty
+        return tp.parse_impact("")
+    impact_of(eds[active].path, "HEAD")
+
+## `--print --task-json`: the panel for agents (plan D4).
+fn Workspace.task_json(self) str
+    job := task_job()
+    tp.panel_json(job, task_impact(job))
+
+## Ctrl-Shift-K: the task panel as a list; a row with a declaration jumps to it.
+fn Workspace.task_panel(mut self)
+    job := task_job()
+    ed := eds[active]
+    mut found := List[Hit]()
+    for r in tp.panel_rows(job, task_impact(job))
+        mut loc := Loc(path: "", line: 0, col: 0)
+        for sym in ed.symbols
+            if r.id != "" and sym.id == r.id
+                loc = Loc(path: ed.path, line: sym.line, col: 1)
+        found.push(Hit(loc: loc, text: r.text))
+    show_list("task", found)
+
+## V, F or X in the panel: `ail task verify|finish|abort`, answer shown as rows.
+fn Workspace.task_action(mut self, sub str)
+    mut args := ["task", sub]
+    if sub != "abort"
+        args.push("--json")
+    r := proc.run(ail_command(), args) else err
+        message = "can't run {err.cmd}: {err.kind}"
+        return
+    mut found := List[Hit]()
+    for l in tp.answer_rows("{r.out}{r.err}")
+        found.push(Hit(loc: Loc(path: "", line: 0, col: 0), text: l))
+    show_list("task {sub}", found)
+
+@test fn the_task_panel_has_its_keys_and_marks_the_gutter()
+    kk := workspace_key("k", true, true) else Zoom("")
+    assert(kk == TaskPanel)
+    ky := workspace_key("f8", false, false) else Zoom("")
+    assert(ky == AffectedTests)
+    kv := workspace_key("f7", false, false) else Zoom("")
+    assert(kv == TaskVerify)
+    mut ed := typed("fn a()\n    1\n", [])
+    ed.impact = Set[int]()
+    ed.impact.add(0)
+    mut mark := ""
+    for sp in ed.render().spans
+        if sp.row == 0 and sp.col == 0
+            mark = sp.text
+    assert(mark.ends_with("~"))
+    ed.apply(Insert("x"))
+    assert_eq(ed.impact.len(), 0)
 
 # ---- The program card (Ctrl-Shift-I) --------------------------------------
 
@@ -5909,20 +6079,275 @@ fn Workspace.on_window_event(mut self, ev ui.Event, m ui.Modifiers)
     if not shift_click
         on_event(ev)
 
+# ---- Window front end (std.app, S1) --------------------------------------
+
+## The `std.app` window: the workspace drawn on a canvas (`window/`), pixel
+## events turned back into the cell events the workspace takes. The cell
+## `Screen` and every `--print` test are unchanged.
+struct Shell
+    ws Workspace
+    m win.Metrics
+    pw float
+    ph float
+    cellw float
+    cellh float
+    held bool
+    menu app.Popup?
+    sent List[str]
+    ready bool
+
+fn Shell.new(w Workspace) Shell
+    Shell(
+        ws: w,
+        m: win.metrics(1000.0, 700.0, 8.0, 16.0, 13.0, false),
+        pw: 1000.0,
+        ph: 700.0,
+        cellw: 8.0,
+        cellh: 16.0,
+        held: false,
+        menu: none,
+        sent: [],
+        ready: false,
+    )
+
+## The code's font size in points: the workspace's cell height, scaled.
+fn Shell.size(self) float
+    ws.font.to_float() * 0.65
+
+## Lays the grid out for the canvas and tells the workspace its new size.
+fn Shell.relayout(mut self)
+    next := win.metrics(pw, ph, cellw, cellh, size(), ws.minimap)
+    if not ready or next.cols != m.cols or next.rows != m.rows
+        ws.on_event(Resize(cols: next.cols, rows: next.rows))
+    m = next
+    ready = true
+
+## The tabs of the strip.
+fn Shell.tabs(self) List[win.Tab]
+    mut out := List[win.Tab]()
+    for i in 0..ws.eds.len()
+        e := ws.eds[i]
+        out.push(win.Tab(
+            name: base_name(e.path),
+            active: i == ws.active,
+            dirty: e.dirty,
+            errors: e.diag_count("error"),
+            warnings: e.diag_count("warning"),
+        ))
+    out
+
+## Everything one frame shows, from the workspace's `Screen`.
+fn Shell.frame(self) win.Frame
+    s := ws.render()
+    e := ws.eds[ws.active]
+    p := ws.pal
+    colors := win.Colors(
+        bg: p.bg_of(BG),
+        fg: p.fg_of(FG),
+        pane_bg: p.bg_of(PANE_BG),
+        line_bg: p.bg_of(LINE_BG),
+        status_bg: p.bg_of(STATUS_BG),
+        status_fg: p.fg_of(STATUS_FG),
+        gutter_fg: p.fg_of(GUTTER_FG),
+        select_bg: p.bg_of(SELECT_BG),
+        error_fg: p.fg_of(ERROR_FG),
+        warn_fg: p.fg_of(WARN_FG),
+    )
+    runs := [
+        win.Run(row: sp.row, col: sp.col, text: sp.text, fg: p.fg_of(sp.fg), bg: p.bg_of(sp.bg))
+        for sp in s.spans
+    ]
+    srow := 1 + e.text_rows()
+    mut status := ""
+    if srow < s.text.len()
+        cs := s.text[srow].chars()
+        if cs.len() > ws.left()
+            status = cs[ws.left()..].join("")
+    mut marks := List[win.Mark]()
+    for d in e.diags
+        marks.push(win.Mark(line: (d.line - 1).max(0), kind: d.severity))
+    mut lens := List[int]()
+    if ws.minimap
+        for l in e.lines
+            lens.push(l.chars().len())
+    win.Frame(
+        colors: colors,
+        runs: runs,
+        tabs: tabs(),
+        cols: s.cols,
+        rows: s.rows,
+        status_row: srow,
+        status: status,
+        cursor_col: s.cursor_col,
+        cursor_row: s.cursor_row,
+        left: ws.left(),
+        bar_from: 1,
+        bar_to: srow,
+        bar: win.Bar(top: e.top, total: e.lines.len(), visible: e.text_rows(), marks: marks),
+        minimap: ws.minimap,
+        zen: ws.zen,
+        lens: lens,
+    )
+
+## A key as the workspace takes it.
+fn Shell.press_key(mut self, spec win.KeySpec)
+    before := ws.eds[ws.active].clip
+    ws.on_event(Key(key: spec.key, ctrl: spec.ctrl, alt: spec.alt, shift: spec.shift))
+    after := ws.eds[ws.active].clip
+    if after != before
+        sent.push(app.clipboard(after))
+
+## A click on the scrollbar: the buffer scrolls to that fraction.
+fn Shell.click_bar(mut self, y float)
+    y0 := win.row_y(m, 1)
+    span := (win.row_y(m, 1 + ws.eds[ws.active].text_rows()) - y0).max(1.0)
+    total := ws.eds[ws.active].lines.len()
+    at := (((y - y0) / span).max(0.0).min(1.0) * total.to_float()).to_int()
+    ws.eds[ws.active].top = at.min(total - 1).max(0)
+
+## A press on the canvas: the tab strip, the scrollbar, a right-click menu,
+## or a cell of the grid.
+fn Shell.pointer_down(mut self, ev app.Event)
+    cell := win.cell_at(m, ev.x, ev.y)
+    if cell.row == 0
+        hit := win.tab_hit(tabs(), win.chrome_size(m), ev.x)
+        if hit.index >= 0 and ev.text == "left"
+            ws.active = hit.index
+            if hit.close
+                ws.close_tab()
+        return
+    if ev.x >= m.w - win.SCROLL_W
+        click_bar(ev.y)
+        return
+    if ev.text == "right"
+        menu = app.Popup(id: "ctx", x: ev.x, y: ev.y, items: win.MENU)
+        return
+    held = ev.text == "left"
+    ws.on_event(Mouse(col: cell.col, row: cell.row, button: "left", kind: "down"))
+
+impl app.App for Shell
+    fn update(mut self, ev app.Event)
+        match ev.kind
+            "resize" =>
+                if ev.id == "edit"
+                    pw = ev.dx
+                    ph = ev.dy
+                    cellw = ev.cell_w
+                    cellh = ev.cell_h
+            "key" =>
+                press_key(win.key_spec(ev.text, ev.ctrl, ev.meta, ev.alt, ev.shift))
+            "paste" =>
+                if ws.picking or ws.searching
+                    for c in ev.text.chars()
+                        ws.on_event(press("{c}"))
+                else
+                    ws.eds[ws.active].clip = ev.text
+                    ws.on_event(key_event("ctrl+v"))
+            "down" =>
+                pointer_down(ev)
+            "move" =>
+                if held
+                    cell := win.cell_at(m, ev.x, ev.y)
+                    ws.on_event(Mouse(col: cell.col, row: cell.row, button: "left", kind: "drag"))
+            "up" =>
+                if held
+                    held = false
+                    cell := win.cell_at(m, ev.x, ev.y)
+                    ws.on_event(Mouse(col: cell.col, row: cell.row, button: "left", kind: "up"))
+            "scroll" =>
+                n := win.wheel_lines(ev.dy, m.ch)
+                if n != 0
+                    ws.on_event(Scroll(lines: n))
+            "popup" =>
+                menu = none
+                k := win.menu_key(ev.text)
+                if k != ""
+                    ws.on_event(key_event(k))
+            "close" =>
+                ws.on_event(Close)
+            _ => held = held
+        ws.idle(time.now_ms())
+        relayout()
+        if ws.quit
+            if ws.remember
+                ws.save_session()
+            io.exit(0)
+
+    fn view(self) app.Node
+        app.canvas("edit", 0.0, 0.0, win.canvas_ops(frame(), m))
+
+    fn title(self) str
+        e := ws.eds[ws.active]
+        "{base_name(e.path)}{if e.dirty then " *" else ""} - edit"
+
+    fn popup(self) app.Popup?
+        menu
+
+    fn lines(mut self) List[str]
+        out := sent
+        sent = []
+        out
+
+    fn edge(self) bool
+        false
+
+@test fn the_app_shell_draws_and_edits_without_a_window()
+    mut sh := Shell.new(Workspace.new(Editor.new("t.ail", "fn main()\n", 100, 32)))
+    mut size := app.event("resize")
+    size.id = "edit"
+    size.dx = 800.0
+    size.dy = 500.0
+    size.cell_w = 8.0
+    size.cell_h = 16.0
+    mut kp := app.key("x")
+    kp.id = "edit"
+    shots := app.script(mut sh, [size, kp, kp])
+    assert(shots[2].contains("canvas #edit"))
+    assert_eq(sh.ws.eds[0].lines[0], "xxfn main()")
+    assert(sh.ws.eds[0].dirty)
+    assert_eq(sh.ws.cols, sh.m.cols)
+    assert_eq(sh.title(), "t.ail * - edit")
+    mut cp := app.key("c")
+    cp.meta = true
+    sh.update(cp)
+    assert_eq(sh.lines().len(), 0)
+
+## What both windows do first (S10): remember settings, take the font
+## (`--font`, else the saved one), reopen the last tabs unless starting on
+## the welcome screen, and show that screen when asked or when no file was given.
+fn Workspace.start_up(mut self, flags List[str])
+    font = font_flag(flags)
+    remember = true
+    load_prefs()
+    if not flags.contains("--font")
+        font = value_of("font").to_int() else 20
+    if value_of("restore") == "on" and not flags.contains("--start")
+        restore_session()
+    welcome = flags.contains("--welcome")
+    if flags.contains("--start") and value_of("welcome") == "on"
+        welcome = true
+
+## Opens the `std.app` window, or prints one screen when there is no host.
+fn app_main(mut ed Editor, flags List[str])
+    ed.index()
+    mut ws := Workspace.new(ed)
+    ws.start_up(flags)
+    mut name := saved_theme()
+    at := flags.index_of("--theme") else -1
+    if at >= 0 and at + 1 < flags.len()
+        name = flags[at + 1]
+    if not ws.set_theme(name)
+        ws.message = "no theme `{name}`: try {themes.NAMES.join(", ")}"
+    mut sh := Shell.new(ws)
+    app.run(mut sh) else err
+        print("edit: no window ({err.kind}: {err.message}); printing the screen instead")
+        print_screen(ed, flags)
+
 ## Opens the window, or prints one screen when there's no display.
 fn window_main(mut ed Editor, flags List[str])
     ed.index()
     mut ws := Workspace.new(ed)
-    ws.font = font_flag(flags)
-    ws.remember = true
-    ws.load_prefs()
-    if not flags.contains("--font")
-        ws.font = ws.value_of("font").to_int() else 20
-    if ws.value_of("restore") == "on" and not flags.contains("--start")
-        ws.restore_session()
-    ws.welcome = flags.contains("--welcome")
-    if flags.contains("--start") and ws.value_of("welcome") == "on"
-        ws.welcome = true
+    ws.start_up(flags)
     mut name := saved_theme()
     at := flags.index_of("--theme") else -1
     if at >= 0 and at + 1 < flags.len()
@@ -5975,6 +6400,9 @@ fn print_screen(ed Editor, flags List[str])
         elif f == "--git"
             ws.gitmarks = true
             ws.refresh_git()
+        elif f == "--task-json"
+            print(ws.task_json())
+            return
     shown := ws.render()
     if flags.contains("--screen")
         runs := [
@@ -6012,7 +6440,7 @@ fn bench(mut ed Editor)
 fn main() !
     args := env.args()
     if args.contains("--help")
-        print("usage: ail run edit.ail [--font N] [--keys] [--welcome] [--git] [--print [--screen] [--check] [--outline] [--explain] [--at=L:C] [--type=TEXT] [--key=KEY]...] [FILE]")
+        print("usage: ail run edit.ail [--font N] [--keys] [--grid] [--welcome] [--git] [--print [--screen] [--check] [--outline] [--explain] [--at=L:C] [--type=TEXT] [--key=KEY]...] [FILE]")
         return
     if args.contains("--keys")
         for l in key_table()
@@ -6036,4 +6464,7 @@ fn main() !
     if flags.contains("--print")
         print_screen(ed, flags)
         return
-    window_main(mut ed, flags)
+    if flags.contains("--grid")
+        window_main(mut ed, flags)
+    else
+        app_main(mut ed, flags)
