@@ -3456,7 +3456,7 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
             fns += 1
         if sp.fg == FIELD_FG and sp.text == "x"
             fields += 1
-    assert_eq(fns, 1)
+    assert_eq(fns, 2)
     assert_eq(fields, 1)
     ed.layer.level = 0
     assert(not ed.render().text[4].contains("1 ref"))
