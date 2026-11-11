@@ -195,34 +195,10 @@ root, else `ail` on `PATH`. A check of unsaved changes writes the buffer to
 `FILE.edit-check.ail` beside the file and removes it afterwards, so relative
 imports resolve as they will on save.
 
-## Status (2026-10-20)
+## Status (2026-11-11)
 
-- Works headless, tested (33 `@test`s, run by `../ail/ail selftest`): editing,
-  auto-indent, undo and redo, moves, highlighting, scrolling, selection and
-  the clipboard, mouse and wheel, tabs and the file picker, run output,
-  find and replace, go to line, bracket matching and pairing, comment
-  toggle, duplicate and move lines, diagnostics with fixes, explain,
-  outline, completion, go to definition and hover (from a recorded
-  `ail api --symbols` output), quit confirmation.
-- Window front end on `std.ui` (ADR 0177), tested on Linux under Xvfb:
-  typing, Ctrl-K, Ctrl-. fixes, Ctrl-S, Ctrl-Space completion with
-  signatures, member completion after `.`, F12, Alt-Shift-F, Ctrl-/,
-  bracket pairing, drag selection, wheel, Ctrl-C to and from the system
-  clipboard, Ctrl-P opening a second tab, F5 running it (ADR 0241), Ctrl-Q.
-  Without a display, `edit.ail FILE` prints one screen instead.
-- Completion, go to definition and hover use the last `ail api --symbols`
-  index taken while the program had no errors (on opening, on Ctrl-K or
-  save with no errors, and on demand), so names declared since then come
-  from the buffer's words without signatures.
-- Speed (Linux x86-64, interpreter): a 100x32 screen of a 1,000-line file
-  renders in about 8 ms; an edit takes about 0.1 ms.
-- Typing `.` after a name opens member completion; typing `(` after a
-  known function shows its signature on the status line. `"""` strings are
-  highlighted across lines.
-- The word under the cursor is marked wherever else it appears on screen;
-  each line with a diagnostic shows the first message after its text;
-  typing `else` or `elif` lines it up with its `if`.
-- Completion offers the locals in scope with their types (`ail api --locals`)
-  and, after `x.`, only the members of `x`'s type (`ail api --type`). The
-  position queries need a program that parses; otherwise the editor falls
-  back to the outline index and the buffer's words.
+- Pinned to ail `3896938b` (`.ail-version`); `tools/check.sh` checks, formats and tests against it, and fails when the editor's `KEYWORDS` differ from the lexer's (lex.kw.1).
+- Front ends: the `std.app` window (default), the old `std.ui` cell grid (`--grid`), and `--print` / `--print --json` for tests and agents. The headless core is tested by `@test`s run with `ail test` (not `ail selftest`).
+- The repo is a package (`ail.pkg`) with an agent kit (`AGENTS.md`, `.mcp.json`).
+- Highlighting and auto-indent know every reserved word of the lexer, including `requires`, `ensures`, `invariant`, `par` and `with`; the contract words `then`, `result` and `old(` and the hole `uhwhatnow?` are marked too.
+- Feature plan against current AIL: the X0 to X11 lanes in the AIL project's `lanes/ail-edit-features-2026-11-10.md`. The look is planned in `docs/plan-2026-11.md` and the beauty slices.

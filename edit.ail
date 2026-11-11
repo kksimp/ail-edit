@@ -363,7 +363,7 @@ fn indent_of(s str) int
         n += 1
     n
 
-BLOCK_WORDS := "fn if elif else while for match struct enum trait impl error"
+BLOCK_WORDS := "fn if elif else while for par with match struct enum trait impl error"
 
 ## Whether a line opens an indented block (lex.block.1): a declaration or a
 ## control-flow header, a `match` arm or `if` value, or `else err`.
@@ -376,6 +376,7 @@ fn opens_block(s str) bool
     mut first := words[0]
     if first.starts_with("@") and n > 1
         first = words[1]
+    # `par for` (conc.par.5) and `with m as mut x` (conc.share.6) open blocks; contract lines do not.
     if BLOCK_WORDS.split(" ").contains(first) or t.ends_with("=>")
         return true
     n >= 2
@@ -1266,6 +1267,7 @@ KEYWORDS := {
     "defer",
     "elif",
     "else",
+    "ensures",
     "enum",
     "error",
     "extern",
@@ -1275,14 +1277,17 @@ KEYWORDS := {
     "if",
     "impl",
     "in",
+    "invariant",
     "match",
     "move",
     "mut",
     "none",
     "not",
     "or",
+    "par",
     "pub",
     "ref",
+    "requires",
     "return",
     "self",
     "spawn",
@@ -1294,6 +1299,7 @@ KEYWORDS := {
     "unsafe",
     "use",
     "while",
+    "with",
 }
 
 ## The end of a quoted literal that starts at `q` (the opening quote),
@@ -1342,11 +1348,17 @@ fn line_colors(cs List[char], inside bool) List[int]
     out.extend(colors(cs[k..]))
     out
 
+## Whether a line is a `requires` or `ensures` line (contract.decl.1).
+fn is_contract_line(cs List[char]) bool
+    t := cs.join("").trim()
+    t.starts_with("requires ") or t.starts_with("ensures ")
+
 ## The foreground color of each character of one line of AIL source, which
 ## starts outside any `"""` string (see `line_colors`).
 fn colors(cs List[char]) List[int]
     mut out := List[int]()
     n := cs.len()
+    contract := is_contract_line(cs)
     mut i := 0
     while i < n
         c := cs[i]
@@ -1371,9 +1383,17 @@ fn colors(cs List[char]) List[int]
         elif is_word(c) or c == '@'
             while j < n and is_word(cs[j])
                 j += 1
-            if c == '@'
+            word := cs[i..j].join("")
+            if word == "uhwhatnow" and j < n and cs[j] == '?'
+                # the hole that asks (expr.hole.3), shown like `todo`
+                j += 1
+                fg = KEYWORD_FG
+            elif c == '@'
                 fg = ATTR_FG
-            elif KEYWORDS.contains(cs[i..j].join(""))
+            elif KEYWORDS.contains(word)
+                fg = KEYWORD_FG
+            elif contract and (word == "then" or word == "result" or word == "old" and j < n and cs[j] == '(')
+                # contextual words of contracts (contract.decl.1, contract.ens.*)
                 fg = KEYWORD_FG
             elif c.is_upper()
                 fg = TYPE_FG
@@ -3003,6 +3023,28 @@ fn keys(s str) List[Command]
     assert_eq(s[20], NUMBER_FG)
     assert_eq(s[22], STRING_FG)
     assert_eq(s[26], STRING_FG)
+
+@test fn new_keywords_are_highlighted()
+    for w in ["requires", "ensures", "invariant", "par", "with"]
+        assert(KEYWORDS.contains(w))
+    assert_eq(colors("par for i in 0..3".chars())[0], KEYWORD_FG)
+    c := colors("ensures result > old(x) then".chars())
+    assert_eq(c[8], KEYWORD_FG)
+    assert_eq(c[24], KEYWORD_FG)
+    h := colors("x := uhwhatnow?".chars())
+    assert_eq(h[5], KEYWORD_FG)
+    assert_eq(h[14], KEYWORD_FG)
+    # `result` outside a contract is a plain name
+    assert_eq(colors("result := 1".chars())[0], FG)
+
+@test fn par_and_with_open_blocks()
+    assert(opens_block("par for i in 0..n"))
+    assert(opens_block("with m as mut x"))
+    assert(not opens_block("requires b != 0"))
+    ed := typed("", keys("par for i in 0..3\nx\n"))
+    assert_eq(ed.lines, ["par for i in 0..3", "    x", "    "])
+    ed2 := typed("", keys("with m as mut x\nx\n"))
+    assert_eq(ed2.lines, ["with m as mut x", "    x", "    "])
 
 @test fn horizontal_and_vertical_scroll()
     mut ed := typed("", [])
