@@ -1,0 +1,1781 @@
+## The agent panel (parity plan D5, lane P1): the pure model of the side
+## panel where a person talks to a coding agent over ACP (features/acp).
+## It holds the agents to choose from, the prompt box with its `@` mentions,
+## the transcript as display rows for a panel of a given width, the scroll
+## state, and a state machine whose `key` turns key presses into an `Intent`.
+##
+## Pure: the wiring owns the agent process, a long-lived job (features/jobs:
+## `keep_stdin: true`, `timeout_ms: 0`). It starts `agent.command` with
+## `agent.args` in the workspace, sends the line `Panel.start` returns and
+## every line of an `acp.Action.SendLines`, each followed by "\n", with
+## `jobs.send`, and feeds each line the job's `Step.fresh` carries on `out`
+## to `Panel.take`, acting on the `acp.Action` it returns as features/acp
+## says. When the job ends it calls `Panel.ended`. Keys go to `Panel.key`;
+## the wiring acts on the `Intent`: `Send` -> `Panel.send`, `Cancel` ->
+## `Panel.cancel`, `Permit` -> `Panel.permit`, `NewSession` -> stop the job,
+## start it again and call `Panel.start`, `PickAgent` -> a chooser over
+## `Panel.agents`, then `Panel.choose_agent`, `Jump` -> open the path at the
+## 0-based line, `OpenReview` -> the review panel, `Close` -> hide the panel.
+## Paste goes to `Panel.paste`. The editor keeps `Panel.ctx` current (the
+## active file, the selection, diagnostics, ...) for mentions.
+use features.acp
+use features.wrap
+
+## Tool output lines shown under a tool call; the rest is counted.
+TOOL_LINES := 6
+## Mention choices the chooser shows.
+CHOICES := 8
+## The hint after a first Escape during a turn.
+STOP_HINT := "press Escape again to stop the agent"
+## The hint when Enter is pressed during a turn.
+BUSY_HINT := "the agent is busy; press Escape twice to stop it"
+## A gap count that means "no match".
+NO_MATCH := 10000
+
+# ---- Agents ------------------------------------------------------------------
+
+## An agent the panel can start: its shown name and the command line that
+## starts it speaking ACP on standard input and output.
+pub struct Agent
+    pub name str
+    pub command str
+    pub args List[str]
+
+## The agents that speak ACP, started the way their documentation says
+## (fetched 2026-11-15):
+## - Claude Code through its ACP adapter: npm package
+##   `@agentclientprotocol/claude-agent-acp` (bin `claude-agent-acp`), README
+##   at github.com/agentclientprotocol/claude-agent-acp; the old
+##   `@zed-industries/claude-code-acp` is deprecated in its favour.
+## - Codex through its ACP adapter: `npx -y @agentclientprotocol/codex-acp`,
+##   README at github.com/agentclientprotocol/codex-acp (replaces
+##   `@zed-industries/codex-acp`).
+## - Gemini CLI: `gemini --acp`, docs/cli/acp-mode.md in
+##   github.com/google-gemini/gemini-cli.
+## Each needs the tool installed and signed in; nothing is bundled.
+pub fn presets() List[Agent]
+    [
+        Agent(
+            name: "Claude Code",
+            command: "npx",
+            args: ["-y", "@agentclientprotocol/claude-agent-acp"],
+        ),
+        Agent(name: "Codex", command: "npx", args: ["-y", "@agentclientprotocol/codex-acp"]),
+        Agent(name: "Gemini CLI", command: "gemini", args: ["--acp"]),
+    ]
+
+## The settings key of an agent's name: lower case, spaces as `-`
+## (`Claude Code` is `claude-code`), so `agent.claude-code ...` sets it.
+pub fn key_of(name str) str
+    name.trim().to_lower().replace(" ", "-")
+
+## The command line as one string, for the picker and the JSON dump.
+pub fn Agent.shown(self) str
+    "{self.command} {self.args.join(" ")}".trim()
+
+## The presets, changed and extended by the settings file's lines
+## `agent.NAME COMMAND ARGS...` (the file is `KEY VALUE` lines). A NAME whose
+## `key_of` matches a preset replaces that preset's command; any other NAME
+## adds an agent of that name. A line with no command is skipped.
+pub fn parse_agents(settings_text str) List[Agent]
+    mut out := presets()
+    for raw in settings_text.split("\n")
+        rest := raw.trim().strip_prefix("agent.") else continue
+        mut words := List[str]()
+        for w in rest.split(" ")
+            if w != ""
+                words.push(w)
+        if words.len() < 2
+            continue
+        mut found := false
+        for k in 0..out.len()
+            if key_of(out[k].name) == key_of(words[0])
+                out[k].command = words[1]
+                out[k].args = words[2..]
+                found = true
+        if not found
+            out.push(Agent(name: words[0], command: words[1], args: words[2..]))
+    out
+
+## The agent called `name`, by its name or its settings key; `none` if
+## there is none.
+pub fn choose(agents List[Agent], name str) Agent?
+    for a in agents
+        if a.name == name or key_of(a.name) == key_of(name)
+            return a
+    none
+
+# ---- Mentions ----------------------------------------------------------------
+
+## What a mention brings: a file, a symbol, or one of the fixed items
+## `@selection`, `@diagnostics`, `@file` (the active file), `@task` and
+## `@test-failures`.
+pub enum MentionKind
+    Path
+    Symbol
+    Selection
+    Diagnostics
+    ActiveFile
+    TaskState
+    TestFailures
+
+## One mention in a prompt: `value` is the path or the symbol name, "" for
+## the fixed items.
+pub struct Mention
+    pub kind MentionKind
+    pub value str
+
+## What the box gives at submit: the text, trimmed, and its mentions in the
+## order they appear, without repeats.
+pub struct Submitted
+    pub text str
+    pub mentions List[Mention]
+
+## What the editor knows that a mention can bring. `root` is the absolute
+## workspace directory (relative paths are taken from it), `active` the
+## active file's path ("" when none), `selection` the selected text with its
+## 0-based first and last lines, `diagnostics`, `failures` (failing tests)
+## and `task` as text, and the `files` and `symbols` the chooser offers.
+pub struct Context
+    pub root str
+    pub active str
+    pub selection str
+    pub sel_from int
+    pub sel_to int
+    pub diagnostics List[str]
+    pub task str
+    pub failures List[str]
+    pub files List[str]
+    pub symbols List[str]
+
+## A context with nothing in it but the workspace directory.
+pub fn Context.new(dir str) Context
+    Context(
+        root: dir,
+        active: "",
+        selection: "",
+        sel_from: 0,
+        sel_to: 0,
+        diagnostics: [],
+        task: "",
+        failures: [],
+        files: [],
+        symbols: [],
+    )
+
+## What the mentions of a prompt resolve to: text blocks to append to the
+## prompt and the absolute paths to send as resource links.
+pub struct Resolved
+    pub blocks List[str]
+    pub files List[str]
+
+fn fixed_items() List[str]
+    ["@selection", "@diagnostics", "@file", "@task", "@test-failures"]
+
+fn fixed_kind(token str) MentionKind?
+    if token == "selection"
+        return MentionKind.Selection
+    if token == "diagnostics"
+        return MentionKind.Diagnostics
+    if token == "file"
+        return MentionKind.ActiveFile
+    if token == "task"
+        return MentionKind.TaskState
+    if token == "test-failures"
+        return MentionKind.TestFailures
+    none
+
+fn is_mark(c char) bool
+    c == '.' or c == ',' or c == ';' or c == ':' or c == '!' or c == '?' or c == ')'
+
+fn strip_marks(s str) str
+    mut cs := s.chars()
+    while cs.len() > 0 and is_mark(cs[cs.len() - 1])
+        _ := cs.pop()
+    cs.join("")
+
+fn token_mention(token str, known List[str]) Mention?
+    if token == ""
+        return none
+    if kind := fixed_kind(token)
+        return Mention(kind: kind, value: "")
+    if sym := token.strip_prefix("#")
+        if sym == ""
+            return none
+        return Mention(kind: MentionKind.Symbol, value: sym)
+    if known.contains(token)
+        return Mention(kind: MentionKind.Path, value: token)
+    none
+
+## The mention a word such as `@file` or `@#parse,` names, if any.
+fn mention_of(word str, known List[str]) Mention?
+    token := word.strip_prefix("@") else return none
+    if m := token_mention(token, known)
+        return m
+    token_mention(strip_marks(token), known)
+
+fn base_of(path str) str
+    parts := path.replace("\\", "/").split("/")
+    parts[parts.len() - 1]
+
+## How spread out the characters of `q` are in `s` (both lower case): the
+## characters skipped between the first and the last matched; `NO_MATCH`
+## when `q` is not a subsequence of `s`.
+fn gaps(s str, q str) int
+    cs := s.chars()
+    mut i := 0
+    mut first := -1
+    mut last := 0
+    for c in q.chars()
+        while i < cs.len() and cs[i] != c
+            i += 1
+        if i == cs.len()
+            return NO_MATCH
+        if first < 0
+            first = i
+        last = i
+        i += 1
+    if first < 0
+        return 0
+    last - first + 1 - q.len()
+
+## A fuzzy score of `path` for the lower-case query `q`, lower is better:
+## the file name starts with `q`, then contains it, then the path contains
+## it, then `q`'s characters appear in order (fewer gaps first); -1 when they
+## do not.
+fn path_score(path str, q str) int
+    if q == ""
+        return 300
+    low := path.to_lower()
+    g := gaps(low, q)
+    if g >= NO_MATCH
+        return -1
+    base := base_of(low)
+    if base.starts_with(q)
+        return 0
+    if base.contains(q)
+        return 100
+    if low.contains(q)
+        return 200
+    300 + g
+
+struct Scored
+    score int
+    size int
+    order int
+    text str
+
+fn ranks_before(a Scored, b Scored) bool
+    if a.score != b.score
+        return a.score < b.score
+    if a.size != b.size
+        return a.size < b.size
+    a.order < b.order
+
+fn sort_scored(xs List[Scored]) List[Scored]
+    mut out := List[Scored]()
+    for x in xs
+        mut at := out.len()
+        while at > 0 and ranks_before(x, out[at - 1])
+            at -= 1
+        out.insert(at, x)
+    out
+
+## The chooser's items for the partial word `query` typed after `@`: the
+## fixed items whose name starts with it, then files (by fuzzy path match)
+## and symbols (shown `#name`) by score, shorter first on a tie, files before
+## symbols at an empty query. A query starting `#` offers symbols only.
+pub fn mention_choices(query str, files List[str], symbols List[str]) List[str]
+    low := query.to_lower()
+    mut out := List[str]()
+    mut scored := List[Scored]()
+    sq := low.strip_prefix("#") else low
+    only_symbols := low.starts_with("#")
+    if not only_symbols
+        for f in fixed_items()
+            if f.slice(1, f.len()).starts_with(low)
+                out.push(f)
+        for i in 0..files.len()
+            fscore := path_score(files[i], low)
+            if fscore >= 0
+                fsize := if low == "" then 0 else files[i].len()
+                scored.push(Scored(score: fscore, size: fsize, order: i, text: files[i]))
+    for j in 0..symbols.len()
+        ss := path_score(symbols[j], sq)
+        if ss >= 0
+            ssize := if sq == "" then 0 else symbols[j].len()
+            at := files.len() + j
+            scored.push(Scored(score: ss, size: ssize, order: at, text: "#{symbols[j]}"))
+    for item in sort_scored(scored)
+        out.push(item.text)
+    out
+
+fn absolute(path str, root str) str
+    cs := path.chars()
+    if root == "" or path.starts_with("/") or path.starts_with("\\")
+        return path
+    if cs.len() >= 2 and cs[1] == ':'
+        return path
+    "{root}/{path}"
+
+fn short(path str, root str) str
+    if root == ""
+        return path
+    path.strip_prefix("{root}/") else path
+
+fn listed(title str, items List[str]) str
+    if items.len() == 0
+        return "{title}: none"
+    "{title}:\n{items.join("\n")}"
+
+## The text blocks and resource-link paths the `mentions` of a prompt bring
+## from `ctx`. Files (a mentioned path, made absolute from `ctx.root`, or the
+## active file) are links, each once; the selection (with its file and
+## lines), diagnostics, task status and failing tests are blocks; a symbol is
+## a block naming it, for the agent to look up.
+pub fn resolve(mentions List[Mention], ctx Context) Resolved
+    mut blocks := List[str]()
+    mut files := List[str]()
+    for m in mentions
+        match m.kind
+            MentionKind.Path =>
+                p := absolute(m.value, ctx.root)
+                if not files.contains(p)
+                    files.push(p)
+            MentionKind.ActiveFile =>
+                if ctx.active != "" and not files.contains(ctx.active)
+                    files.push(ctx.active)
+            MentionKind.Selection =>
+                if ctx.selection == ""
+                    blocks.push("Selection: none")
+                else
+                    at := short(ctx.active, ctx.root)
+                    mut span := "line {ctx.sel_from + 1}"
+                    if ctx.sel_to != ctx.sel_from
+                        span = "lines {ctx.sel_from + 1}-{ctx.sel_to + 1}"
+                    blocks.push("Selection in {at} {span}:\n```\n{ctx.selection}\n```")
+            MentionKind.Diagnostics => blocks.push(listed("Diagnostics", ctx.diagnostics))
+            MentionKind.TaskState =>
+                state_text := if ctx.task == "" then "none" else ctx.task
+                blocks.push("Task: {state_text}")
+            MentionKind.TestFailures => blocks.push(listed("Failing tests", ctx.failures))
+            MentionKind.Symbol => blocks.push("Symbol: {m.value}")
+    Resolved(blocks: blocks, files: files)
+
+## The prompt text with the resolved blocks after it, a blank line apart.
+pub fn prompt_text(text str, r Resolved) str
+    if r.blocks.len() == 0
+        return text
+    "{text}\n\n{r.blocks.join("\n\n")}"
+
+# ---- Prompt box --------------------------------------------------------------
+
+## The prompt box: its lines, the caret (0-based line and column in
+## characters), the prompts sent before (oldest first) with the one shown
+## while browsing them, and the paths accepted from the mention chooser.
+pub struct Box
+    pub lines List[str]
+    pub line int
+    pub col int
+    pub history List[str]
+    ## The history entry shown; `history.len()` when it is the text being
+    ## written.
+    pub back int
+    ## The text being written, kept while the history is browsed.
+    pub draft str
+    ## Paths accepted from the chooser: `@PATH` with one of these is a file
+    ## mention (also when the prompt comes back from the history).
+    pub known List[str]
+
+## An empty box.
+pub fn Box.new() Box
+    Box(lines: [""], line: 0, col: 0, history: [], back: 0, draft: "", known: [])
+
+## The box's text, lines joined with "\n".
+pub fn Box.text(self) str
+    self.lines.join("\n")
+
+## Whether the box holds only white space.
+pub fn Box.is_empty(self) bool
+    self.text().trim() == ""
+
+## Inserts `text` at the caret; "\n" (or "\r\n") in it starts new lines. The
+## caret ends after it.
+pub fn Box.insert(mut self, text str)
+    t := text.replace("\r\n", "\n").replace("\r", "\n")
+    parts := t.split("\n")
+    cs := self.lines[self.line].chars()
+    at := self.col.max(0).min(cs.len())
+    head := cs[..at].join("")
+    tail := cs[at..].join("")
+    if parts.len() == 1
+        self.lines[self.line] = "{head}{t}{tail}"
+        self.col = at + t.len()
+        return
+    mut fresh := ["{head}{parts[0]}"]
+    for k in 1..parts.len() - 1
+        fresh.push(parts[k])
+    last := parts[parts.len() - 1]
+    fresh.push("{last}{tail}")
+    mut out := self.lines[..self.line]
+    out.extend(fresh)
+    out.extend(self.lines[self.line + 1..])
+    self.lines = out
+    self.line += parts.len() - 1
+    self.col = last.len()
+
+## Breaks the line at the caret (Shift-Enter).
+pub fn Box.newline(mut self)
+    self.insert("\n")
+
+## Pasted text, inserted as typed.
+pub fn Box.paste(mut self, text str)
+    self.insert(text)
+
+## Removes the character before the caret, joining with the line above at
+## the start of a line.
+pub fn Box.backspace(mut self)
+    cs := self.lines[self.line].chars()
+    at := self.col.max(0).min(cs.len())
+    if at > 0
+        self.lines[self.line] = "{cs[..at - 1].join("")}{cs[at..].join("")}"
+        self.col = at - 1
+        return
+    if self.line == 0
+        return
+    prev := self.lines[self.line - 1]
+    cur := self.lines[self.line]
+    self.lines[self.line - 1] = "{prev}{cur}"
+    _ := self.lines.remove_at(self.line)
+    self.line -= 1
+    self.col = prev.len()
+
+## Removes the character after the caret, joining with the line below at
+## the end of a line.
+pub fn Box.delete(mut self)
+    cs := self.lines[self.line].chars()
+    at := self.col.max(0).min(cs.len())
+    if at < cs.len()
+        self.lines[self.line] = "{cs[..at].join("")}{cs[at + 1..].join("")}"
+        return
+    if self.line + 1 >= self.lines.len()
+        return
+    cur := self.lines[self.line]
+    nxt := self.lines[self.line + 1]
+    self.lines[self.line] = "{cur}{nxt}"
+    _ := self.lines.remove_at(self.line + 1)
+
+## Moves the caret one character left, to the end of the line above at the
+## start of a line.
+pub fn Box.left(mut self)
+    if self.col > 0
+        self.col -= 1
+    elif self.line > 0
+        self.line -= 1
+        self.col = self.lines[self.line].len()
+
+## Moves the caret one character right, to the start of the line below at
+## the end of a line.
+pub fn Box.right(mut self)
+    if self.col < self.lines[self.line].len()
+        self.col += 1
+    elif self.line + 1 < self.lines.len()
+        self.line += 1
+        self.col = 0
+
+## Moves the caret one line up, the column clamped to the line.
+pub fn Box.up(mut self)
+    if self.line > 0
+        self.line -= 1
+        self.col = self.col.min(self.lines[self.line].len())
+
+## Moves the caret one line down, the column clamped to the line.
+pub fn Box.down(mut self)
+    if self.line + 1 < self.lines.len()
+        self.line += 1
+        self.col = self.col.min(self.lines[self.line].len())
+
+## Moves the caret to the start of its line.
+pub fn Box.home(mut self)
+    self.col = 0
+
+## Moves the caret to the end of its line.
+pub fn Box.end(mut self)
+    self.col = self.lines[self.line].len()
+
+fn Box.set_text(mut self, s str)
+    self.lines = s.split("\n")
+    self.line = self.lines.len() - 1
+    self.col = self.lines[self.line].len()
+
+## Shows the previous sent prompt (Up on the first line); the text being
+## written is kept and comes back after the newest.
+pub fn Box.older(mut self)
+    if self.back <= 0
+        return
+    if self.back >= self.history.len()
+        self.draft = self.text()
+        self.back = self.history.len()
+    self.back -= 1
+    entry := self.history[self.back]
+    self.set_text(entry)
+
+## Shows the next sent prompt (Down on the last line), then the text that
+## was being written.
+pub fn Box.newer(mut self)
+    if self.back >= self.history.len()
+        return
+    self.back += 1
+    mut entry := self.draft
+    if self.back < self.history.len()
+        entry = self.history[self.back]
+    self.set_text(entry)
+
+## The partial word after `@` at the caret (`""` right after the `@`), or
+## `none` when the caret is not in such a word. The `@` must start a word.
+pub fn Box.query(self) str?
+    cs := self.lines[self.line].chars()
+    at := self.col.max(0).min(cs.len())
+    mut k := at
+    while k > 0 and not cs[k - 1].is_space() and cs[k - 1] != '@'
+        k -= 1
+    if k == 0 or cs[k - 1] != '@'
+        return none
+    if k >= 2 and not cs[k - 2].is_space()
+        return none
+    cs[k..at].join("")
+
+## Replaces the `@` word at the caret with chooser item `choice` (a path, a
+## `#symbol` or a fixed `@item`) and a space; a path is remembered as known.
+## Nothing happens when the caret is in no `@` word.
+pub fn Box.accept(mut self, choice str)
+    q := self.query() else return
+    token := choice.strip_prefix("@") else choice
+    cs := self.lines[self.line].chars()
+    at := self.col.max(0).min(cs.len())
+    start := at - q.len() - 1
+    self.lines[self.line] = "{cs[..start].join("")}@{token} {cs[at..].join("")}"
+    self.col = start + token.len() + 2
+    if not choice.starts_with("@") and not choice.starts_with("#")
+        if not self.known.contains(choice)
+            self.known.push(choice)
+
+## Takes the box's text and mentions (`@PATH` of a known path, `@#symbol`,
+## the fixed `@items`; trailing punctuation is ignored), adds the text to
+## the history (not twice in a row) and empties the box.
+pub fn Box.submit(mut self) Submitted
+    body := self.text().trim()
+    mut found := List[Mention]()
+    for w in body.replace("\n", " ").split(" ")
+        if m := mention_of(w, self.known)
+            if not found.contains(m)
+                found.push(m)
+    if body != ""
+        n := self.history.len()
+        if n == 0 or self.history[n - 1] != body
+            self.history.push(body)
+    self.back = self.history.len()
+    self.draft = ""
+    self.lines = [""]
+    self.line = 0
+    self.col = 0
+    Submitted(text: body, mentions: found)
+
+## The partial word after `@` at the caret of `b`, or `none` (see
+## `Box.query`).
+pub fn mention_query(b Box) str?
+    b.query()
+
+## Puts chooser item `choice` in place of the `@` word at the caret of `b`
+## (see `Box.accept`).
+pub fn accept_mention(mut b Box, choice str)
+    b.accept(choice)
+
+# ---- Transcript view ---------------------------------------------------------
+
+## What a display row shows, for its colour: a speaker's name, message
+## text, a thought (drawn dimmed), a tool call with its status mark, a tool's
+## output, a place a tool touches, a plan step, a proposed change, a
+## permission prompt, one numbered choice of it, an editor note, a blank.
+pub enum ViewKind
+    Header
+    Body
+    Thought
+    Tool
+    ToolText
+    Link
+    Plan
+    Diff
+    Permission
+    Choice
+    Note
+    Blank
+
+## One row of the panel: `text` drawn after `indent` columns, `path` and
+## the 0-based `line` a click or Enter jumps to ("" and -1 for none).
+pub struct ViewRow
+    pub text str
+    pub kind ViewKind
+    pub indent int
+    pub path str
+    pub line int
+
+## A place a tool call touches: tool call id, path and 0-based line.
+pub struct Target
+    pub call str
+    pub path str
+    pub line int
+
+## The size of a proposed change: lines added and removed between the
+## common start and end, and the 0-based line in the new text where it
+## starts.
+pub struct Change
+    pub added int
+    pub removed int
+    pub at int
+
+fn vrow(text str, kind ViewKind, indent int, path str, at int) ViewRow
+    ViewRow(text: text, kind: kind, indent: indent, path: path, line: at)
+
+fn split_lines(s str) List[str]
+    if s == "" then List[str]() else s.split("\n")
+
+## The lines a diff adds and removes, by its common first and last lines.
+pub fn change_of(d acp.DiffPart) Change
+    was := split_lines(d.old_text else "")
+    now := split_lines(d.new_text)
+    mut head := 0
+    while head < was.len() and head < now.len() and was[head] == now[head]
+        head += 1
+    mut tail := 0
+    while tail < was.len() - head and tail < now.len() - head
+        if was[was.len() - 1 - tail] != now[now.len() - 1 - tail]
+            break
+        tail += 1
+    Change(added: now.len() - head - tail, removed: was.len() - head - tail, at: head)
+
+## `text` cut into rows: each of its lines wrapped by the rule of
+## `wrap.rows` to the width left after `indent` and `hang`, continuation
+## rows indented `hang` more, trailing spaces dropped.
+fn wrapped(text str, w int, indent int, hang int, kind ViewKind, path str, at int) List[ViewRow]
+    avail := (w - indent - hang).max(1)
+    mut out := List[ViewRow]()
+    for piece in text.split("\n")
+        cs := piece.chars()
+        starts := wrap.rows(piece, avail, false)
+        for k in 0..starts.len()
+            stop := if k + 1 < starts.len() then starts[k + 1] else cs.len()
+            seg := cs[starts[k]..stop].join("").trim_end()
+            extra := if k == 0 then 0 else hang
+            out.push(vrow(seg, kind, indent + extra, path, at))
+    out
+
+fn status_mark(tag str) str
+    match tag
+        "in_progress" => "~"
+        "completed" => "+"
+        "failed" => "x"
+        _ => "."
+
+fn plan_mark(st acp.PlanStatus) str
+    if st == acp.PlanStatus.Finished
+        return "[x]"
+    if st == acp.PlanStatus.Working
+        return "[~]"
+    "[ ]"
+
+fn tool_rows(r acp.Row, targets List[Target], cwd str, w int) List[ViewRow]
+    parts := r.text.split("\n")
+    mut spots := List[Target]()
+    for t in targets
+        if t.call == r.call
+            spots.push(t)
+    mut path := ""
+    mut at := -1
+    if spots.len() > 0
+        path = spots[0].path
+        at = spots[0].line
+    mut out := wrapped("{status_mark(r.tag)} {parts[0]}", w, 2, 2, ViewKind.Tool, path, at)
+    body := parts[1..]
+    shown := body.len().min(TOOL_LINES)
+    for k in 0..shown
+        out.extend(wrapped(body[k], w, 4, 0, ViewKind.ToolText, "", -1))
+    if body.len() > shown
+        out.push(vrow("... {body.len() - shown} more lines", ViewKind.ToolText, 4, "", -1))
+    for s in spots
+        place := "{short(s.path, cwd)}:{s.line + 1}"
+        out.extend(wrapped(place, w, 4, 0, ViewKind.Link, s.path, s.line))
+    out
+
+fn plan_rows(entries List[acp.PlanEntry], w int) List[ViewRow]
+    mut out := List[ViewRow]()
+    for e in entries
+        out.extend(wrapped("{plan_mark(e.status)} {e.content}", w, 2, 4, ViewKind.Plan, "", -1))
+    out
+
+fn diff_rows(d acp.DiffPart, cwd str, w int) List[ViewRow]
+    c := change_of(d)
+    text := "{short(d.path, cwd)} +{c.added} -{c.removed}"
+    wrapped(text, w, 2, 2, ViewKind.Diff, d.path, c.at)
+
+fn permission_rows(r acp.Row, ask acp.PermissionRequest?, w int) List[ViewRow]
+    req := ask else return wrapped(answered(r), w, 2, 2, ViewKind.Permission, "", -1)
+    mut out := wrapped("? {r.text}", w, 2, 2, ViewKind.Permission, "", -1)
+    for k in 0..req.options.len()
+        out.extend(wrapped("{k + 1}. {req.options[k].name}", w, 4, 3, ViewKind.Choice, "", -1))
+    out
+
+fn answered(r acp.Row) str
+    if r.tag == "" then "? {r.text}" else "? {r.text}: {r.tag}"
+
+## The index of the permission row waiting for an answer, or -1.
+fn open_permission(s acp.Session) int
+    if s.asking == none
+        return -1
+    mut k := s.rows.len() - 1
+    while k >= 0
+        if s.rows[k].kind == acp.RowKind.Permission
+            return if s.rows[k].tag == "" then k else -1
+        k -= 1
+    -1
+
+## The transcript of session `s` as rows for a panel `cols` wide (at least
+## 8): a header (`You` or the agent's name `agent`) where the speaker
+## changes, a blank row before it; message text wrapped, indented 2; thoughts
+## as `Thought` rows; a tool call as its status mark (`.` pending, `~`
+## running, `+` done, `x` failed) and title, at most 6 lines of its output,
+## and its `targets` as `path:line` rows to jump to; plan steps with `[ ]`,
+## `[~]`, `[x]`; each proposed change as `path +N -M`, jumping to its first
+## changed line; the waiting permission prompt as numbered choices, an
+## answered one with its answer; editor notes unindented. Paths under the
+## session's directory are shown relative to it.
+pub fn view(s acp.Session, agent str, targets List[Target], cols int) List[ViewRow]
+    w := cols.max(8)
+    asked := open_permission(s)
+    mut out := List[ViewRow]()
+    mut prev := acp.Who.Editor
+    mut diff_at := 0
+    for i in 0..s.rows.len()
+        r := s.rows[i]
+        if r.who != acp.Who.Editor and r.who != prev
+            if out.len() > 0
+                out.push(vrow("", ViewKind.Blank, 0, "", -1))
+            who_name := if r.who == acp.Who.User then "You" else agent
+            out.push(vrow(who_name, ViewKind.Header, 0, "", -1))
+            prev = r.who
+        if r.kind == acp.RowKind.Message
+            out.extend(wrapped(r.text, w, 2, 0, ViewKind.Body, "", -1))
+        elif r.kind == acp.RowKind.Thought
+            out.extend(wrapped(r.text, w, 2, 0, ViewKind.Thought, "", -1))
+        elif r.kind == acp.RowKind.Tool
+            out.extend(tool_rows(r, targets, s.cwd, w))
+        elif r.kind == acp.RowKind.Plan
+            out.extend(plan_rows(s.plan, w))
+        elif r.kind == acp.RowKind.Diff
+            if diff_at < s.diffs.len()
+                out.extend(diff_rows(s.diffs[diff_at], s.cwd, w))
+            diff_at += 1
+        elif r.kind == acp.RowKind.Permission
+            if i == asked
+                out.extend(permission_rows(r, s.asking, w))
+            else
+                out.extend(permission_rows(r, none, w))
+        else
+            out.extend(wrapped(r.text, w, 0, 0, ViewKind.Note, "", -1))
+    out
+
+fn targets_of(call str, locs List[acp.Location]) List[Target]
+    mut out := List[Target]()
+    for l in locs
+        out.push(Target(call: call, path: l.path, line: ((l.line else 1) - 1).max(0)))
+    out
+
+fn update_targets(up acp.Update) List[Target]
+    match up
+        ToolStart(call) => targets_of(call.id, call.locations)
+        ToolChange(change) => targets_of(change.id, change.locations)
+        AgentText | AgentThought | UserText | PlanChange | Commands | ModeChange | OtherUpdate => List[Target]()
+
+## The places one agent line gives its tool call (all for one call id).
+fn targets_in(line str) List[Target]
+    match acp.parse(line)
+        SessionUpdate(_, up) => update_targets(up)
+        AskPermission(ask) => targets_of(ask.tool.id, ask.tool.locations)
+        Reply | Failure | ReadText | WriteText | Unknown => List[Target]()
+
+# ---- Scrolling ---------------------------------------------------------------
+
+## The transcript's scroll: the first row shown, whether it follows the end
+## (until the person scrolls up), the selected row in transcript focus (-1
+## for none), and the row count and height of the last layout.
+pub struct Scroll
+    pub top int
+    pub follow bool
+    pub sel int
+    pub total int
+    pub height int
+
+## A scroll at the end, following it.
+pub fn Scroll.new() Scroll
+    Scroll(top: 0, follow: true, sel: -1, total: 0, height: 1)
+
+fn Scroll.last_top(self) int
+    (self.total - self.height).max(0)
+
+## Lays the scroll over `n` rows shown `high` at a time: at the end when it
+## follows, else where it was, clamped.
+pub fn Scroll.fit(mut self, n int, high int)
+    self.total = n.max(0)
+    self.height = high.max(1)
+    if self.follow or self.top > self.last_top()
+        self.top = self.last_top()
+    self.top = self.top.max(0)
+    if self.sel >= self.total
+        self.sel = self.total - 1
+
+## Scrolls by `d` rows (negative is up); it follows again at the end.
+pub fn Scroll.by(mut self, d int)
+    self.top = (self.top + d).max(0).min(self.last_top())
+    self.follow = self.top >= self.last_top()
+
+## Moves the selection by `d` rows, from the last shown row (going up) or
+## the first (going down) when nothing is selected, and scrolls to keep it
+## shown. It follows only with the last row selected at the end.
+pub fn Scroll.select(mut self, d int)
+    if self.total == 0
+        return
+    mut start := self.sel
+    if start < 0
+        start = if d < 0 then (self.top + self.height).min(self.total) else self.top - 1
+    self.sel = (start + d).max(0).min(self.total - 1)
+    if self.sel < self.top
+        self.top = self.sel
+    if self.sel >= self.top + self.height
+        self.top = self.sel - self.height + 1
+    self.follow = self.top >= self.last_top() and self.sel == self.total - 1
+
+## Scrolls to the first row.
+pub fn Scroll.home(mut self)
+    self.top = 0
+    self.follow = self.last_top() == 0
+
+## Scrolls to the end, follows it, and drops the selection.
+pub fn Scroll.end(mut self)
+    self.top = self.last_top()
+    self.follow = true
+    self.sel = -1
+
+# ---- Panel -------------------------------------------------------------------
+
+## Where the panel is: no agent running or ready for a prompt (`Idle`),
+## starting, running a turn, waiting for a permission answer, or stopped
+## with the reason.
+pub enum Phase
+    Idle
+    Starting
+    Running
+    Asking
+    Stopped(reason str)
+
+## What has the keys: the prompt box or the transcript.
+pub enum Focus
+    Prompt
+    Transcript
+
+## What the wiring must do after `Panel.key` (see the module comment).
+## `Permit` carries the option id, `Jump` a path and a 0-based line.
+pub enum Intent
+    Nothing
+    Send(text str, files List[str])
+    Cancel
+    Permit(option str)
+    NewSession
+    PickAgent
+    Jump(path str, line int)
+    OpenReview
+    Close
+
+## A prompt waiting for the agent to be ready.
+pub struct Outgoing
+    pub text str
+    pub files List[str]
+
+## The agent panel.
+pub struct Panel
+    pub agents List[Agent]
+    pub agent Agent
+    pub session acp.Session
+    ## Whether the agent process runs (between `start` and `ended`).
+    pub live bool
+    pub state Phase
+    pub input Box
+    pub scroll Scroll
+    pub focus Focus
+    pub ctx Context
+    ## The places tool calls touch, for jumps.
+    pub targets List[Target]
+    ## The mention chooser: open, its items, the highlighted one.
+    pub choosing bool
+    pub choices List[str]
+    pub pick int
+    ## Escape was pressed once during a turn.
+    pub armed bool
+    ## The width of the last layout.
+    pub width int
+    ## A line under the box ("" for none).
+    pub hint str
+    ## A prompt sent before the agent was ready; it goes when it is.
+    pub pending Outgoing?
+
+## A panel over `offered` agents (the presets when empty), the first chosen,
+## for the absolute workspace directory `dir`; nothing runs yet.
+pub fn Panel.new(offered List[Agent], dir str) Panel
+    list := if offered.len() > 0 then offered else presets()
+    Panel(
+        agents: list,
+        agent: list[0],
+        session: acp.open(dir),
+        live: false,
+        state: Phase.Idle,
+        input: Box.new(),
+        scroll: Scroll.new(),
+        focus: Focus.Prompt,
+        ctx: Context.new(dir),
+        targets: [],
+        choosing: false,
+        choices: [],
+        pick: 0,
+        armed: false,
+        width: 40,
+        hint: "",
+        pending: none,
+    )
+
+fn last_note(s acp.Session) str
+    mut k := s.rows.len() - 1
+    while k >= 0
+        if s.rows[k].kind == acp.RowKind.Note
+            return s.rows[k].text
+        k -= 1
+    "stopped"
+
+fn Panel.sync(mut self)
+    st := self.session.state
+    if st == acp.SessionState.Stopped
+        self.state = Phase.Stopped(reason: last_note(self.session))
+    elif not self.live
+        self.state = Phase.Idle
+    elif st == acp.SessionState.Starting
+        self.state = Phase.Starting
+    elif st == acp.SessionState.Running
+        self.state = if self.session.asking != none then Phase.Asking else Phase.Running
+    else
+        self.state = Phase.Idle
+
+## Chooses the agent called `name` (name or settings key) for the next
+## session; false when there is none.
+pub fn Panel.choose_agent(mut self, name str) bool
+    found := choose(self.agents, name) else return false
+    self.agent = found
+    true
+
+## A fresh session with the chosen agent, whose process the wiring has
+## just started: the `initialize` line to send, naming the client `client`
+## `version`. A pending prompt is kept and goes when the agent is ready.
+pub fn Panel.start(mut self, client str, version str) str
+    self.session = acp.open(self.session.cwd)
+    self.targets = List[Target]()
+    self.scroll = Scroll.new()
+    self.live = true
+    self.armed = false
+    self.hint = ""
+    first := self.session.start(client, version)
+    self.sync()
+    first
+
+fn Panel.add_targets(mut self, found List[Target])
+    if found.len() == 0
+        return
+    call := found[0].call
+    mut kept := List[Target]()
+    for t in self.targets
+        if t.call != call
+            kept.push(t)
+    kept.extend(found)
+    self.targets = kept
+
+## Takes one line the agent wrote (see `acp.Session.take`) and records the
+## places its tool calls touch. When the agent has just become ready and a
+## prompt is pending, that prompt is sent: the result is its lines.
+pub fn Panel.take(mut self, line str) acp.Action
+    act := self.session.take(line)
+    self.add_targets(targets_in(line))
+    mut out := act
+    if act == acp.Action.Nothing and self.session.state == acp.SessionState.Ready
+        if waiting := self.pending
+            self.pending = none
+            out = acp.Action.SendLines(lines: self.send(waiting.text, waiting.files))
+    self.sync()
+    out
+
+## The agent process ended or could not start; `why` is the reason shown.
+pub fn Panel.ended(mut self, why str)
+    self.live = false
+    self.pending = none
+    self.armed = false
+    self.session.ended(why)
+    self.sync()
+
+## Sends a prompt (`Intent.Send`): the lines to write, none unless the
+## agent is ready. The transcript follows the end again.
+pub fn Panel.send(mut self, text str, files List[str]) List[str]
+    out := self.session.prompt(text, files)
+    self.scroll.end()
+    self.sync()
+    out
+
+## Stops the running turn (`Intent.Cancel`): the lines to write.
+pub fn Panel.cancel(mut self) List[str]
+    self.armed = false
+    if self.hint == STOP_HINT
+        self.hint = ""
+    out := self.session.cancel()
+    self.sync()
+    out
+
+## Answers the waiting permission request with `option` (`Intent.Permit`):
+## the lines to write.
+pub fn Panel.permit(mut self, option str) List[str]
+    out := self.session.answer_permission(option)
+    self.sync()
+    out
+
+## Pastes `text` into the prompt box.
+pub fn Panel.paste(mut self, text str)
+    self.input.paste(text)
+    self.focus = Focus.Prompt
+    self.refresh_chooser()
+
+## The whole transcript as rows `cols` wide.
+pub fn Panel.rows(self, cols int) List[ViewRow]
+    view(self.session, self.agent.name, self.targets, cols)
+
+## The rows shown in a transcript area `cols` wide and `high` rows high,
+## after fitting the scroll to them (at the end while it follows).
+pub fn Panel.visible(mut self, cols int, high int) List[ViewRow]
+    self.width = cols
+    every := self.rows(cols)
+    self.scroll.fit(every.len(), high)
+    stop := (self.scroll.top + self.scroll.height).min(every.len())
+    every[self.scroll.top..stop]
+
+fn Panel.close_chooser(mut self)
+    self.choosing = false
+    self.choices = List[str]()
+    self.pick = 0
+
+fn Panel.refresh_chooser(mut self)
+    asked := self.input.query()
+    if asked == none
+        self.close_chooser()
+        return
+    q := asked else ""
+    mut found := mention_choices(q, self.ctx.files, self.ctx.symbols)
+    if found.len() > CHOICES
+        found = found[..CHOICES]
+    self.choices = found
+    self.choosing = true
+    self.pick = 0
+
+fn Panel.disarm(mut self)
+    self.armed = false
+    if self.hint == STOP_HINT
+        self.hint = ""
+
+fn ctrl_intent(k str) Intent
+    match k.to_lower()
+        "n" => Intent.NewSession
+        "e" => Intent.PickAgent
+        "r" => Intent.OpenReview
+        _ => Intent.Nothing
+
+fn digit(k str) int?
+    if k.len() != 1
+        return none
+    n := k.to_int() else return none
+    if n < 1 or n > 9
+        return none
+    n
+
+fn Panel.escape(mut self) Intent
+    if self.choosing
+        self.close_chooser()
+        return Intent.Nothing
+    if self.state == Phase.Running or self.state == Phase.Asking
+        if self.armed
+            self.disarm()
+            return Intent.Cancel
+        self.armed = true
+        self.hint = STOP_HINT
+        return Intent.Nothing
+    Intent.Close
+
+fn Panel.chooser_key(mut self, k str) bool
+    n := self.choices.len()
+    if k == "up"
+        self.pick = (self.pick - 1).max(0)
+        return true
+    if k == "down"
+        self.pick = (self.pick + 1).min((n - 1).max(0))
+        return true
+    if k == "tab" or k == "enter"
+        if n > 0
+            item := self.choices[self.pick]
+            self.input.accept(item)
+        self.close_chooser()
+        return true
+    false
+
+fn Panel.submit(mut self) Intent
+    if self.input.is_empty()
+        return Intent.Nothing
+    if self.state == Phase.Running or self.state == Phase.Asking
+        self.hint = BUSY_HINT
+        return Intent.Nothing
+    if self.state == Phase.Starting and self.pending != none
+        return Intent.Nothing
+    sent := self.input.submit()
+    res := resolve(sent.mentions, self.ctx)
+    msg := Outgoing(text: prompt_text(sent.text, res), files: res.files)
+    self.hint = ""
+    if self.state == Phase.Idle and self.live
+        return Intent.Send(text: msg.text, files: msg.files)
+    self.pending = msg
+    if self.state == Phase.Starting
+        return Intent.Nothing
+    Intent.NewSession
+
+fn Panel.jump(self) Intent
+    every := self.rows(self.width)
+    at := self.scroll.sel
+    if at < 0 or at >= every.len()
+        return Intent.Nothing
+    r := every[at]
+    if r.path == ""
+        return Intent.Nothing
+    Intent.Jump(path: r.path, line: r.line)
+
+fn Panel.transcript_key(mut self, k str) Intent
+    match k
+        "up" => self.scroll.select(-1)
+        "down" => self.scroll.select(1)
+        "pageup" => self.scroll.by(-self.scroll.height)
+        "pagedown" => self.scroll.by(self.scroll.height)
+        "home" => self.scroll.home()
+        "end" => self.scroll.end()
+        "enter" => return self.jump()
+        _ =>
+            if k.len() == 1 or k == "space"
+                self.focus = Focus.Prompt
+                return self.prompt_key(k, false)
+    Intent.Nothing
+
+fn Panel.prompt_key(mut self, k str, shift bool) Intent
+    if k == "enter"
+        if shift
+            self.input.newline()
+            self.refresh_chooser()
+            return Intent.Nothing
+        return self.submit()
+    match k
+        "backspace" => self.input.backspace()
+        "delete" => self.input.delete()
+        "left" => self.input.left()
+        "right" => self.input.right()
+        "home" => self.input.home()
+        "end" => self.input.end()
+        "space" => self.input.insert(" ")
+        "up" =>
+            if self.input.line == 0
+                self.input.older()
+            else
+                self.input.up()
+        "down" =>
+            if self.input.line + 1 >= self.input.lines.len()
+                self.input.newer()
+            else
+                self.input.down()
+        _ =>
+            if k.len() != 1
+                return Intent.Nothing
+            self.input.insert(k)
+    self.refresh_chooser()
+    Intent.Nothing
+
+## One key press (`k` as the editor names keys: a character, or `enter`,
+## `escape`, `tab`, `backspace`, `delete`, `up`, `down`, `left`, `right`,
+## `home`, `end`, `pageup`, `pagedown`) and what the wiring must do.
+## - Ctrl-N new session, Ctrl-E pick the agent, Ctrl-R open the review.
+## - Escape closes the mention chooser; during a turn the first press arms
+##   and the second gives `Cancel`; otherwise it gives `Close`.
+## - While a permission prompt waits, 1 to 9 answer it (in the transcript,
+##   or when the box is empty).
+## - Tab switches focus (in the chooser it accepts the item, as Enter does;
+##   Up and Down move in the chooser).
+## - In the box: Enter sends (`Send` when the agent is ready; else the
+##   prompt waits and `NewSession` starts the agent, or `Nothing` while it
+##   starts), Shift-Enter breaks the line, Up on the first line and Down on
+##   the last walk the history, typing `@` opens the chooser.
+## - In the transcript: Up and Down select a row, PageUp, PageDown, Home and
+##   End scroll, Enter jumps to the selected row's place; typing a character
+##   goes back to the box.
+pub fn Panel.key(mut self, k str, ctrl bool, alt bool, shift bool) Intent
+    if k != "escape"
+        self.disarm()
+    if ctrl and not alt
+        return ctrl_intent(k)
+    if alt
+        return Intent.Nothing
+    if k == "escape"
+        return self.escape()
+    if self.choosing and self.chooser_key(k)
+        return Intent.Nothing
+    if self.state == Phase.Asking and (self.focus == Focus.Transcript or self.input.is_empty())
+        if num := digit(k)
+            if ask := self.session.asking
+                if num <= ask.options.len()
+                    return Intent.Permit(option: ask.options[num - 1].id)
+    if k == "tab"
+        self.focus = if self.focus == Focus.Prompt then Focus.Transcript else Focus.Prompt
+        return Intent.Nothing
+    if self.focus == Focus.Transcript
+        return self.transcript_key(k)
+    self.prompt_key(k, shift)
+
+fn phase_text(p Phase) str
+    match p
+        Phase.Idle => "idle"
+        Phase.Starting => "starting"
+        Phase.Running => "running"
+        Phase.Asking => "waiting for permission"
+        Phase.Stopped(why) => "stopped: {why}"
+
+fn phase_name(p Phase) str
+    match p
+        Phase.Idle => "idle"
+        Phase.Starting => "starting"
+        Phase.Running => "running"
+        Phase.Asking => "asking"
+        Phase.Stopped(_) => "stopped"
+
+## The tool calls of the last turn: tool rows after the last prompt.
+fn turn_tools(s acp.Session) int
+    mut n := 0
+    mut k := s.rows.len() - 1
+    while k >= 0 and s.rows[k].who != acp.Who.User
+        if s.rows[k].kind == acp.RowKind.Tool
+            n += 1
+        k -= 1
+    n
+
+## The status-bar segment: `agent: NAME - STATE`, with the turn's tool
+## calls while it runs, e.g. `agent: Claude Code - running (3 tools)`.
+pub fn Panel.status(self) str
+    mut extra := ""
+    if self.state == Phase.Running or self.state == Phase.Asking
+        tools := turn_tools(self.session)
+        if tools == 1
+            extra = " (1 tool)"
+        elif tools > 1
+            extra = " ({tools} tools)"
+    "agent: {self.agent.name} - {phase_text(self.state)}{extra}"
+
+fn jm(key str, value Json) JsonMember
+    JsonMember(key: key, value: value)
+
+fn jnum(n int) Json
+    Json.Num(n.to_float())
+
+fn jstrs(xs List[str]) Json
+    mut out := List[Json]()
+    for x in xs
+        out.push(Json.Str(x))
+    Json.Arr(out)
+
+## The panel as JSON for `--print --json` (D4): the agent and its command,
+## the state and its reason, the status text, focus, the box (lines and
+## caret), the chooser's items, the waiting permission's choices, the
+## scroll, and the rows at the last width (text, kind, indent, path, line).
+pub fn Panel.to_json(self) str
+    mut items := List[Json]()
+    for r in self.rows(self.width)
+        items.push(Json.Obj([
+            jm("text", Json.Str(r.text)),
+            jm("kind", Json.Str(r.kind.name().to_lower())),
+            jm("indent", jnum(r.indent)),
+            jm("path", Json.Str(r.path)),
+            jm("line", jnum(r.line)),
+        ]))
+    mut why := ""
+    if self.state != Phase.Idle
+        why = phase_text(self.state).strip_prefix("stopped: ") else ""
+    mut asking := List[str]()
+    if ask := self.session.asking
+        for o in ask.options
+            asking.push(o.name)
+    box := Json.Obj([
+        jm("lines", jstrs(self.input.lines)),
+        jm("line", jnum(self.input.line)),
+        jm("col", jnum(self.input.col)),
+    ])
+    view_at := Json.Obj([
+        jm("top", jnum(self.scroll.top)),
+        jm("follow", Json.Bool(self.scroll.follow)),
+        jm("sel", jnum(self.scroll.sel)),
+    ])
+    Json
+        .Obj([
+            jm("panel", Json.Str("agent")),
+            jm("agent", Json.Str(self.agent.name)),
+            jm("command", Json.Str(self.agent.shown())),
+            jm("state", Json.Str(phase_name(self.state))),
+            jm("reason", Json.Str(why)),
+            jm("status", Json.Str(self.status())),
+            jm("focus", Json.Str(self.focus.name().to_lower())),
+            jm("prompt", box),
+            jm("choices", jstrs(self.choices)),
+            jm("permission", jstrs(asking)),
+            jm("hint", Json.Str(self.hint)),
+            jm("scroll", view_at),
+            jm("rows", Json.Arr(items)),
+        ])
+        .to_text()
+
+# ---- Tests -------------------------------------------------------------------
+
+## Test lines are written with ' for " so they stay readable.
+fn q(s str) str
+    s.replace("'", "\"")
+
+fn upd(body str) str
+    p := "\{'sessionId':'s1','update':\{{body}}}"
+    q("\{'jsonrpc':'2.0','method':'session/update','params':{p}}")
+
+fn chunk(kind str, text str) str
+    upd("'sessionUpdate':'{kind}','content':\{'type':'text','text':'{text}'}")
+
+fn agent_req(id int, method str, params str) str
+    q("\{'jsonrpc':'2.0','id':{id},'method':'{method}','params':\{{params}}}")
+
+fn ok(id int, result str) str
+    q("\{'jsonrpc':'2.0','id':{id},'result':\{{result}}}")
+
+fn opt(id str, name str, kind str) str
+    "\{'optionId':'{id}','name':'{name}','kind':'{kind}'}"
+
+fn entry(content str, priority str, status str) str
+    "\{'content':'{content}','priority':'{priority}','status':'{status}'}"
+
+fn vr(text str, kind ViewKind, indent int, path str, at int) ViewRow
+    ViewRow(text: text, kind: kind, indent: indent, path: path, line: at)
+
+fn ready_panel() Panel
+    mut p := Panel.new(presets(), "/w")
+    _ := p.start("ail-edit", "0.1")
+    _ := p.take(ok(0, "'protocolVersion':1"))
+    _ := p.take(ok(1, "'sessionId':'s1'"))
+    p
+
+fn press(mut p Panel, k str) Intent
+    p.key(k, false, false, false)
+
+@test fn presets_and_settings_make_the_agent_list()
+    ps := presets()
+    assert_eq(ps.len(), 3)
+    assert_eq(ps[0].shown(), "npx -y @agentclientprotocol/claude-agent-acp")
+    assert_eq(ps[1].shown(), "npx -y @agentclientprotocol/codex-acp")
+    assert_eq(ps[2].shown(), "gemini --acp")
+    assert_eq(key_of("Claude Code"), "claude-code")
+    text := "font 20\nagent.codex codex-acp --flag\nagent.opencode opencode acp\nagent.bad\n"
+    list := parse_agents(text)
+    assert_eq(list.len(), 4)
+    assert_eq(list[1], Agent(name: "Codex", command: "codex-acp", args: ["--flag"]))
+    assert_eq(list[3], Agent(name: "opencode", command: "opencode", args: ["acp"]))
+    assert_eq(parse_agents(""), ps)
+    assert_eq((choose(list, "codex") else ps[0]).command, "codex-acp")
+    assert_eq((choose(list, "gemini-cli") else ps[0]).name, "Gemini CLI")
+    assert_eq((choose(list, "Claude Code") else ps[1]).name, "Claude Code")
+    assert(choose(list, "nobody") == none)
+
+@test fn the_box_edits_like_a_small_text_area()
+    mut b := Box.new()
+    assert(b.is_empty())
+    b.insert("ab")
+    b.newline()
+    b.insert("cd")
+    assert_eq(b.lines, ["ab", "cd"])
+    assert_eq((b.line, b.col), (1, 2))
+    b.left()
+    b.left()
+    b.left()
+    assert_eq((b.line, b.col), (0, 2))
+    b.backspace()
+    assert_eq(b.lines, ["a", "cd"])
+    b.right()
+    assert_eq((b.line, b.col), (1, 0))
+    b.backspace()
+    assert_eq(b.lines, ["acd"])
+    assert_eq(b.col, 1)
+    b.delete()
+    assert_eq(b.lines, ["ad"])
+    b.end()
+    b.delete()
+    assert_eq(b.lines, ["ad"])
+    b.home()
+    b.paste("x\r\ny")
+    assert_eq(b.lines, ["x", "yad"])
+    assert_eq((b.line, b.col), (1, 1))
+    b.up()
+    assert_eq((b.line, b.col), (0, 1))
+    b.down()
+    assert_eq((b.line, b.col), (1, 1))
+    b.home()
+    b.backspace()
+    assert_eq(b.text(), "xyad")
+    b.delete()
+    assert_eq(b.text(), "xad")
+
+@test fn the_box_walks_its_history()
+    mut b := Box.new()
+    b.insert("one")
+    _ := b.submit()
+    b.insert("two")
+    _ := b.submit()
+    b.insert("  ")
+    assert_eq(b.submit().text, "")
+    assert_eq(b.history, ["one", "two"])
+    b.insert("dra")
+    b.older()
+    assert_eq(b.text(), "two")
+    b.older()
+    b.older()
+    assert_eq(b.text(), "one")
+    b.newer()
+    assert_eq(b.text(), "two")
+    b.newer()
+    assert_eq(b.text(), "dra")
+    b.newer()
+    assert_eq(b.text(), "dra")
+    sent := b.submit()
+    assert_eq(sent, Submitted(text: "dra", mentions: []))
+    assert_eq(b.history, ["one", "two", "dra"])
+    assert_eq(b.lines, [""])
+
+@test fn mentions_are_found_accepted_and_submitted()
+    mut b := Box.new()
+    b.insert("see @li")
+    assert_eq(mention_query(b), "li")
+    accept_mention(mut b, "/w/lib.ail")
+    assert_eq(b.text(), "see @/w/lib.ail ")
+    assert(mention_query(b) == none)
+    b.insert("@")
+    assert_eq(mention_query(b), "")
+    b.accept("@selection")
+    b.insert("and @#pa")
+    b.accept("#parse")
+    b.insert("a@b @file, @nope @task ")
+    assert(mention_query(b) == none)
+    assert_eq(b.known, ["/w/lib.ail"])
+    sent := b.submit()
+    assert_eq(sent.text, "see @/w/lib.ail @selection and @#parse a@b @file, @nope @task")
+    want := [
+        Mention(kind: MentionKind.Path, value: "/w/lib.ail"),
+        Mention(kind: MentionKind.Selection, value: ""),
+        Mention(kind: MentionKind.Symbol, value: "parse"),
+        Mention(kind: MentionKind.ActiveFile, value: ""),
+        Mention(kind: MentionKind.TaskState, value: ""),
+    ]
+    assert_eq(sent.mentions, want)
+    b.older()
+    assert_eq(b.submit().mentions, want)
+
+@test fn mention_choices_rank_fixed_items_files_and_symbols()
+    all_items := mention_choices("", ["/w/b.ail"], ["parse"])
+    fixed := ["@selection", "@diagnostics", "@file", "@task", "@test-failures"]
+    mut want := fixed
+    want.push("/w/b.ail")
+    want.push("#parse")
+    assert_eq(all_items, want)
+    te := mention_choices("te", ["/w/src/main.ail", "/w/test.ail"], ["tell", "rate"])
+    assert_eq(te, ["@test-failures", "#tell", "/w/test.ail", "#rate"])
+    assert_eq(mention_choices("#pa", ["/w/pa.ail"], ["parse", "spawn"]), ["#parse", "#spawn"])
+    wa := mention_choices("wa", ["/w/a.ail", "/w/x/walk.ail"], [])
+    assert_eq(wa, ["/w/x/walk.ail", "/w/a.ail"])
+    assert_eq(mention_choices("AIL", ["/w/A.ail", "/w/zz.md"], []), ["/w/A.ail"])
+    assert_eq(mention_choices("zq", ["/w/a.ail"], ["x"]), List[str]())
+
+@test fn mentions_resolve_to_blocks_and_links()
+    mut ctx := Context.new("/w")
+    ctx.active = "/w/a.ail"
+    ctx.selection = "x := 1"
+    ctx.diagnostics = ["a.ail:3: unused x"]
+    ctx.task = "verify: ok"
+    ms := [
+        Mention(kind: MentionKind.Selection, value: ""),
+        Mention(kind: MentionKind.Diagnostics, value: ""),
+        Mention(kind: MentionKind.ActiveFile, value: ""),
+        Mention(kind: MentionKind.Path, value: "lib/b.ail"),
+        Mention(kind: MentionKind.TestFailures, value: ""),
+        Mention(kind: MentionKind.Symbol, value: "parse"),
+        Mention(kind: MentionKind.TaskState, value: ""),
+        Mention(kind: MentionKind.Path, value: "/w/a.ail"),
+    ]
+    r := resolve(ms, ctx)
+    assert_eq(r.files, ["/w/a.ail", "/w/lib/b.ail"])
+    assert_eq(r.blocks, [
+        "Selection in a.ail line 1:\n```\nx := 1\n```",
+        "Diagnostics:\na.ail:3: unused x",
+        "Failing tests: none",
+        "Symbol: parse",
+        "Task: verify: ok",
+    ])
+    ctx.sel_to = 2
+    ctx.selection = ""
+    sel := [Mention(kind: MentionKind.Selection, value: "")]
+    assert_eq(resolve(sel, ctx).blocks, ["Selection: none"])
+    ctx.selection = "a\nb\nc"
+    assert_eq(resolve(sel, ctx).blocks, ["Selection in a.ail lines 1-3:\n```\na\nb\nc\n```"])
+    two := Resolved(blocks: ["A", "B"], files: [])
+    assert_eq(prompt_text("fix", two), "fix\n\nA\n\nB")
+    assert_eq(prompt_text("fix", Resolved(blocks: [], files: [])), "fix")
+    win := resolve([Mention(kind: MentionKind.Path, value: "C:\\w\\a.ail")], ctx)
+    assert_eq(win.files, ["C:\\w\\a.ail"])
+
+@test fn changes_count_the_lines_between_common_ends()
+    d := acp.DiffPart(path: "/w/a", old_text: "a\nb\nc", new_text: "a\nx\ny\nc")
+    assert_eq(change_of(d), Change(added: 2, removed: 1, at: 1))
+    fresh := acp.DiffPart(path: "/w/n", old_text: none, new_text: "a\nb")
+    assert_eq(change_of(fresh), Change(added: 2, removed: 0, at: 0))
+    same := acp.DiffPart(path: "/w/s", old_text: "a\na", new_text: "a\na")
+    assert_eq(change_of(same), Change(added: 0, removed: 0, at: 2))
+    cut := acp.DiffPart(path: "/w/c", old_text: "a\na\na", new_text: "a\na")
+    assert_eq(change_of(cut), Change(added: 0, removed: 1, at: 2))
+
+@test fn tool_rows_show_marks_output_and_places()
+    mut s := acp.open("/w")
+    out := "Run tests\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8"
+    s.rows.push(acp.Row(
+        who: acp.Who.Agent,
+        kind: acp.RowKind.Tool,
+        text: out,
+        tag: "failed",
+        call: "t1",
+    ))
+    note := "the agent exited with status 1"
+    s.rows.push(acp.Row(who: acp.Who.Editor, kind: acp.RowKind.Note, text: note, tag: "", call: ""))
+    s.rows.push(acp.Row(
+        who: acp.Who.Agent,
+        kind: acp.RowKind.Diff,
+        text: "/w/n.ail",
+        tag: "new +2",
+        call: "t1",
+    ))
+    s.diffs.push(acp.DiffPart(path: "/w/n.ail", old_text: none, new_text: "a\nb"))
+    rows := view(s, "Codex", [Target(call: "t1", path: "/w/t.ail", line: 4)], 20)
+    mut want := [
+        vr("Codex", ViewKind.Header, 0, "", -1),
+        vr("x Run tests", ViewKind.Tool, 2, "/w/t.ail", 4),
+    ]
+    for k in 1..7
+        want.push(vr("l{k}", ViewKind.ToolText, 4, "", -1))
+    want.push(vr("... 2 more lines", ViewKind.ToolText, 4, "", -1))
+    want.push(vr("t.ail:5", ViewKind.Link, 4, "/w/t.ail", 4))
+    want.push(vr("the agent exited", ViewKind.Note, 0, "", -1))
+    want.push(vr("with status 1", ViewKind.Note, 0, "", -1))
+    want.push(vr("n.ail +2 -0", ViewKind.Diff, 2, "/w/n.ail", 0))
+    assert_eq(rows, want)
+    assert_eq(status_mark("pending"), ".")
+    assert_eq(status_mark("in_progress"), "~")
+    assert_eq(status_mark("completed"), "+")
+
+@test fn the_scroll_follows_the_end_until_scrolled_up()
+    mut sc := Scroll.new()
+    sc.fit(10, 4)
+    assert_eq((sc.top, sc.follow), (6, true))
+    sc.by(-2)
+    assert_eq((sc.top, sc.follow), (4, false))
+    sc.fit(12, 4)
+    assert_eq(sc.top, 4)
+    sc.by(10)
+    assert_eq((sc.top, sc.follow), (8, true))
+    sc.fit(13, 4)
+    assert_eq(sc.top, 9)
+    sc.select(-1)
+    assert_eq((sc.sel, sc.top, sc.follow), (12, 9, true))
+    sc.select(-4)
+    assert_eq((sc.sel, sc.top, sc.follow), (8, 8, false))
+    sc.fit(14, 4)
+    assert_eq(sc.top, 8)
+    sc.home()
+    assert_eq((sc.top, sc.follow), (0, false))
+    sc.end()
+    assert_eq((sc.top, sc.follow, sc.sel), (10, true, -1))
+    sc.fit(2, 4)
+    assert_eq(sc.top, 0)
+
+@test fn keys_drive_the_panel()
+    mut p := ready_panel()
+    assert_eq(p.state, Phase.Idle)
+    assert_eq(press(mut p, "escape"), Intent.Close)
+    assert_eq(p.key("n", true, false, false), Intent.NewSession)
+    assert_eq(p.key("E", true, false, false), Intent.PickAgent)
+    assert_eq(p.key("r", true, false, false), Intent.OpenReview)
+    assert_eq(press(mut p, "enter"), Intent.Nothing)
+    _ := press(mut p, "h")
+    _ := p.key("enter", false, false, true)
+    _ := press(mut p, "i")
+    assert_eq(p.input.lines, ["h", "i"])
+    assert_eq(press(mut p, "enter"), Intent.Send(text: "h\ni", files: []))
+    _ := p.send("h\ni", [])
+    assert_eq(p.state, Phase.Running)
+    _ := press(mut p, "x")
+    assert_eq(press(mut p, "enter"), Intent.Nothing)
+    assert_eq(p.hint, BUSY_HINT)
+    assert_eq(p.input.text(), "x")
+    assert_eq(press(mut p, "escape"), Intent.Nothing)
+    assert(p.armed)
+    assert_eq(p.hint, STOP_HINT)
+    _ := press(mut p, "left")
+    assert(not p.armed)
+    _ := press(mut p, "escape")
+    assert_eq(press(mut p, "escape"), Intent.Cancel)
+    assert_eq(p.cancel(), [acp.cancel_line("s1")])
+    _ := press(mut p, "tab")
+    assert_eq(p.focus, Focus.Transcript)
+    _ := press(mut p, "y")
+    assert_eq(p.focus, Focus.Prompt)
+    assert_eq(p.input.text(), "yx")
+    _ := press(mut p, "up")
+    assert_eq(p.input.text(), "h\ni")
+    p.paste(" @")
+    assert(p.choosing)
+    assert_eq(press(mut p, "escape"), Intent.Nothing)
+    assert(not p.choosing)
+    assert(p.choose_agent("gemini-cli"))
+    assert_eq(p.agent.name, "Gemini CLI")
+    assert(not p.choose_agent("nobody"))
+
+@test fn a_prompt_before_the_agent_is_ready_waits_for_it()
+    mut p := Panel.new([], "/w")
+    assert_eq(p.agent.name, "Claude Code")
+    assert_eq(press(mut p, "h"), Intent.Nothing)
+    _ := press(mut p, "i")
+    assert_eq(press(mut p, "enter"), Intent.NewSession)
+    assert(p.pending != none)
+    assert_eq(p.start("ail-edit", "0.1"), acp.initialize_line(0, "ail-edit", "0.1"))
+    assert_eq(p.state, Phase.Starting)
+    _ := press(mut p, "x")
+    assert_eq(press(mut p, "enter"), Intent.Nothing)
+    assert_eq(p.input.text(), "x")
+    _ := p.take(ok(0, "'protocolVersion':1"))
+    sent := p.take(ok(1, "'sessionId':'s1'"))
+    assert_eq(sent, acp.Action.SendLines(lines: [acp.prompt_line(2, "s1", "hi", [])]))
+    assert_eq(p.state, Phase.Running)
+    assert(p.pending == none)
+    p.ended("the agent exited (status 1)")
+    assert_eq(p.state, Phase.Stopped(reason: "the agent exited (status 1)"))
+    assert_eq(p.status(), "agent: Claude Code - stopped: the agent exited (status 1)")
+
+# A recorded turn through the panel: handshake, a prompt with a file mention
+# typed through the chooser, a thought, a streamed message, a plan, a tool
+# call with a place, its permission answered by a number key, the diff, the
+# end; then the view at width 40, a jump from the transcript and the JSON.
+@test fn a_scripted_session_builds_the_view()
+    mut p := Panel.new(presets(), "/w")
+    p.ctx.files = ["/w/a.ail", "/w/b.ail", "/w/lib/abc.ail"]
+    assert_eq(p.status(), "agent: Claude Code - idle")
+    _ := p.start("ail-edit", "0.1")
+    assert_eq(p.status(), "agent: Claude Code - starting")
+    hello := p.take(ok(0, "'protocolVersion':1"))
+    assert_eq(hello, acp.Action.SendLines(lines: [acp.new_session_line(1, "/w")]))
+    assert_eq(p.take(ok(1, "'sessionId':'s1'")), acp.Action.Nothing)
+    for k in ["f", "i", "x", "space", "@", "a"]
+        assert_eq(press(mut p, k), Intent.Nothing)
+    assert(p.choosing)
+    assert_eq(p.choices, ["/w/a.ail", "/w/lib/abc.ail", "/w/b.ail"])
+    _ := press(mut p, "tab")
+    assert_eq(p.input.text(), "fix @/w/a.ail ")
+    go := press(mut p, "enter")
+    assert_eq(go, Intent.Send(text: "fix @/w/a.ail", files: ["/w/a.ail"]))
+    sent := p.send("fix @/w/a.ail", ["/w/a.ail"])
+    assert_eq(sent, [acp.prompt_line(2, "s1", "fix @/w/a.ail", ["/w/a.ail"])])
+    assert_eq(p.status(), "agent: Claude Code - running")
+    _ := p.take(chunk("agent_thought_chunk", "Looking at a.ail"))
+    _ := p.take(chunk("agent_message_chunk", "I will fix the bug in a.ail now, "))
+    _ := p.take(chunk("agent_message_chunk", "then run the tests."))
+    e1 := entry("Read a.ail", "high", "completed")
+    e2 := entry("Fix the bug", "high", "in_progress")
+    _ := p.take(upd("'sessionUpdate':'plan','entries':[{e1},{e2}]"))
+    head := "'sessionUpdate':'tool_call','toolCallId':'call_1','title':'Edit a.ail'"
+    loc := "'locations':[\{'path':'/w/a.ail','line':2}]"
+    _ := p.take(upd("{head},'kind':'edit','status':'pending',{loc}"))
+    assert_eq(p.status(), "agent: Claude Code - running (1 tool)")
+    o1 := opt("allow", "Allow", "allow_once")
+    o2 := opt("reject", "Reject", "reject_once")
+    tc := "'toolCall':\{'toolCallId':'call_1'}"
+    params := "'sessionId':'s1',{tc},'options':[{o1},{o2}]"
+    _ := p.take(agent_req(5, "session/request_permission", params))
+    assert_eq(p.state, Phase.Asking)
+    assert_eq(p.status(), "agent: Claude Code - waiting for permission (1 tool)")
+    asking := p.rows(40)
+    assert_eq(asking.len(), 15)
+    assert_eq(asking[10], vr(". Edit a.ail", ViewKind.Tool, 2, "/w/a.ail", 1))
+    assert_eq(asking[12..], [
+        vr("? Edit a.ail", ViewKind.Permission, 2, "", -1),
+        vr("1. Allow", ViewKind.Choice, 4, "", -1),
+        vr("2. Reject", ViewKind.Choice, 4, "", -1),
+    ])
+    assert_eq(press(mut p, "1"), Intent.Permit(option: "allow"))
+    assert_eq(p.permit("allow"), [ok(5, "'outcome':\{'outcome':'selected','optionId':'allow'}")])
+    assert_eq(p.state, Phase.Running)
+    texts := "'oldText':'x := 1\\ny := 2','newText':'x := 1\\ny := 3'"
+    diff := "\{'type':'diff','path':'/w/a.ail',{texts}}"
+    head2 := "'sessionUpdate':'tool_call_update','toolCallId':'call_1','status':'completed'"
+    _ := p.take(upd("{head2},'content':[{diff}]"))
+    assert_eq(p.take(ok(2, "'stopReason':'end_turn'")), acp.Action.Nothing)
+    assert_eq(p.state, Phase.Idle)
+    want := [
+        vr("You", ViewKind.Header, 0, "", -1),
+        vr("fix @/w/a.ail", ViewKind.Body, 2, "", -1),
+        vr("@/w/a.ail", ViewKind.Body, 2, "", -1),
+        vr("", ViewKind.Blank, 0, "", -1),
+        vr("Claude Code", ViewKind.Header, 0, "", -1),
+        vr("Looking at a.ail", ViewKind.Thought, 2, "", -1),
+        vr("I will fix the bug in a.ail now, then", ViewKind.Body, 2, "", -1),
+        vr("run the tests.", ViewKind.Body, 2, "", -1),
+        vr("[x] Read a.ail", ViewKind.Plan, 2, "", -1),
+        vr("[~] Fix the bug", ViewKind.Plan, 2, "", -1),
+        vr("+ Edit a.ail", ViewKind.Tool, 2, "/w/a.ail", 1),
+        vr("a.ail:2", ViewKind.Link, 4, "/w/a.ail", 1),
+        vr("? Edit a.ail: Allow", ViewKind.Permission, 2, "", -1),
+        vr("a.ail +1 -1", ViewKind.Diff, 2, "/w/a.ail", 1),
+    ]
+    assert_eq(p.rows(40), want)
+    shown := p.visible(40, 5)
+    assert_eq(shown, want[9..])
+    _ := press(mut p, "tab")
+    _ := press(mut p, "up")
+    assert_eq(p.scroll.sel, 13)
+    assert_eq(press(mut p, "enter"), Intent.Jump(path: "/w/a.ail", line: 1))
+    j := parse_json(p.to_json())?
+    assert_eq(j.text("state", ""), "idle")
+    assert_eq(j.text("status", ""), "agent: Claude Code - idle")
+    assert_eq(j.text("command", ""), "npx -y @agentclientprotocol/claude-agent-acp")
+    assert_eq(j.text("focus", ""), "transcript")
+    rows := j.arr("rows") else []
+    assert_eq(rows.len(), 14)
+    assert_eq(rows[13].text("kind", ""), "diff")
+    assert_eq(rows[13].int("line") else -1, 1)
+    assert_eq(rows[13].text("text", ""), "a.ail +1 -1")
+    sc := j.get("scroll") else Json.Null
+    assert_eq(sc.int("sel") else 0, 13)
