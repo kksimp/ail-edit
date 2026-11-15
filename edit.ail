@@ -363,26 +363,70 @@ fn indent_of(s str) int
         n += 1
     n
 
-BLOCK_WORDS := "fn if elif else while for par with match struct enum trait impl error"
+BLOCK_WORDS := "fn if elif else while for par with match select unsafe struct enum trait impl error unique"
+
+## The words just before an `if` or `match` whose value a line binds, assigns,
+## returns, yields or gives to an arm, so that it opens a block there
+## (expr.if.1, expr.match.1, expr.yield.2).
+VALUE_LEADS := ":= = += -= *= /= %= &= |= ^= <<= >>= => return yield"
+
+## The index of a line's own first word, past its attributes, `pub`, `defer`
+## (own.defer.1) and a loop's label (expr.loop.9).
+fn head_word(words List[str]) int
+    n := words.len()
+    mut k := 0
+    while k + 1 < n
+        w := words[k]
+        label := w.ends_with(":") and (words[k + 1] == "for" or words[k + 1] == "while")
+        if not (w.starts_with("@") or w == "pub" or w == "defer" or label)
+            break
+        k += 1
+    k
+
+## Whether `word` (`if` or `match`) opens a block on the line of `words`: as
+## the line's own first word, or as the value of a binding, an assignment, a
+## `return`, a `yield` or an arm.
+fn opens_with(words List[str], word str) bool
+    # `if c then a else b` is one expression (expr.if.2) and opens nothing.
+    if words.contains("then")
+        return false
+    if words[head_word(words)] == word
+        return true
+    leads := VALUE_LEADS.split(" ")
+    for i in 1..words.len()
+        if words[i] == word and leads.contains(words[i - 1])
+            return true
+    false
+
+## Whether `w` is a plain name: not a keyword, a number or other text.
+fn is_name(w str) bool
+    cs := w.chars()
+    if cs.len() == 0 or cs[0].is_digit() or KEYWORDS.contains(w)
+        return false
+    for c in cs
+        if not is_word(c)
+            return false
+    true
 
 ## Whether a line opens an indented block (lex.block.1): a declaration or a
-## control-flow header, a `match` arm or `if` value, or `else err`.
+## control-flow header, a `match` or `select` arm, an `if` or `match` value,
+## or `else` and `else err` (err.else.2-3).
 fn opens_block(s str) bool
     t := s.trim()
     if t == "" or t.starts_with("#")
         return false
     words := t.split(" ")
     n := words.len()
-    mut first := words[0]
-    if first.starts_with("@") and n > 1
-        first = words[1]
-    # `par for` (conc.par.5) and `with m as mut x` (conc.share.6) open blocks; contract lines do not.
-    if BLOCK_WORDS.split(" ").contains(first) or t.ends_with("=>")
+    if words.contains("then")
+        return false
+    # `par for` (conc.par.5), `with m as mut x` (conc.share.6), `select` (conc.select.2)
+    # and `unsafe` (unsafe.block.1) open blocks; contract lines do not.
+    if t.ends_with("=>") or BLOCK_WORDS.split(" ").contains(words[head_word(words)])
         return true
-    n >= 2
-        and (words[n - 1] == "else" or words[n - 2] == "else" or words[n - 2] == ":=" and (words[n - 1] == "match" or words[n - 1] == "if"))
-        or t.contains(":= if ")
-        or t.contains(":= match ")
+    if opens_with(words, "if") or opens_with(words, "match")
+        return true
+    # `x := f() else 0` is a whole line (err.else.6); `else err` goes on in a block.
+    words[n - 1] == "else" or n >= 2 and words[n - 2] == "else" and is_name(words[n - 1])
 
 fn Editor.newline(mut self)
     head := lines[line].slice(0, col)
@@ -631,7 +675,7 @@ fn word_marks(cs List[char], word str) List[bool]
     out
 
 ## After typing, a line that now reads `else` or `elif` moves back one level
-## to line up with its `if` (lex.block.1).
+## to line up with its `if`, also an `if` that is a value or deferred (lex.block.1).
 fn Editor.dedent_else(mut self)
     t := lines[line].trim()
     if t != "else" and t != "elif"
@@ -645,7 +689,7 @@ fn Editor.dedent_else(mut self)
     if l < 0 or indent_of(lines[l]) != ind - INDENT
         return
     head := lines[l].trim()
-    if head.starts_with("if ") or head.starts_with("elif ") or head.contains(":= if ")
+    if head.starts_with("elif ") or opens_with(head.split(" "), "if")
         c := col
         edit(line, 0, line, INDENT, "")
         set_col(c - INDENT)
@@ -1289,6 +1333,7 @@ KEYWORDS := {
     "ref",
     "requires",
     "return",
+    "select",
     "self",
     "spawn",
     "struct",
@@ -1300,6 +1345,7 @@ KEYWORDS := {
     "use",
     "while",
     "with",
+    "yield",
 }
 
 ## The end of a quoted literal that starts at `q` (the opening quote),
@@ -1313,6 +1359,69 @@ fn quoted_end(cs List[char], q int, raw bool) int
             j += 1
         j += 1
     (j + 1).min(n)
+
+## Just past the `"` that closes the string starting at `q`, skipping escapes
+## and each `{expression}`, whose code may hold strings and chars of its own
+## (lex.str.2), and its format specification (lex.str.7).
+fn string_end(cs List[char], q int) int
+    n := cs.len()
+    mut j := q + 1
+    while j < n and cs[j] != '"'
+        if cs[j] == '\\'
+            j += 1
+        elif cs[j] == '{'
+            j = interp_close(cs, j)
+        j += 1
+    (j + 1).min(n)
+
+## The `}` that closes the interpolation opened at `open`, or the end of the
+## line when it never closes (lex.str.2).
+fn interp_close(cs List[char], open int) int
+    n := cs.len()
+    mut depth := 0
+    mut k := open
+    while k < n
+        c := cs[k]
+        if c == '{'
+            depth += 1
+        elif c == '}'
+            depth -= 1
+            if depth == 0
+                return k
+        elif c == '"'
+            k = string_end(cs, k) - 1
+        elif c == '\''
+            k = quoted_end(cs, k, false) - 1
+        k += 1
+    n
+
+## Just past the number that starts at `i`: digits, letters and `_` (`0x1f`,
+## `1_000`), a fraction, and an exponent's sign (`1e-3`, lex.num.1-2). After
+## `0x`, `0b` or `0o` a sign is an operator: `0x1e-3` is a subtraction.
+fn number_end(cs List[char], i int) int
+    n := cs.len()
+    prefixed := cs[i] == '0' and i + 1 < n and "xbo".contains(cs[i + 1])
+    mut j := i + 1
+    while j < n
+        c := cs[j]
+        digit_next := j + 1 < n and cs[j + 1].is_digit()
+        if is_word(c) or c == '.' and digit_next
+            j += 1
+        elif not prefixed and "+-".contains(c) and "eE".contains(cs[j - 1]) and digit_next
+            j += 1
+        else
+            break
+    j
+
+## Whether a `r"` or `b"` string starts at `i`, not inside a longer name.
+fn prefixed_quote(cs List[char], i int) bool
+    if i + 1 >= cs.len() or cs[i + 1] != '"' or i > 0 and is_word(cs[i - 1])
+        return false
+    cs[i] == 'r' or cs[i] == 'b'
+
+## Whether `"""` starts at `i`.
+fn starts_triple(cs List[char], i int) bool
+    i + 2 < cs.len() and cs[i] == '"' and cs[i + 1] == '"' and cs[i + 2] == '"'
 
 TRIPLE := "\"\"\""
 
@@ -1370,15 +1479,20 @@ fn colors(cs List[char]) List[int]
         elif c == '"' and i + 2 < n and cs[i + 1] == '"' and cs[i + 2] == '"'
             j = triple_end(cs, i + 3)
             fg = STRING_FG
-        elif c == '"' or c == '\''
+        elif c == '"'
+            j = string_end(cs, i)
+            fg = STRING_FG
+        elif c == '\''
             j = quoted_end(cs, i, false)
             fg = STRING_FG
-        elif c == 'r' and i + 1 < n and cs[i + 1] == '"' and (i == 0 or not is_word(cs[i - 1]))
-            j = quoted_end(cs, i + 1, true)
+        elif prefixed_quote(cs, i)
+            # `r"..."` and `r"""` are raw (lex.str.6); `b"..."` is `bytes` (lex.bytes.1)
+            j = quoted_end(cs, i + 1, c == 'r')
+            if c == 'r' and starts_triple(cs, i + 1)
+                j = triple_end(cs, i + 4)
             fg = STRING_FG
         elif c.is_digit()
-            while j < n and (is_word(cs[j]) or cs[j] == '.' and j + 1 < n and cs[j + 1].is_digit())
-                j += 1
+            j = number_end(cs, i)
             fg = NUMBER_FG
         elif is_word(c) or c == '@'
             while j < n and is_word(cs[j])
@@ -2464,14 +2578,26 @@ fn key_command(key str, ctrl bool, alt bool, shift bool) Command?
 
 # ---- Running `ail` ------------------------------------------------------
 
-## The `ail` command: `$AIL`, else `./ail` when run from the repository
-## root, else `ail` on `PATH`.
+## The `ail` command (tool.path.1, ADR 1058): `$AIL`, which the `ail`
+## launcher sets for the programs it runs, else `./ail` when run from the
+## root of an ail clone, else `ail` on `PATH`. On Windows `proc.run` finds
+## `ail.cmd` for either (std.proc.3); `proc.which` skips a directory or a
+## file that isn't a program named `ail`.
 fn ail_command() str
-    if a := env.get("AIL")
-        return a
-    if fs.exists("./ail")
+    pick_ail(env.get("AIL") else "", proc.which("./ail") != none)
+
+## `ail_command` from what it found: an empty `$AIL` counts as unset.
+fn pick_ail(given str, here bool) str
+    if given != ""
+        return given
+    if here
         return "./ail"
     "ail"
+
+@test fn ail_is_the_launchers_then_the_clones_then_the_one_on_path()
+    assert_eq(pick_ail("/opt/ail/ail.cmd", true), "/opt/ail/ail.cmd")
+    assert_eq(pick_ail("", true), "./ail")
+    assert_eq(pick_ail("", false), "ail")
 
 fn jstr(j Json, key str) str
     (j.get(key) else Json.Null).as_str() else ""
@@ -2875,7 +3001,7 @@ fn Editor.ail_fix_preview(mut self)
 fn Editor.layer_confirm(mut self, ev ui.Event) bool
     match ev
         Key(k, ctrl, alt, shift) =>
-            if k == "enter" and not ctrl and not alt
+            if k == Enter and not ctrl and not alt
                 snapshot()
                 lines = layer.proposed
                 line = line.min(lines.len() - 1)
@@ -3046,6 +3172,79 @@ fn keys(s str) List[Command]
     ed2 := typed("", keys("with m as mut x\nx\n"))
     assert_eq(ed2.lines, ["with m as mut x", "    x", "    "])
 
+@test fn select_and_yield_are_keywords()
+    for w in ["select", "yield"]
+        assert(KEYWORDS.contains(w))
+    assert_eq(KEYWORDS.len(), 43)
+    assert_eq(colors("select".chars())[0], KEYWORD_FG)
+    y := colors("    yield n".chars())
+    assert_eq(y[4], KEYWORD_FG)
+    assert_eq(y[10], FG)
+    mut texts := List[str]()
+    for c in typed("yi", [Go(End)]).candidates()
+        texts.push(c.text)
+    assert(texts.contains("yield"))
+
+@test fn bit_operators_are_highlighted()
+    # expr.bit.3: `&`, `^`, `~`, `<<`, `>>` and their assignments color as operators
+    b := colors("m := (a & 0xff) ^ ~b << 2 >> 1".chars())
+    for k in [8, 16, 18, 21, 22, 26, 27]
+        assert_eq(b[k], OP_FG)
+    for k in [10, 13, 24, 29]
+        assert_eq(b[k], NUMBER_FG)
+    assert_eq(b[19], FG)
+    a := colors("x <<= 1 # c".chars())
+    assert_eq(a[2], OP_FG)
+    assert_eq(a[4], OP_FG)
+    assert_eq(a[6], NUMBER_FG)
+    assert_eq(a[8], COMMENT_FG)
+
+@test fn literal_forms_are_highlighted()
+    # a string inside `\{...}` doesn't end the outer one (lex.str.2), nor a format spec (lex.str.7)
+    s := colors("p(\"\{xs.join(\", \")} \{n:08}\") # c".chars())
+    for k in [2, 13, 14, 17, 22, 25]
+        assert_eq(s[k], STRING_FG)
+    assert_eq(s[28], COMMENT_FG)
+    # `b"..."` is a `bytes` literal with no interpolation (lex.bytes.1)
+    bs := colors("x := b\"a\{\" # c".chars())
+    assert_eq(bs[5], STRING_FG)
+    assert_eq(bs[9], STRING_FG)
+    assert_eq(bs[11], COMMENT_FG)
+    # `r"""` opens a raw multi-line string (lex.str.6)
+    assert_eq(colors("r\"\"\"a\"b".chars())[6], STRING_FG)
+    # an exponent keeps its sign; after `0x` the `-` subtracts (lex.num.1-2)
+    e := colors("1e-3 + 2.5E+8 - 0x1e-3".chars())
+    for k in [2, 3, 11, 12, 19, 21]
+        assert_eq(e[k], NUMBER_FG)
+    for k in [5, 14, 20]
+        assert_eq(e[k], OP_FG)
+    n := colors("0b1010_0101 1_000".chars())
+    assert_eq(n[10], NUMBER_FG)
+    assert_eq(n[16], NUMBER_FG)
+
+@test fn select_unsafe_and_value_blocks_indent()
+    assert(opens_block("select"))
+    assert(opens_block("    v := ch.recv() =>"))
+    assert(opens_block("    after 100 =>"))
+    assert(not opens_block("    closed => break"))
+    assert(opens_block("unsafe"))
+    assert(opens_block("unsafe fn poke(p *int)"))
+    assert(opens_block("pub fn f()"))
+    assert(opens_block("pub unique struct File"))
+    assert(opens_block("defer if done"))
+    assert(opens_block("outer: for x in xs"))
+    assert(opens_block("return match s"))
+    assert(opens_block("total += if big"))
+    assert(opens_block("    Red => if c"))
+    assert(not opens_block("x := if c then 1 else 2"))
+    assert(not opens_block("x := f() else 0"))
+    assert(not opens_block("yield n * 2"))
+    assert(not opens_block("extern c fn abs(x int) int"))
+    ed := typed("", keys("select\nv := ch.recv() =>\nprint(v)\n"))
+    assert_eq(ed.lines, ["select", "    v := ch.recv() =>", "        print(v)", "        "])
+    ed2 := typed("", keys("total += if big\n1\nelse"))
+    assert_eq(ed2.lines, ["total += if big", "    1", "else"])
+
 @test fn horizontal_and_vertical_scroll()
     mut ed := typed("", [])
     for _ in 0..30
@@ -3194,12 +3393,12 @@ DIAG_JSON := "\{\"api\":1,\"severity\":\"error\",\"rule\":\"expr.name.1\",\"file
 @test fn window_events_drive_the_editor()
     mut ed := typed("", [])
     mut evs := List[ui.Event]()
-    evs.push(Key(key: "h", ctrl: false, alt: false, shift: false))
-    evs.push(Key(key: "I", ctrl: false, alt: false, shift: true))
-    evs.push(Key(key: "left", ctrl: false, alt: false, shift: true))
-    evs.push(Key(key: "c", ctrl: true, alt: false, shift: false))
-    evs.push(Key(key: "end", ctrl: false, alt: false, shift: false))
-    evs.push(Key(key: "v", ctrl: true, alt: false, shift: false))
+    evs.push(Key(key: Text("h"), ctrl: false, alt: false, shift: false))
+    evs.push(Key(key: Text("I"), ctrl: false, alt: false, shift: true))
+    evs.push(Key(key: Left, ctrl: false, alt: false, shift: true))
+    evs.push(Key(key: Text("c"), ctrl: true, alt: false, shift: false))
+    evs.push(Key(key: End, ctrl: false, alt: false, shift: false))
+    evs.push(Key(key: Text("v"), ctrl: true, alt: false, shift: false))
     evs.push(Resize(cols: 60, rows: 20))
     evs.push(Close)
     for ev in evs
@@ -3252,7 +3451,7 @@ fn indexed(cmds List[Command]) Editor
 
 ## A key pressed with no modifiers.
 fn press(k str) ui.Event
-    Key(key: k, ctrl: false, alt: false, shift: false)
+    Key(key: ui.key_code(k), ctrl: false, alt: false, shift: false)
 
 ## `ail api --refs` for `add` in API_SRC: its declaration and one call.
 ADD_REFS_JSON := "\{\"api\":1,\"symbol\":\"fn:add\",\"refs\":[\{\"file\":\"t.ail.edit-query.ail\",\"line\":5,\"col\":4,\"def\":true},\{\"file\":\"t.ail.edit-query.ail\",\"line\":10,\"col\":11,\"def\":false},\{\"file\":\"other.ail\",\"line\":1,\"col\":1,\"def\":false}]}"
@@ -3571,13 +3770,13 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
 @test fn mouse_clicks_drags_and_scrolls()
     mut ed := typed("fn main()\n    print(1)\n    print(2)\n", [])
     gw := ed.gutter_width()
-    ed.on_event(Mouse(col: gw + 4, row: 1, button: "left", kind: "down"))
+    ed.on_event(Mouse(col: gw + 4, row: 1, button: Left, kind: Down))
     assert_eq([ed.line, ed.col], [1, 4])
-    ed.on_event(Mouse(col: gw + 9, row: 2, button: "left", kind: "drag"))
-    ed.on_event(Mouse(col: gw + 9, row: 2, button: "left", kind: "up"))
+    ed.on_event(Mouse(col: gw + 9, row: 2, button: Left, kind: Drag))
+    ed.on_event(Mouse(col: gw + 9, row: 2, button: Left, kind: Up))
     assert_eq(ed.selected_text(), "print(1)\n    print")
     # Past the end of a line, a click lands at its end.
-    ed.on_event(Mouse(col: 99, row: 0, button: "left", kind: "down"))
+    ed.on_event(Mouse(col: 99, row: 0, button: Left, kind: Down))
     assert_eq([ed.line, ed.col], [0, 9])
     assert(ed.selection() == none)
     ed.on_event(Scroll(lines: 2))
@@ -3588,7 +3787,7 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
 @test fn clicking_a_diagnostic_jumps_to_it()
     mut ed := typed("fn main()\n    prnt(1)\n", [])
     ed.diags = parse_diags(DIAG_JSON)
-    ed.on_event(Mouse(col: 3, row: ed.text_rows() + 1, button: "left", kind: "down"))
+    ed.on_event(Mouse(col: 3, row: ed.text_rows() + 1, button: Left, kind: Down))
     assert_eq([ed.line, ed.col], [1, 4])
 
 @test fn run_output_goes_to_the_pane()
@@ -3626,7 +3825,7 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
         err: "t.ail:3:13: trap[type.coll.4]: out of bounds\n",
     ))
     assert_eq(ed.pane_text.len(), 2)
-    ed.on_event(Mouse(col: 2, row: ed.text_rows() + 2, button: "left", kind: "down"))
+    ed.on_event(Mouse(col: 2, row: ed.text_rows() + 2, button: Left, kind: Down))
     assert_eq([ed.line, ed.col], [2, 12])
     # Long output keeps its end.
     mut long := ""
@@ -3641,12 +3840,12 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     gw := ws.eds[0].gutter_width()
     plain := ui.Modifiers(ctrl: false, alt: false, shift: false)
     shift := ui.Modifiers(ctrl: false, alt: false, shift: true)
-    ws.on_window_event(Mouse(col: gw + 1, row: 1, button: "left", kind: "down"), plain)
-    ws.on_window_event(Mouse(col: gw + 1, row: 1, button: "left", kind: "up"), plain)
-    ws.on_window_event(Mouse(col: gw + 2, row: 2, button: "left", kind: "down"), shift)
+    ws.on_window_event(Mouse(col: gw + 1, row: 1, button: Left, kind: Down), plain)
+    ws.on_window_event(Mouse(col: gw + 1, row: 1, button: Left, kind: Up), plain)
+    ws.on_window_event(Mouse(col: gw + 2, row: 2, button: Left, kind: Down), shift)
     assert_eq(ws.eds[0].selected_text(), "bc\nde")
     # A second Shift-click moves the end, keeping the start.
-    ws.on_window_event(Mouse(col: gw + 3, row: 1, button: "left", kind: "down"), shift)
+    ws.on_window_event(Mouse(col: gw + 3, row: 1, button: Left, kind: Down), shift)
     assert_eq(ws.eds[0].selected_text(), "bc")
 
 @test fn tabs_and_the_picker()
@@ -3654,27 +3853,27 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     ws.eds[0].path = "a.ail"
     ws.eds.push(typed("y", []))
     ws.eds[1].path = "dir/b.ail"
-    ws.on_event(Key(key: "tab", ctrl: true, alt: false, shift: false))
+    ws.on_event(Key(key: Tab, ctrl: true, alt: false, shift: false))
     assert_eq(ws.active, 1)
-    ws.on_event(Key(key: "tab", ctrl: true, alt: false, shift: true))
+    ws.on_event(Key(key: Tab, ctrl: true, alt: false, shift: true))
     assert_eq(ws.active, 0)
     s := ws.render()
     assert_eq(s.text[0], " a.ail   b.ail ")
     assert_eq(s.text[1].trim(), "1 x")
-    ws.on_event(Mouse(col: 9, row: 0, button: "left", kind: "down"))
+    ws.on_event(Mouse(col: 9, row: 0, button: Left, kind: Down))
     assert_eq(ws.active, 1)
     assert(fuzzy("edit.ail", "EdA"))
     assert(not fuzzy("edit.ail", "zz"))
     ws.files = ["a.ail", "dir/b.ail", "dir/c.ail"]
     ws.picking = true
-    ws.on_event(Key(key: "c", ctrl: false, alt: false, shift: false))
+    ws.on_event(Key(key: Text("c"), ctrl: false, alt: false, shift: false))
     assert_eq(ws.matches(), ["dir/c.ail"])
-    ws.on_event(Key(key: "escape", ctrl: false, alt: false, shift: false))
+    ws.on_event(Key(key: Escape, ctrl: false, alt: false, shift: false))
     assert(not ws.picking)
     # Ctrl-W closes a clean tab; the last one quits.
-    ws.on_event(Key(key: "w", ctrl: true, alt: false, shift: false))
+    ws.on_event(Key(key: Text("w"), ctrl: true, alt: false, shift: false))
     assert_eq(ws.eds.len(), 1)
-    ws.on_event(Key(key: "w", ctrl: true, alt: false, shift: false))
+    ws.on_event(Key(key: Text("w"), ctrl: true, alt: false, shift: false))
     assert(ws.quit)
 
 @test fn probe_keys_reach_the_workspace_and_the_trace_tree_folds()
@@ -3703,7 +3902,8 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
         assert(not names.contains(r.name))
         names.add(r.name)
         match key_event(r.spec)
-            Key(k, ctrl, alt, shift) =>
+            Key(code, ctrl, alt, shift) =>
+                k := code.name()
                 assert(
                     key_command(k, ctrl, alt, shift) != none
                         or extra_key(k, ctrl, alt, shift) != none
@@ -3801,7 +4001,8 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     ws.on_event(press("x"))
     assert(ws.eds[0].lines[1].contains("x"))
 
-@test fn the_file_tree_lists_ail_files_first_and_opens_them()
+# test.sandbox.2: it writes a directory beside the program.
+@needs(fs) @test fn the_file_tree_lists_ail_files_first_and_opens_them()
     d := "edit-tree-test.tmp"
     fs.make_dir("{d}/sub") else err
         assert(false)
@@ -3917,11 +4118,11 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     assert_eq(ws.pal.fg_of(BG), 0xffffff)
     assert(not ws.set_theme("neon"))
     assert_eq(ws.theme, "light")
-    ws.on_event(Key(key: "T", ctrl: true, alt: false, shift: true))
+    ws.on_event(Key(key: Text("T"), ctrl: true, alt: false, shift: true))
     assert_eq(ws.theme, "solarized")
     assert_eq(ws.message, "theme solarized")
-    ws.on_event(Key(key: "T", ctrl: true, alt: false, shift: true))
-    ws.on_event(Key(key: "T", ctrl: true, alt: false, shift: true))
+    ws.on_event(Key(key: Text("T"), ctrl: true, alt: false, shift: true))
+    ws.on_event(Key(key: Text("T"), ctrl: true, alt: false, shift: true))
     assert_eq(ws.theme, "ail-dark")
     for name in themes.NAMES
         t := themes.named(name) else unreachable("listed")
@@ -3982,7 +4183,7 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     assert(ed.pane_text.contains("2 -     prnt(1)"))
     assert(ed.pane_text.contains("2 +     print(1)"))
     assert_eq(ed.lines[1], "    prnt(1)")
-    ed.on_event(Key(key: "enter", ctrl: false, alt: false, shift: false))
+    ed.on_event(Key(key: Enter, ctrl: false, alt: false, shift: false))
     assert(not ed.layer.pending)
     assert_eq(ed.lines[1], "    print(1)")
     ed.apply(Undo)
@@ -3992,7 +4193,7 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     mut ed := typed("fn main()\n    prnt(1)", [])
     ed.diags = parse_diags("{DIAG_JSON}\n")
     ed.layer_key("x")
-    ed.on_event(Key(key: "down", ctrl: false, alt: false, shift: false))
+    ed.on_event(Key(key: Down, ctrl: false, alt: false, shift: false))
     assert(not ed.layer.pending)
     assert_eq(ed.lines[1], "    prnt(1)")
 
@@ -4016,14 +4217,14 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     mut ws := Workspace.new(typed("fn main()\n    prnt(1)", []))
     ws.eds[0].diags = parse_diags("{DIAG_JSON}\n")
     ws.eds[0].line = 1
-    ws.on_event(Key(key: ".", ctrl: true, alt: false, shift: false))
+    ws.on_event(Key(key: Text("."), ctrl: true, alt: false, shift: false))
     assert(ws.eds[0].layer.pending)
     assert_eq(ws.eds[0].lines[1], "    prnt(1)")
-    ws.on_event(Key(key: "escape", ctrl: false, alt: false, shift: false))
+    ws.on_event(Key(key: Escape, ctrl: false, alt: false, shift: false))
     assert(not ws.eds[0].layer.pending)
-    ws.on_event(Key(key: ".", ctrl: true, alt: false, shift: true))
+    ws.on_event(Key(key: Text("."), ctrl: true, alt: false, shift: true))
     assert(ws.eds[0].layer.pending)
-    ws.on_event(Key(key: "enter", ctrl: false, alt: false, shift: false))
+    ws.on_event(Key(key: Enter, ctrl: false, alt: false, shift: false))
     assert_eq(ws.eds[0].lines[1], "    print(1)")
 
 @test fn settings_keep_other_lines()
@@ -4074,7 +4275,8 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     assert_eq(ws.binds.len(), 1)
     assert(ws.message.starts_with("no command"))
 
-@test fn enter_on_an_unmatched_path_creates_the_file()
+# test.sandbox.2: it writes a directory beside the program.
+@needs(fs) @test fn enter_on_an_unmatched_path_creates_the_file()
     d := "edit-newfile-test.tmp"
     fs.make_dir(d) else err
         assert(false)
@@ -4127,12 +4329,12 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
 
 @test fn ctrl_plus_and_minus_step_the_font_size()
     mut ws := Workspace.new(typed("", []))
-    ws.on_event(Key(key: "=", ctrl: true, alt: false, shift: false))
+    ws.on_event(Key(key: Text("="), ctrl: true, alt: false, shift: false))
     assert_eq(ws.font, 24)
-    ws.on_event(Key(key: "-", ctrl: true, alt: false, shift: false))
-    ws.on_event(Key(key: "-", ctrl: true, alt: false, shift: false))
+    ws.on_event(Key(key: Text("-"), ctrl: true, alt: false, shift: false))
+    ws.on_event(Key(key: Text("-"), ctrl: true, alt: false, shift: false))
     assert_eq(ws.font, 18)
-    ws.on_event(Key(key: "0", ctrl: true, alt: false, shift: false))
+    ws.on_event(Key(key: Text("0"), ctrl: true, alt: false, shift: false))
     assert_eq(ws.font, 20)
     assert_eq(ws.eds[0].lines, [""])
     assert_eq(font_flag(["--font", "13"]), 13)
@@ -4302,7 +4504,8 @@ fn Editor.on_event(mut self, ev ui.Event)
     if layer.pending and layer_confirm(ev)
         return
     match ev
-        Key(k, ctrl, alt, shift) =>
+        Key(code, ctrl, alt, shift) =>
+            k := code.name()
             if cmd := extra_key(k, ctrl, alt, shift)
                 run_extra(cmd)
             elif cmd := key_command(k, ctrl, alt, shift)
@@ -4337,11 +4540,11 @@ fn Editor.position_at(self, c int, r int) Range?
 
 ## A click places the caret and starts a selection that a drag extends. A
 ## click in the pane picks a diagnostic or an outline entry.
-fn Editor.on_mouse(mut self, c int, r int, button str, kind str)
-    if button != "left" or kind == "up"
+fn Editor.on_mouse(mut self, c int, r int, button ui.MouseButton, kind ui.MouseKind)
+    if button != Left or kind == Up
         return
     if p := position_at(c, r)
-        if kind == "down"
+        if kind == Down
             extra = []
             selecting = true
             anchor_line = p.line
@@ -4350,7 +4553,7 @@ fn Editor.on_mouse(mut self, c int, r int, button str, kind str)
         set_col(p.col)
         scroll()
         return
-    if kind == "down"
+    if kind == Down
         click_pane(r - text_rows() - 1)
 
 ## Shift-click: select from the caret, or the selection's start, to the
@@ -5103,7 +5306,7 @@ fn key_event(spec str) ui.Event
     if key == "space"
         key = " "
     Key(
-        key: key,
+        key: ui.key_code(key),
         ctrl: parts.contains("ctrl"),
         alt: parts.contains("alt"),
         shift: parts.contains("shift"),
@@ -5115,8 +5318,14 @@ fn pressed(ev ui.Event) str?
         Key(k, ctrl, alt, _) =>
             if ctrl or alt
                 return none
-            k
+            k.name()
         Resize(_, _) | Close | Mouse(_, _, _, _) | Scroll(_) => none
+
+@test fn key_specs_round_trip_through_key_codes()
+    assert(key_event("f5") == Key(key: F(5), ctrl: false, alt: false, shift: false))
+    assert(key_event("space") == Key(key: Text(" "), ctrl: false, alt: false, shift: false))
+    for spec in ["pagedown", "escape", "a", "f12", "["]
+        assert_eq(pressed(key_event(spec)) else "", spec)
 
 ## Keys the workspace handles itself, before the active tab sees them.
 enum WsKey
@@ -5534,7 +5743,7 @@ fn Workspace.on_event(mut self, ev ui.Event)
 ## The spec (`ctrl+shift+t` form) of a key event; none for other events.
 fn event_spec(ev ui.Event) str?
     match ev
-        Key(k, ctrl, alt, shift) => workspace.spec_of(k, ctrl, alt, shift)
+        Key(k, ctrl, alt, shift) => workspace.spec_of(k.name(), ctrl, alt, shift)
         Resize(_, _) | Close | Mouse(_, _, _, _) | Scroll(_) => none
 
 fn Workspace.dispatch(mut self, ev ui.Event)
@@ -5551,7 +5760,7 @@ fn Workspace.dispatch(mut self, ev ui.Event)
         askbar_event(ev)
         return
     if browsing and repl_step == 3
-        if ev == Key(key: "enter", ctrl: true, alt: false, shift: false)
+        if ev == Key(key: Enter, ctrl: true, alt: false, shift: false)
             apply_replace()
             return
         if k := pressed(ev)
@@ -5576,7 +5785,7 @@ fn Workspace.dispatch(mut self, ev ui.Event)
         message = ""
     match ev
         Key(k, ctrl, alt, shift) =>
-            if wk := workspace_key(k, ctrl, alt, shift)
+            if wk := workspace_key(k.name(), ctrl, alt, shift)
                 n := eds.len()
                 match wk
                     NextTab => active = (active + 1) % n
@@ -5638,17 +5847,17 @@ fn Workspace.dispatch(mut self, ev ui.Event)
         Close => quit_all()
         Mouse(c, r, button, kind) =>
             if r == 0
-                if kind == "down"
+                if kind == Down
                     click_tab(c)
                 return
             if c < left()
-                if kind == "down" and button == "left"
+                if kind == Down and button == Left
                     click_tree(r)
                 return
             tree_focus = false
             if splitting and c >= left() + split_half()
                 return
-            if kind == "down" and button == "left"
+            if kind == Down and button == Left
                 ed := eds[active]
                 if loc := ed.pane_location(r - 1 - ed.text_rows() - 1)
                     if loc.path != ed.path
@@ -6027,9 +6236,10 @@ fn Workspace.start_search(mut self)
 ## Typing the query: Enter searches, Escape cancels.
 fn Workspace.search_event(mut self, ev ui.Event)
     match ev
-        Key(k, ctrl, _, _) =>
+        Key(code, ctrl, _, _) =>
             if ctrl
                 return
+            k := code.name()
             if k == "escape"
                 searching = false
                 repl_step = 0
@@ -7180,7 +7390,7 @@ fn Workspace.askbar_event(mut self, ev ui.Event)
         Key(k, ctrl, _, _) =>
             if ctrl
                 return
-            if askbar.key(k) == "run"
+            if askbar.key(k.name()) == "run"
                 askbar_run()
         Close => quit_all()
         Resize(_, _) => on_resize(ev)
@@ -7332,7 +7542,8 @@ fn Workspace.idle(mut self, now int)
 
 ## The files under `dir`, to `depth` levels, skipping hidden and build
 ## directories, at most `limit` of them.
-@test fn agent_changes_reload_and_mark_lines()
+# test.sandbox.2: it writes a directory beside the program.
+@needs(fs) @test fn agent_changes_reload_and_mark_lines()
     d := "edit-agent-test.tmp"
     fs.make_dir(d) else err
         assert(false)
@@ -7450,9 +7661,10 @@ fn Workspace.start_picking(mut self)
 
 fn Workspace.pick_event(mut self, ev ui.Event)
     match ev
-        Key(k, ctrl, _, _) =>
+        Key(code, ctrl, _, _) =>
             if ctrl
                 return
+            k := code.name()
             if k == "escape"
                 picking = false
                 commanding = false
@@ -7588,7 +7800,7 @@ fn Workspace.welcome_event(mut self, ev ui.Event) bool
             if ctrl or alt
                 return false
             dirs := workspace.recent(prefs)
-            n := k.to_int() else return false
+            n := k.name().to_int() else return false
             if n < 1 or n > dirs.len().min(9)
                 return false
             value := setting(prefs, session_key(dirs[n - 1])) else return true
@@ -7752,10 +7964,10 @@ fn Workspace.window(mut self) ! ui.UiError
 fn Workspace.on_window_event(mut self, ev ui.Event, m ui.Modifiers)
     shift_click := match ev
         Mouse(c, r, button, kind) =>
-            if m.alt and not picking and button == "left" and kind == "down" and r > 0
+            if m.alt and not picking and button == Left and kind == Down and r > 0
                 eds[active].add_caret_at(c - left(), r - 1)
                 true
-            elif m.shift and not picking and button == "left" and kind == "down" and r > 0
+            elif m.shift and not picking and button == Left and kind == Down and r > 0
                 eds[active].extend_to(c - left(), r - 1)
                 true
             else
@@ -8051,7 +8263,7 @@ fn Shell.frame(self) win.Frame
 ## A key as the workspace takes it.
 fn Shell.press_key(mut self, spec win.KeySpec)
     before := ws.eds[ws.active].clip
-    ws.on_event(Key(key: spec.key, ctrl: spec.ctrl, alt: spec.alt, shift: spec.shift))
+    ws.on_event(Key(key: ui.key_code(spec.key), ctrl: spec.ctrl, alt: spec.alt, shift: spec.shift))
     after := ws.eds[ws.active].clip
     if after != before
         sent.push(app.clipboard(after))
@@ -8089,7 +8301,7 @@ fn Shell.pointer_down(mut self, ev app.Event)
         menu = app.Popup(id: "ctx", x: ev.x, y: ev.y, items: win.MENU)
         return
     held = ev.text == "left"
-    ws.on_event(Mouse(col: cell.col, row: cell.row, button: "left", kind: "down"))
+    ws.on_event(Mouse(col: cell.col, row: cell.row, button: Left, kind: Down))
 
 ## The caret after a blink tick: it flips, except within 500 ms of a key.
 fn Shell.caret_on_now(self) bool
@@ -8108,40 +8320,40 @@ fn blinker(inbox app.Inbox, stop Mutex[int])
 impl app.App for Shell
     fn update(mut self, ev app.Event)
         match ev.kind
-            "resize" =>
+            Resize =>
                 if ev.id == "edit"
                     pw = ev.dx
                     ph = ev.dy
                     cellw = ev.cell_w
                     cellh = ev.cell_h
-            "external" =>
+            External =>
                 if ev.id == "blink"
                     caret_on = caret_on_now()
-            "key" =>
+            Key =>
                 solid_until = time.now_ms() + 500
                 caret_on = true
                 press_key(win.key_spec(ev.text, ev.ctrl, ev.meta, ev.alt, ev.shift))
-            "paste" =>
+            Paste =>
                 if ws.picking or ws.searching
                     for c in ev.text.chars()
                         ws.on_event(press("{c}"))
                 else
                     ws.eds[ws.active].clip = ev.text
                     ws.on_event(key_event("ctrl+v"))
-            "down" =>
+            Down =>
                 pointer_down(ev)
-            "move" =>
+            Move =>
                 hover_x = ev.x
                 hover_y = ev.y
                 if tab_drag >= 0
                     tab_drop = win.tab_drop(tabs(), win.chrome_size(m), ev.x)
                 elif held
                     cell := win.cell_at(m, ev.x, ev.y)
-                    ws.on_event(Mouse(col: cell.col, row: cell.row, button: "left", kind: "drag"))
-            "leave" =>
+                    ws.on_event(Mouse(col: cell.col, row: cell.row, button: Left, kind: Drag))
+            Leave =>
                 hover_x = -1.0
                 hover_y = -1.0
-            "up" =>
+            Up =>
                 if tab_drag >= 0
                     if tab_drop >= 0 and tab_drop != tab_drag
                         ws.move_tab(tab_drag, tab_drop)
@@ -8150,17 +8362,17 @@ impl app.App for Shell
                 elif held
                     held = false
                     cell := win.cell_at(m, ev.x, ev.y)
-                    ws.on_event(Mouse(col: cell.col, row: cell.row, button: "left", kind: "up"))
-            "scroll" =>
+                    ws.on_event(Mouse(col: cell.col, row: cell.row, button: Left, kind: Up))
+            Scroll =>
                 n := win.wheel_lines(ev.dy, m.ch)
                 if n != 0
                     ws.on_event(Scroll(lines: n))
-            "popup" =>
+            Popup =>
                 menu = none
                 k := win.menu_key(ev.text)
                 if k != ""
                     ws.on_event(key_event(k))
-            "close" =>
+            Close =>
                 ws.on_event(Close)
             _ => held = held
         ws.idle(time.now_ms())
@@ -8193,7 +8405,7 @@ impl app.App for Shell
 
 @test fn the_app_shell_draws_and_edits_without_a_window()
     mut sh := Shell.new(Workspace.new(Editor.new("t.ail", "fn main()\n", 100, 32)))
-    mut size := app.event("resize")
+    mut size := app.event(Resize)
     size.id = "edit"
     size.dx = 800.0
     size.dy = 500.0
