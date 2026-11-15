@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ail": {
+      "command": "ail",
+      "args": ["mcp"]
+    }
+  }
+}
