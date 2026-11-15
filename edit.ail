@@ -2464,14 +2464,26 @@ fn key_command(key str, ctrl bool, alt bool, shift bool) Command?
 
 # ---- Running `ail` ------------------------------------------------------
 
-## The `ail` command: `$AIL`, else `./ail` when run from the repository
-## root, else `ail` on `PATH`.
+## The `ail` command (tool.path.1, ADR 1058): `$AIL`, which the `ail`
+## launcher sets for the programs it runs, else `./ail` when run from the
+## root of an ail clone, else `ail` on `PATH`. On Windows `proc.run` finds
+## `ail.cmd` for either (std.proc.3); `proc.which` skips a directory or a
+## file that isn't a program named `ail`.
 fn ail_command() str
-    if a := env.get("AIL")
-        return a
-    if fs.exists("./ail")
+    pick_ail(env.get("AIL") else "", proc.which("./ail") != none)
+
+## `ail_command` from what it found: an empty `$AIL` counts as unset.
+fn pick_ail(given str, here bool) str
+    if given != ""
+        return given
+    if here
         return "./ail"
     "ail"
+
+@test fn ail_is_the_launchers_then_the_clones_then_the_one_on_path()
+    assert_eq(pick_ail("/opt/ail/ail.cmd", true), "/opt/ail/ail.cmd")
+    assert_eq(pick_ail("", true), "./ail")
+    assert_eq(pick_ail("", false), "ail")
 
 fn jstr(j Json, key str) str
     (j.get(key) else Json.Null).as_str() else ""
@@ -3801,7 +3813,8 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     ws.on_event(press("x"))
     assert(ws.eds[0].lines[1].contains("x"))
 
-@test fn the_file_tree_lists_ail_files_first_and_opens_them()
+# test.sandbox.2: it writes a directory beside the program.
+@needs(fs) @test fn the_file_tree_lists_ail_files_first_and_opens_them()
     d := "edit-tree-test.tmp"
     fs.make_dir("{d}/sub") else err
         assert(false)
@@ -4074,7 +4087,8 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     assert_eq(ws.binds.len(), 1)
     assert(ws.message.starts_with("no command"))
 
-@test fn enter_on_an_unmatched_path_creates_the_file()
+# test.sandbox.2: it writes a directory beside the program.
+@needs(fs) @test fn enter_on_an_unmatched_path_creates_the_file()
     d := "edit-newfile-test.tmp"
     fs.make_dir(d) else err
         assert(false)
@@ -7332,7 +7346,8 @@ fn Workspace.idle(mut self, now int)
 
 ## The files under `dir`, to `depth` levels, skipping hidden and build
 ## directories, at most `limit` of them.
-@test fn agent_changes_reload_and_mark_lines()
+# test.sandbox.2: it writes a directory beside the program.
+@needs(fs) @test fn agent_changes_reload_and_mark_lines()
     d := "edit-agent-test.tmp"
     fs.make_dir(d) else err
         assert(false)
