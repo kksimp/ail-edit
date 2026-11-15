@@ -1,0 +1,487 @@
+## Going places (editor plan P9, lane W5): the back and forward stack, the
+## tab order by last use for Ctrl-Tab, the closed-tab stack, bookmarks, the
+## matching bracket and the last edit places. Pure values the editor keeps
+## and changes; positions are 0-based, columns count characters.
+
+## A place in a file. `path` is "" where the file is implied.
+pub struct Place
+    pub path str
+    pub line int
+    pub col int
+
+impl Ord for Place
+
+## Places this many lines apart or fewer in one file count as one place.
+NEAR := 8
+HISTORY_CAP := 100
+CLOSED_CAP := 20
+EDITS_CAP := 20
+BRACKET_LINES := 5000
+
+fn near(a Place, b Place) bool
+    a.path == b.path and (a.line - b.line).abs() <= NEAR
+
+## `p` after lines were inserted or deleted in `path` below line `at_line`:
+## `delta` > 0 inserted that many lines after `at_line`, `delta` < 0 deleted
+## that many after it. Later places move with their text; a place on a
+## deleted line moves to `at_line`, column 0. Other files' places stay.
+pub fn shifted(p Place, path str, at_line int, delta int) Place
+    if p.path != path or p.line <= at_line
+        return p
+    l := p.line + delta
+    if l <= at_line
+        return Place(path: p.path, line: at_line, col: 0)
+    Place(path: p.path, line: l, col: p.col)
+
+fn shift_all(ps List[Place], path str, at_line int, delta int) List[Place]
+    mut out := List[Place]()
+    for p in ps
+        out.push(shifted(p, path, at_line, delta))
+    out
+
+# ---- Back and forward -------------------------------------------------------
+
+## The jump history: `behind` holds the places left by jumps, newest last;
+## `ahead` the places `back` came from, newest last.
+pub struct History
+    pub behind List[Place]
+    pub ahead List[Place]
+
+## An empty history.
+pub fn History.empty() History
+    History(behind: List[Place](), ahead: List[Place]())
+
+## Records a jump away from `p` (call it with the caret's place before going
+## to a definition, a search hit or another file). A place near the top of
+## the back stack replaces it instead of adding one. Either way the forward
+## stack is cleared, and the back stack keeps the newest 100.
+pub fn History.visit(mut self, p Place)
+    self.ahead.clear()
+    if top := self.behind.last()
+        if near(top, p)
+            self.behind[self.behind.len() - 1] = p
+            return
+    self.behind.push(p)
+    while self.behind.len() > HISTORY_CAP
+        _ := self.behind.remove_at(0)
+
+## Goes back from `current`: the newest place that is not `current`'s own
+## neighbourhood, with `current` saved for `forward`; `none` when there is
+## nowhere to go.
+pub fn History.back(mut self, current Place) Place?
+    while true
+        p := self.behind.pop() else return none
+        if near(p, current) and self.behind.len() > 0
+            continue
+        self.ahead.push(current)
+        return p
+    none
+
+## Goes forward again from `current`, saving it for `back`; `none` when
+## nothing was gone back from.
+pub fn History.forward(mut self, current Place) Place?
+    p := self.ahead.pop() else return none
+    self.behind.push(current)
+    p
+
+## Moves the places of `path` after lines change below `at_line` (see
+## `shifted`).
+pub fn History.shift(mut self, path str, at_line int, delta int)
+    self.behind = shift_all(self.behind, path, at_line, delta)
+    self.ahead = shift_all(self.ahead, path, at_line, delta)
+
+# ---- Recent tabs and closed tabs --------------------------------------------
+
+## Tabs by last use, most recent first, for Ctrl-Tab; and the closed tabs,
+## newest last, for reopen.
+pub struct Recent
+    pub paths List[str]
+    pub shut List[Place]
+
+## No tabs used yet.
+pub fn Recent.empty() Recent
+    Recent(paths: List[str](), shut: List[Place]())
+
+## Marks `path` as the tab used now.
+pub fn Recent.touch(mut self, path str)
+    if i := self.paths.index_of(path)
+        _ := self.paths.remove_at(i)
+    self.paths.insert(0, path)
+
+## The tabs by last use, most recent first.
+pub fn Recent.order(self) List[str]
+    self.paths
+
+## The tab `step` places from `from` in last-use order, wrapping: step 1
+## from the current tab is the one used before it (Ctrl-Tab), -1 goes the
+## other way. A path not in the list counts from the most recent; `none`
+## when there are no tabs.
+pub fn Recent.next(self, from str, step int) str?
+    n := self.paths.len()
+    if n == 0
+        return none
+    i := self.paths.index_of(from) else return self.paths[0]
+    self.paths[((i + step) % n + n) % n]
+
+## Forgets `path` without keeping it for reopen.
+pub fn Recent.forget(mut self, path str)
+    if i := self.paths.index_of(path)
+        _ := self.paths.remove_at(i)
+
+## Records that the tab `path` closed with its caret at (`line`, `col`): it
+## leaves the order and goes on the closed stack, which keeps the newest 20.
+pub fn Recent.closed(mut self, path str, line int, col int)
+    self.forget(path)
+    self.shut.push(Place(path: path, line: line, col: col))
+    while self.shut.len() > CLOSED_CAP
+        _ := self.shut.remove_at(0)
+
+## The last closed tab to open again, taken off the stack, or `none`.
+pub fn Recent.reopen(mut self) Place?
+    self.shut.pop()
+
+# ---- Bookmarks --------------------------------------------------------------
+
+## Bookmarked lines in every file, kept sorted by path then line.
+pub struct Bookmarks
+    pub marks List[Place]
+
+## No bookmarks.
+pub fn Bookmarks.empty() Bookmarks
+    Bookmarks(marks: List[Place]())
+
+## Whether line `line` of `path` has a bookmark.
+pub fn Bookmarks.has(self, path str, line int) bool
+    for m in self.marks
+        if m.path == path and m.line == line
+            return true
+    false
+
+## Sets or clears the bookmark on a line; true when it is now set.
+pub fn Bookmarks.toggle(mut self, path str, line int) bool
+    for i in 0..self.marks.len()
+        if self.marks[i].path == path and self.marks[i].line == line
+            _ := self.marks.remove_at(i)
+            return false
+    self.marks.push(Place(path: path, line: line, col: 0))
+    self.marks.sort()
+    true
+
+## The bookmarked lines of `path`, in order.
+pub fn Bookmarks.lines_in(self, path str) List[int]
+    mut out := List[int]()
+    for m in self.marks
+        if m.path == path
+            out.push(m.line)
+    out
+
+## The next bookmarked line of `path` after `line` (or before it, when not
+## `forward`), wrapping round the file; `none` when the file has none.
+pub fn Bookmarks.next(self, path str, line int, forward bool) int?
+    ls := self.lines_in(path)
+    if ls.len() == 0
+        return none
+    if forward
+        for l in ls
+            if l > line
+                return l
+        return ls[0]
+    mut i := ls.len() - 1
+    while i >= 0
+        if ls[i] < line
+            return ls[i]
+        i -= 1
+    ls[ls.len() - 1]
+
+## Moves the bookmarks of `path` after lines change below `at_line` (see
+## `shifted`); bookmarks that land on one line become one.
+pub fn Bookmarks.shift(mut self, path str, at_line int, delta int)
+    mut out := List[Place]()
+    for m in shift_all(self.marks, path, at_line, delta)
+        p := Place(path: m.path, line: m.line, col: 0)
+        if not out.contains(p)
+            out.push(p)
+    out.sort()
+    self.marks = out
+
+## The bookmarks for a panel, sorted, each `path:LINE` with a 1-based line.
+pub fn Bookmarks.rows(self) List[str]
+    mut out := List[str]()
+    for m in self.marks
+        out.push("{m.path}:{m.line + 1}")
+    out
+
+# ---- Matching bracket -------------------------------------------------------
+
+SQ := "'"
+
+## For each character of a line, whether a bracket there counts: not inside
+## a string or character literal and not in a `#` comment. The same scan as
+## `features/pairs`: quotes end at the line, `\` escapes the next character.
+fn code_mask(cs List[char]) List[bool]
+    single := SQ.chars()[0]
+    mut out := List[bool]()
+    mut quote := ' '
+    mut i := 0
+    while i < cs.len()
+        c := cs[i]
+        if quote != ' '
+            if c == '\\'
+                out.push(false)
+                i += 1
+            elif c == quote
+                quote = ' '
+            out.push(false)
+        elif c == '#'
+            while i < cs.len()
+                out.push(false)
+                i += 1
+            break
+        elif c == '"' or c == single
+            quote = c
+            out.push(false)
+        else
+            out.push(true)
+        i += 1
+    while out.len() < cs.len()
+        out.push(false)
+    out
+
+fn bracket_index(c char) int
+    "()[]\{}".chars().index_of(c) else -1
+
+## The bracket matching the one at (`line`, `col`), or just before it when
+## there is none at it, among `()[]{}`; brackets in strings, character
+## literals and comments are skipped. The search goes at most 5000 lines
+## away. The place's `path` is "". `none` when there is no bracket there or
+## no match.
+pub fn matching_bracket(lines List[str], line int, col int) Place?
+    if line < 0 or line >= lines.len()
+        return none
+    cs := lines[line].chars()
+    mask := code_mask(cs)
+    mut c := col
+    if c < 0 or c >= cs.len() or not mask[c] or bracket_index(cs[c]) < 0
+        c -= 1
+    if c < 0 or c >= cs.len() or not mask[c]
+        return none
+    i := bracket_index(cs[c])
+    if i < 0
+        return none
+    brackets := "()[]\{}".chars()
+    ch := brackets[i]
+    other := brackets[i + 1 - 2 * (i % 2)]
+    step := if i % 2 == 0 then 1 else -1
+    mut depth := 0
+    mut l := line
+    mut k := c
+    mut row := cs
+    mut m := mask
+    while (l - line).abs() <= BRACKET_LINES
+        while k >= 0 and k < row.len()
+            if m[k]
+                if row[k] == ch
+                    depth += 1
+                elif row[k] == other
+                    depth -= 1
+                    if depth == 0
+                        return Place(path: "", line: l, col: k)
+            k += step
+        l += step
+        if l < 0 or l >= lines.len()
+            return none
+        row = lines[l].chars()
+        m = code_mask(row)
+        k = if step == 1 then 0 else row.len() - 1
+    none
+
+# ---- Last edit places -------------------------------------------------------
+
+## The places of recent edits, oldest first, newest 20 kept. An edit near
+## the newest replaces it, so typing a word is one place. `at` is where
+## `previous` has stepped to; `places.len()` when it has not.
+pub struct LastEdit
+    pub places List[Place]
+    pub at int
+
+## No edits yet.
+pub fn LastEdit.empty() LastEdit
+    LastEdit(places: List[Place](), at: 0)
+
+## Records an edit at `p` and starts `previous` again from the newest.
+pub fn LastEdit.note(mut self, p Place)
+    mut add := true
+    if top := self.places.last()
+        if near(top, p)
+            self.places[self.places.len() - 1] = p
+            add = false
+    if add
+        self.places.push(p)
+        while self.places.len() > EDITS_CAP
+            _ := self.places.remove_at(0)
+    self.at = self.places.len()
+
+## The newest edit place, then each older one on later calls, wrapping back
+## to the newest after the oldest; `none` before any edit.
+pub fn LastEdit.previous(mut self) Place?
+    n := self.places.len()
+    if n == 0
+        return none
+    self.at -= 1
+    if self.at < 0 or self.at >= n
+        self.at = n - 1
+    self.places[self.at]
+
+## Moves the edit places of `path` after lines change below `at_line`.
+pub fn LastEdit.shift(mut self, path str, at_line int, delta int)
+    self.places = shift_all(self.places, path, at_line, delta)
+
+# ---- Tests ------------------------------------------------------------------
+
+fn at(path str, line int) Place
+    Place(path: path, line: line, col: 0)
+
+@test fn visit_records_far_jumps_only()
+    mut h := History.empty()
+    h.visit(at("a", 0))
+    h.visit(at("a", 3))
+    assert_eq(h.behind, [at("a", 3)])
+    h.visit(at("a", 50))
+    h.visit(at("b", 50))
+    assert_eq(h.behind.len(), 3)
+
+@test fn back_and_forward_walk_the_stacks()
+    mut h := History.empty()
+    h.visit(at("a", 0))
+    h.visit(at("a", 40))
+    assert_eq(h.back(at("b", 7)), at("a", 40))
+    assert_eq(h.back(at("a", 40)), at("a", 0))
+    assert_eq(h.back(at("a", 0)), none)
+    assert_eq(h.forward(at("a", 0)), at("a", 40))
+    assert_eq(h.forward(at("a", 40)), at("b", 7))
+    assert_eq(h.forward(at("b", 7)), none)
+
+@test fn back_skips_the_place_you_are_at()
+    mut h := History.empty()
+    h.visit(at("a", 0))
+    h.visit(at("a", 40))
+    assert_eq(h.back(at("a", 41)), at("a", 0))
+
+@test fn a_new_visit_clears_forward()
+    mut h := History.empty()
+    h.visit(at("a", 0))
+    _ := h.back(at("a", 90))
+    assert_eq(h.ahead.len(), 1)
+    h.visit(at("c", 1))
+    assert_eq(h.ahead.len(), 0)
+    assert_eq(h.forward(at("c", 1)), none)
+
+@test fn history_is_capped()
+    mut h := History.empty()
+    for i in 0..150
+        h.visit(at("f{i}", 0))
+    assert_eq(h.behind.len(), 100)
+    assert_eq(h.behind[0], at("f50", 0))
+
+@test fn places_shift_with_inserted_and_deleted_lines()
+    mut h := History.empty()
+    h.visit(at("a", 5))
+    h.visit(at("a", 30))
+    h.visit(at("b", 30))
+    h.shift("a", 10, 4)
+    assert_eq(h.behind, [at("a", 5), at("a", 34), at("b", 30)])
+    h.shift("a", 20, -20)
+    assert_eq(h.behind[1], at("a", 20))
+    moved := shifted(Place(path: "a", line: 40, col: 3), "a", 20, -5)
+    assert_eq(moved, Place(path: "a", line: 35, col: 3))
+
+@test fn recent_orders_tabs_by_use()
+    mut r := Recent.empty()
+    r.touch("a")
+    r.touch("b")
+    r.touch("c")
+    r.touch("a")
+    assert_eq(r.order(), ["a", "c", "b"])
+    assert_eq(r.next("a", 1), "c")
+    assert_eq(r.next("b", 1), "a")
+    assert_eq(r.next("a", -1), "b")
+    assert_eq(r.next("zzz", 1), "a")
+    assert_eq(Recent.empty().next("a", 1), none)
+
+@test fn closed_tabs_reopen_newest_first()
+    mut r := Recent.empty()
+    r.touch("a")
+    r.touch("b")
+    r.closed("b", 4, 2)
+    r.closed("a", 1, 0)
+    assert_eq(r.order().len(), 0)
+    assert_eq(r.reopen(), Place(path: "a", line: 1, col: 0))
+    assert_eq(r.reopen(), Place(path: "b", line: 4, col: 2))
+    assert_eq(r.reopen(), none)
+    for i in 0..25
+        r.closed("t{i}", 0, 0)
+    assert_eq(r.shut.len(), 20)
+    assert_eq(r.reopen(), at("t24", 0))
+
+@test fn bookmarks_toggle_and_wrap()
+    mut b := Bookmarks.empty()
+    assert(b.toggle("a", 9))
+    assert(b.toggle("a", 2))
+    assert(b.toggle("z", 5))
+    assert_eq(b.lines_in("a"), [2, 9])
+    assert_eq(b.next("a", 2, true), 9)
+    assert_eq(b.next("a", 9, true), 2)
+    assert_eq(b.next("a", 2, false), 9)
+    assert_eq(b.next("a", 5, false), 2)
+    assert_eq(b.next("q", 5, true), none)
+    assert(not b.toggle("a", 9))
+    assert(not b.has("a", 9))
+    assert_eq(b.rows(), ["a:3", "z:6"])
+
+@test fn bookmarks_shift_and_merge()
+    mut b := Bookmarks.empty()
+    _ := b.toggle("a", 3)
+    _ := b.toggle("a", 12)
+    _ := b.toggle("a", 14)
+    b.shift("a", 5, 2)
+    assert_eq(b.lines_in("a"), [3, 14, 16])
+    b.shift("a", 10, -10)
+    assert_eq(b.lines_in("a"), [3, 10])
+
+@test fn brackets_match_both_ways()
+    lines := ["f(a[1], {b})", "    x)", "y("]
+    assert_eq(matching_bracket(lines, 0, 1), Place(path: "", line: 0, col: 11))
+    assert_eq(matching_bracket(lines, 0, 12), Place(path: "", line: 0, col: 1))
+    assert_eq(matching_bracket(lines, 0, 3), Place(path: "", line: 0, col: 5))
+    assert_eq(matching_bracket(lines, 0, 8), Place(path: "", line: 0, col: 10))
+    assert_eq(matching_bracket(lines, 1, 5), none)
+    assert_eq(matching_bracket(lines, 2, 1), none)
+    assert_eq(matching_bracket(lines, 0, 7), none)
+
+@test fn brackets_span_lines()
+    lines := ["fn f(", "    a,", ")"]
+    assert_eq(matching_bracket(lines, 0, 4), Place(path: "", line: 2, col: 0))
+    assert_eq(matching_bracket(lines, 2, 0), Place(path: "", line: 0, col: 4))
+
+@test fn brackets_in_strings_and_comments_are_skipped()
+    lines := ["f(\")\", ')', x) # )", "(# ("]
+    assert_eq(matching_bracket(lines, 0, 1), Place(path: "", line: 0, col: 13))
+    assert_eq(matching_bracket(lines, 0, 3), none)
+    assert_eq(matching_bracket(lines, 0, 17), none)
+
+@test fn last_edits_step_back_and_wrap()
+    mut e := LastEdit.empty()
+    assert_eq(e.previous(), none)
+    e.note(at("a", 1))
+    e.note(at("a", 2))
+    e.note(at("a", 40))
+    e.note(at("b", 0))
+    assert_eq(e.places.len(), 3)
+    assert_eq(e.previous(), at("b", 0))
+    assert_eq(e.previous(), at("a", 40))
+    assert_eq(e.previous(), at("a", 2))
+    assert_eq(e.previous(), at("b", 0))
+    e.note(at("c", 0))
+    assert_eq(e.previous(), at("c", 0))
+    e.shift("a", 0, 5)
+    assert_eq(e.places[1], at("a", 45))
