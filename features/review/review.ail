@@ -1,0 +1,1215 @@
+## Reviewing an agent's changes hunk by hunk (gap row A4 and decision D8 of
+## docs/parity-plan-2026-11.md). The review state over `hunks.Stack`: the
+## checkpoints taken before each agent turn, the change set since one of
+## them, the rows of the review panel, what each panel key does to the state
+## and the plan of buffer and file writes an action needs. Also the live
+## change gutter of a buffer (its base text and marks), the side-by-side
+## cells, and the findings of `ail review --json`. Pure: `edit.ail` reads
+## files and buffers, passes lines in and carries the plans out.
+use features.hunks
+
+## An agent turn ends after this long (ms) with no further outside change.
+pub TURN_MS := 5000
+
+## The live gutter recomputes this long (ms) after the last edit.
+pub GUTTER_MS := 300
+
+## Unchanged lines shown around each hunk, in the panel and side by side.
+CONTEXT := 3
+
+## The words that start a declaration, for `decl_line`.
+DECL_WORDS := "fn struct enum trait error unique type"
+
+## The id kinds a finding of `ail review` names (`fn:add`, `type:P`).
+ID_KINDS := "fn type field trait const"
+
+## A file an outside change touched with no text from before it: it was not
+## open in a tab and git HEAD has no copy. The panel lists it as "no base".
+pub struct Loose
+    pub turn int
+    pub path str
+
+## The base of `path` after hunks were kept, while the review compares
+## against checkpoint `turn`.
+pub struct Kept
+    pub turn int
+    pub path str
+    pub lines List[str]
+
+## What a panel row shows.
+pub enum RowKind
+    Summary
+    File
+    Hunk
+    Line
+    NoBase
+    Note
+
+## One row of the review panel. `file` and `hunk` index `State.files` and
+## that file's hunks (-1 for none); `line` is the 1-based line of the
+## current text that Enter opens (0: nothing to open).
+pub struct Row
+    pub kind RowKind
+    pub text str
+    pub file int
+    pub hunk int
+    pub path str
+    pub line int
+
+## What a panel key asks of the editor: `what` is "move", "keep", "revert",
+## "restore", "cycle", "side", "verify", "review" or "" (only a note);
+## `writes` are the buffer or file texts to put in place, in order; `sel`
+## is the row to select afterwards. `used` is false for a key the panel
+## does not take.
+pub struct Plan
+    pub used bool
+    pub sel int
+    pub what str
+    pub path str
+    pub writes List[hunks.Restore]
+    pub note str
+
+## The side-by-side view of one file: old left, new right, read-only.
+pub struct Side
+    pub open bool
+    pub path str
+    pub label str
+    pub pairs List[hunks.Pair]
+    pub top int
+
+## The live change gutter of one buffer: the base it compares with, the
+## `Editor.saves` count when the base was taken, the lines the marks are for,
+## the lines last seen while waiting (and since when, ms; 0 when not
+## waiting), and the hunks and per-line kinds (`hunks.gutter`).
+pub struct Live
+    pub path str
+    pub base List[str]
+    pub saves int
+    pub seen List[str]
+    pub pending List[str]
+    pub changed_at int
+    pub found List[hunks.Hunk]
+    pub kinds List[int]
+
+## Everything the review knows. `against` is the checkpoint compared with
+## (-1: the newest); `taken` numbers the labels; `last_outside` is when the
+## last outside change was seen (ms, 0 for none); `stale` asks for a
+## `refresh`; `armed` is set by the first press of `u`; `git` takes the
+## gutter's base from git HEAD.
+pub struct State
+    pub stack hunks.Stack
+    pub taken int
+    pub against int
+    pub kept List[Kept]
+    pub loose List[Loose]
+    pub files List[hunks.FileChange]
+    pub rows List[Row]
+    pub armed bool
+    pub last_outside int
+    pub stale bool
+    pub side Side
+    pub live List[Live]
+    pub git bool
+
+fn closed_side() Side
+    Side(open: false, path: "", label: "", pairs: List[hunks.Pair](), top: 0)
+
+pub fn State.new() State
+    State(
+        stack: hunks.Stack.new(),
+        taken: 0,
+        against: -1,
+        kept: List[Kept](),
+        loose: List[Loose](),
+        files: List[hunks.FileChange](),
+        rows: List[Row](),
+        armed: false,
+        last_outside: 0,
+        stale: false,
+        side: closed_side(),
+        live: List[Live](),
+        git: false,
+    )
+
+# ---- Checkpoints --------------------------------------------------------------
+
+## Takes a checkpoint named `what N` and compares against it; gives the name.
+pub fn State.take(mut self, what str) str
+    self.taken += 1
+    name := "{what} {self.taken}"
+    self.stack.push(hunks.Checkpoint.new(name))
+    self.against = -1
+    self.armed = false
+    self.stale = true
+    name
+
+## Holds `path` as `lines` in the newest checkpoint (the first hold counts).
+pub fn State.hold(mut self, path str, lines List[str])
+    self.stack.hold(path, lines)
+    self.stale = true
+
+## Whether an agent turn is going on at `now`: an outside change was seen
+## less than TURN_MS ago.
+pub fn State.in_turn(self, now int) bool
+    self.last_outside > 0 and now - self.last_outside < TURN_MS
+
+## A change to `path` that the editor did not make, seen at `now`. The first
+## one of a turn takes a checkpoint. `before` is the file's text before the
+## change; `none` when it is not known, and then the file has no base.
+pub fn State.outside(mut self, path str, before List[str]?, now int)
+    if not self.in_turn(now) or self.stack.items.is_empty()
+        _ := self.take("agent turn")
+    self.last_outside = now
+    if b := before
+        self.hold(path, b)
+        return
+    turn := self.stack.items.len() - 1
+    if self.stack.items[turn].holds(path)
+        return
+    for l in self.loose
+        if l.turn == turn and l.path == path
+            return
+    self.loose.push(Loose(turn: turn, path: path))
+    self.stale = true
+
+## Before Apply agent edit changes `path`: a checkpoint holding its text.
+pub fn State.before_apply(mut self, path str, lines List[str]) str
+    name := self.take("agent edit")
+    self.hold(path, lines)
+    name
+
+## The index of the checkpoint the review compares against; -1 for none.
+pub fn State.compared(self) int
+    n := self.stack.items.len()
+    if self.against < 0 or self.against >= n
+        return n - 1
+    self.against
+
+## The compared checkpoint's label.
+pub fn State.label(self) str
+    i := self.compared()
+    if i < 0
+        return "no checkpoint"
+    self.stack.items[i].label
+
+## The files as they were at the compared checkpoint: for each path held
+## there or later, the earliest hold.
+fn State.base(self) hunks.Checkpoint
+    i := self.compared()
+    mut cp := hunks.Checkpoint.new(self.label())
+    if i < 0
+        return cp
+    for r in self.stack.plan_to(i)
+        if r.remove
+            cp.hold_absent(r.path)
+        else
+            cp.hold(r.path, r.lines)
+    cp
+
+## The paths the compared checkpoint (or a later one) holds: pass their
+## current texts to `refresh`.
+pub fn State.held_paths(self) List[str]
+    mut out := List[str]()
+    for h in self.base().files
+        out.push(h.path)
+    out
+
+## Whether the change set can include `path`.
+pub fn State.holds(self, path str) bool
+    self.base().holds(path)
+
+fn State.kept_base(self, path str) List[str]?
+    turn := self.compared()
+    for k in self.kept
+        if k.turn == turn and k.path == path
+            return k.lines
+    none
+
+fn State.set_kept(mut self, path str, lines List[str])
+    turn := self.compared()
+    for i in 0..self.kept.len()
+        if self.kept[i].turn == turn and self.kept[i].path == path
+            self.kept[i] = Kept(turn: turn, path: path, lines: lines)
+            return
+    self.kept.push(Kept(turn: turn, path: path, lines: lines))
+
+fn change_of(path str, kind hunks.FileKind, before List[str], after List[str]) hunks.FileChange
+    found := hunks.diff(before, after)
+    n := hunks.counts(found)
+    hunks.FileChange(
+        path: path,
+        kind: kind,
+        before: before,
+        after: after,
+        hunks: found,
+        added: n.0,
+        removed: n.1,
+    )
+
+fn recount(f hunks.FileChange) hunks.FileChange
+    mut out := f
+    n := hunks.counts(f.hunks)
+    out.added = n.0
+    out.removed = n.1
+    out
+
+## Rebuilds the change set from the compared checkpoint and `current`, the
+## held files as they are now (open buffers as the editor has them). A file
+## whose hunks were kept compares from its kept base.
+pub fn State.refresh(mut self, current List[hunks.Current])
+    held := self.base()
+    mut now_files := List[hunks.Current]()
+    for c in current
+        if held.holds(c.path)
+            now_files.push(c)
+    ch := held.changes(now_files)
+    mut out := List[hunks.FileChange]()
+    for f in ch.files
+        if kb := self.kept_base(f.path)
+            if kb != f.after
+                out.push(change_of(f.path, f.kind, kb, f.after))
+        else
+            out.push(f)
+    self.files = out
+    self.stale = false
+    self.build_rows()
+
+## The change set, as `hunks.summary` takes it.
+pub fn State.changes(self) hunks.Changes
+    mut created := List[str]()
+    mut deleted := List[str]()
+    for f in self.files
+        if f.kind == hunks.FileKind.Created
+            created.push(f.path)
+        elif f.kind == hunks.FileKind.Deleted
+            deleted.push(f.path)
+    hunks.Changes(files: self.files, created: created, deleted: deleted)
+
+## The index of `path` in the change set, or -1.
+pub fn State.file_index(self, path str) int
+    for i in 0..self.files.len()
+        if self.files[i].path == path
+            return i
+    -1
+
+# ---- Panel rows ---------------------------------------------------------------
+
+fn row(kind RowKind, text str, file int, hunk int, path str, line int) Row
+    Row(kind: kind, text: text, file: file, hunk: hunk, path: path, line: line)
+
+fn kind_word(k hunks.FileKind) str
+    match k
+        Modified => ""
+        Created => " (new file)"
+        Deleted => " (deleted)"
+
+## The 1-based line of a text of `n` lines where hunk `h` shows; a deletion
+## shows on the line after it, kept inside the text.
+fn shown_line(h hunks.Hunk, n int) int
+    (h.new_start + 1).min(n.max(1)).max(1)
+
+## The rows: the summary, then per file a header with its counts and each
+## hunk as unified rows (3 lines of context), then the files with no base.
+fn State.build_rows(mut self)
+    mut out := List[Row]()
+    if self.stack.items.is_empty()
+        out.push(row(
+            RowKind.Note,
+            "no checkpoint yet: one is taken when an agent changes a file, or by Take checkpoint",
+            -1,
+            -1,
+            "",
+            0,
+        ))
+        self.rows = out
+        return
+    out.push(row(RowKind.Summary, "{self.label()}: {hunks.summary(self.changes())}", -1, -1, "", 0))
+    for fi in 0..self.files.len()
+        f := self.files[fi]
+        n := f.after.len()
+        mut first := 1
+        if f.hunks.len() > 0
+            first = shown_line(f.hunks[0], n)
+        out.push(row(
+            RowKind.File,
+            "{f.path}{kind_word(f.kind)}  +{f.added} -{f.removed}",
+            fi,
+            -1,
+            f.path,
+            first,
+        ))
+        for hi in 0..f.hunks.len()
+            h := f.hunks[hi]
+            b := hunks.with_context([h], CONTEXT, f.before.len())[0]
+            shown := hunks.unified(b, f.before)
+            out.push(row(RowKind.Hunk, shown[0], fi, hi, f.path, shown_line(h, n)))
+            mut j := b.new_start
+            for k in 1..shown.len()
+                t := shown[k]
+                out.push(row(RowKind.Line, t, fi, hi, f.path, (j + 1).min(n.max(1))))
+                if not t.starts_with("-")
+                    j += 1
+    turn := self.compared()
+    held := self.base()
+    for l in self.loose
+        if l.turn >= turn and not held.holds(l.path)
+            out.push(row(
+                RowKind.NoBase,
+                "{l.path}: changed, no base (it was not open and git HEAD has no copy)",
+                -1,
+                -1,
+                l.path,
+                1,
+            ))
+    if out.len() == 1
+        out.push(row(RowKind.Note, "no changes since {self.label()}", -1, -1, "", 0))
+    self.rows = out
+
+## The rows' texts, as the pane and `--print --json` show them.
+pub fn State.texts(self) List[str]
+    mut out := List[str]()
+    for r in self.rows
+        out.push(r.text)
+    out
+
+# ---- Panel keys ---------------------------------------------------------------
+
+fn plan(sel int, what str, path str, note str) Plan
+    Plan(used: true, sel: sel, what: what, path: path, writes: List[hunks.Restore](), note: note)
+
+fn unused(sel int) Plan
+    Plan(used: false, sel: sel, what: "", path: "", writes: List[hunks.Restore](), note: "")
+
+## The next (or previous) hunk header row from row `sel`; `sel` when none.
+pub fn State.step_hunk(self, sel int, forward bool) int
+    if forward
+        for i in sel + 1..self.rows.len()
+            if self.rows[i].kind == RowKind.Hunk
+                return i
+        return sel
+    mut i := sel - 1
+    while i >= 0
+        if self.rows[i].kind == RowKind.Hunk
+            return i
+        i -= 1
+    sel
+
+fn State.clamp(self, sel int) int
+    sel.min(self.rows.len() - 1).max(0)
+
+## Replaces file `fi` of the change set, or drops it once no hunk is left.
+fn State.put_file(mut self, fi int, f hunks.FileChange)
+    if f.hunks.is_empty()
+        mut rest := List[hunks.FileChange]()
+        for i in 0..self.files.len()
+            if i != fi
+                rest.push(self.files[i])
+        self.files = rest
+    else
+        self.files[fi] = f
+
+## `k`: hunk `hi` of file `fi` becomes part of the base and leaves the list.
+fn State.keep_hunk(mut self, fi int, hi int, sel int) Plan
+    mut f := self.files[fi]
+    f.before = hunks.keep(f.before, f.hunks[hi]).lines
+    f.hunks = hunks.after_keep(f.hunks, hi)
+    self.set_kept(f.path, f.before)
+    self.put_file(fi, recount(f))
+    self.build_rows()
+    plan(self.clamp(sel), "keep", f.path, "kept a hunk of {f.path}")
+
+## `r`: hunk `hi` of file `fi` goes back to its old lines; the plan writes
+## the file's new text.
+fn State.revert_hunk(mut self, fi int, hi int, sel int) Plan
+    mut f := self.files[fi]
+    f.after = hunks.revert(f.after, f.hunks[hi]).lines
+    f.hunks = hunks.after_revert(f.hunks, hi)
+    mut p := plan(sel, "revert", f.path, "reverted a hunk of {f.path}")
+    gone := f.kind == hunks.FileKind.Created and f.hunks.is_empty()
+    p.writes = [hunks.Restore(path: f.path, lines: f.after, remove: gone)]
+    self.put_file(fi, recount(f))
+    self.build_rows()
+    p.sel = self.clamp(sel)
+    p
+
+## `K`: every hunk of file `fi` is kept.
+fn State.keep_file(mut self, fi int, sel int) Plan
+    mut f := self.files[fi]
+    f.before = hunks.apply_all(f.before, f.hunks)
+    f.hunks = List[hunks.Hunk]()
+    self.set_kept(f.path, f.before)
+    self.put_file(fi, f)
+    self.build_rows()
+    plan(self.clamp(sel), "keep", f.path, "kept every hunk of {f.path}")
+
+## `R`: every hunk of file `fi` is reverted.
+fn State.revert_file(mut self, fi int, sel int) Plan
+    mut f := self.files[fi]
+    f.after = hunks.revert_all(f.after, f.hunks)
+    f.hunks = List[hunks.Hunk]()
+    mut p := plan(sel, "revert", f.path, "reverted every hunk of {f.path}")
+    gone := f.kind == hunks.FileKind.Created
+    p.writes = [hunks.Restore(path: f.path, lines: f.after, remove: gone)]
+    self.put_file(fi, f)
+    self.build_rows()
+    p.sel = self.clamp(sel)
+    p
+
+## `c`: compare against the next older checkpoint, wrapping to the newest.
+fn State.cycle(mut self, sel int) Plan
+    n := self.stack.items.len()
+    if n == 0
+        return plan(sel, "", "", "no checkpoint to compare against")
+    mut i := self.compared() - 1
+    if i < 0
+        i = n - 1
+    self.against = if i == n - 1 then -1 else i
+    self.stale = true
+    said := "comparing against {self.label()} ({i + 1} of {n}: {self.stack.labels().join(", ")})"
+    plan(0, "cycle", "", said)
+
+## `u`: the first press arms; the second restores every held file to the
+## compared checkpoint and drops it and the later ones.
+fn State.restore_key(mut self, sel int) Plan
+    i := self.compared()
+    if i < 0
+        return plan(sel, "", "", "no checkpoint to restore")
+    if not self.armed
+        self.armed = true
+        return plan(
+            sel,
+            "",
+            "",
+            "u again restores every file to {self.label()}; any other key cancels",
+        )
+    self.armed = false
+    name := self.label()
+    mut left_alone := 0
+    for l in self.loose
+        if l.turn >= i
+            left_alone += 1
+    mut note := "restored {name}"
+    if left_alone > 0
+        note = "{note}; {left_alone} file(s) with no base were left as they are"
+    mut p := plan(0, "restore", "", note)
+    p.writes = self.stack.undo_to(i)
+    mut still := List[Kept]()
+    for k in self.kept
+        if k.turn < i
+            still.push(k)
+    self.kept = still
+    mut rest := List[Loose]()
+    for l in self.loose
+        if l.turn < i
+            rest.push(l)
+    self.loose = rest
+    self.against = -1
+    self.files = List[hunks.FileChange]()
+    self.stale = true
+    self.build_rows()
+    p
+
+## What key `k` does with row `sel` selected: `]` `[` hunks, `k` `r` keep or
+## revert the hunk, `K` `R` the file, `u` restore (twice), `c` the next
+## checkpoint, `s` side by side, `v` verify, `a` `ail review`.
+pub fn State.key(mut self, k str, sel int) Plan
+    if k != "u"
+        self.armed = false
+    if k == "]" or k == "["
+        return plan(self.step_hunk(sel, k == "]"), "move", "", "")
+    if k == "c"
+        return self.cycle(sel)
+    if k == "u"
+        return self.restore_key(sel)
+    if k == "a"
+        return plan(sel, "review", "", "")
+    if sel < 0 or sel >= self.rows.len()
+        return unused(sel)
+    rw := self.rows[sel]
+    if k == "v"
+        mut at := rw.path
+        if at == "" and self.files.len() > 0
+            at = self.files[0].path
+        return plan(sel, "verify", at, "")
+    if k == "s"
+        mut fi := rw.file
+        if fi < 0 and self.files.len() > 0
+            fi = 0
+        if not self.open_side(fi)
+            return plan(sel, "", "", "no changed file to compare")
+        return plan(sel, "side", self.side.path, "")
+    if k == "k" or k == "r"
+        if rw.hunk < 0 or rw.file < 0
+            return plan(sel, "", "", "put the selection on a hunk: ] goes to the next")
+        if k == "k"
+            return self.keep_hunk(rw.file, rw.hunk, sel)
+        return self.revert_hunk(rw.file, rw.hunk, sel)
+    if k == "K" or k == "R"
+        if rw.file < 0
+            return plan(sel, "", "", "put the selection on a file")
+        if k == "K"
+            return self.keep_file(rw.file, sel)
+        return self.revert_file(rw.file, sel)
+    unused(sel)
+
+# ---- Side by side -------------------------------------------------------------
+
+## Opens file `fi` of the change set side by side; false when there is none.
+pub fn State.open_side(mut self, fi int) bool
+    if fi < 0 or fi >= self.files.len()
+        return false
+    f := self.files[fi]
+    self.side = Side(
+        open: true,
+        path: f.path,
+        label: self.label(),
+        pairs: hunks.side_by_side(f.before, f.after, f.hunks, CONTEXT),
+        top: 0,
+    )
+    true
+
+## Opens `path` side by side, `from_text` against `now_lines` (a buffer and its
+## gutter base); false when they are the same.
+pub fn State.open_side_of(
+    mut self,
+    path str,
+    from_text List[str],
+    now_lines List[str],
+    label str,
+) bool
+    found := hunks.diff(from_text, now_lines)
+    if found.is_empty()
+        return false
+    self.side = Side(
+        open: true,
+        path: path,
+        label: label,
+        pairs: hunks.side_by_side(from_text, now_lines, found, CONTEXT),
+        top: 0,
+    )
+    true
+
+## A key while the side-by-side view shows `height` rows: Escape closes,
+## Up, Down, PageUp, PageDown, Home and End scroll. False for other keys
+## (the view is read-only and ignores them).
+pub fn State.side_key(mut self, k str, height int) bool
+    last := (self.side.pairs.len() - 1).max(0)
+    step := height.max(1)
+    match k
+        "escape" => self.side = closed_side()
+        "up" => self.side.top = (self.side.top - 1).max(0)
+        "down" => self.side.top = (self.side.top + 1).min(last)
+        "pageup" => self.side.top = (self.side.top - step).max(0)
+        "pagedown" => self.side.top = (self.side.top + step).min(last)
+        "home" => self.side.top = 0
+        "end" => self.side.top = last
+        _ => return false
+    true
+
+## How a side-by-side cell is drawn.
+pub enum Look
+    Plain
+    Number
+    Old
+    New
+    OldMark
+    NewMark
+    Gap
+
+## A piece of a side-by-side row: from column `col`, `text`, drawn as `look`.
+pub struct Cell
+    pub col int
+    pub text str
+    pub look Look
+
+## One side of a row from column `x`, `width` columns: the 1-based line
+## number in 5 columns (blank for no line), then the text, cut to fit, with
+## characters `lo..hi` drawn emphasised.
+fn side_cells(mut out List[Cell], x int, width int, num int, text str, look Look, lo int, hi int)
+    if width <= 0
+        return
+    mut nums := "     "
+    if num >= 0
+        shown := num + 1
+        nums = "{shown:>4} "
+    out.push(Cell(col: x, text: nums.slice(0, nums.len().min(width)), look: Look.Number))
+    room := width - 5
+    if room <= 0
+        return
+    cs := text.chars()
+    end := cs.len().min(room)
+    if end == 0
+        return
+    a := lo.max(0).min(end)
+    b := hi.max(a).min(end)
+    emph := if look == Look.Old then Look.OldMark else Look.NewMark
+    if a > 0
+        out.push(Cell(col: x + 5, text: cs[..a].join(""), look: look))
+    if b > a
+        out.push(Cell(col: x + 5 + a, text: cs[a..b].join(""), look: emph))
+    if end > b
+        out.push(Cell(col: x + 5 + b, text: cs[b..end].join(""), look: look))
+
+## The cells of side-by-side row `p` across `width` columns: the old line on
+## the left, a `|`, the new line on the right. A Changed pair has the span
+## `hunks.intra` finds emphasised on both sides; a Gap row is one cell.
+pub fn side_row(p hunks.Pair, width int) List[Cell]
+    mut out := List[Cell]()
+    if p.kind == hunks.RowKind.Gap
+        out.push(Cell(col: 0, text: p.left_text, look: Look.Gap))
+        return out
+    half := width / 2
+    same := p.kind == hunks.RowKind.Same
+    left_look := if same then Look.Plain else Look.Old
+    right_look := if same then Look.Plain else Look.New
+    mut sp := hunks.Span(old_start: 0, old_end: 0, new_start: 0, new_end: 0)
+    if p.kind == hunks.RowKind.Changed
+        sp = hunks.intra(p.left_text, p.right_text)
+    side_cells(mut out, 0, half - 1, p.left, p.left_text, left_look, sp.old_start, sp.old_end)
+    out.push(Cell(col: (half - 1).max(0), text: "|", look: Look.Plain))
+    side_cells(
+        mut out,
+        half,
+        width - half,
+        p.right,
+        p.right_text,
+        right_look,
+        sp.new_start,
+        sp.new_end,
+    )
+    out
+
+## A side-by-side row as one line of text: `OLD# old | NEW# new`.
+pub fn pair_text(p hunks.Pair) str
+    if p.kind == hunks.RowKind.Gap
+        return p.left_text
+    l := if p.left >= 0 then "{p.left + 1}" else ""
+    r := if p.right >= 0 then "{p.right + 1}" else ""
+    "{l:>4} {p.left_text} | {r:>4} {p.right_text}"
+
+# ---- The live change gutter -----------------------------------------------------
+
+## The index of `path`'s live gutter, or -1.
+pub fn State.live_at(self, path str) int
+    for i in 0..self.live.len()
+        if self.live[i].path == path
+            return i
+    -1
+
+## Whether `path` needs its base (again): never taken, or saved since.
+pub fn State.needs_base(self, path str, saves int) bool
+    i := self.live_at(path)
+    i < 0 or self.live[i].saves != saves
+
+fn computed(lv Live, now_lines List[str]) Live
+    mut out := lv
+    out.found = hunks.diff(lv.base, now_lines)
+    out.kinds = hunks.gutter(out.found, now_lines.len())
+    out.seen = now_lines
+    out.pending = now_lines
+    out.changed_at = 0
+    out
+
+## Sets `path`'s base (git HEAD's text, else the saved text) and marks the
+## buffer's `now_lines` against it at once.
+pub fn State.set_base(mut self, path str, from_text List[str], saves int, now_lines List[str])
+    lv := computed(
+        Live(
+            path: path,
+            base: from_text,
+            saves: saves,
+            seen: now_lines,
+            pending: now_lines,
+            changed_at: 0,
+            found: List[hunks.Hunk](),
+            kinds: List[int](),
+        ),
+        now_lines,
+    )
+    i := self.live_at(path)
+    if i < 0
+        self.live.push(lv)
+    else
+        self.live[i] = lv
+
+## Marks `path` against its base now.
+pub fn State.recompute(mut self, path str, now_lines List[str])
+    i := self.live_at(path)
+    if i >= 0
+        self.live[i] = computed(self.live[i], now_lines)
+
+## Called while the editor waits, with the buffer's lines: the marks are
+## recomputed once the lines have stayed the same for GUTTER_MS since they
+## last changed, never on every keystroke. True when they were recomputed.
+pub fn State.tick(mut self, path str, now_lines List[str], now int) bool
+    i := self.live_at(path)
+    if i < 0
+        return false
+    mut lv := self.live[i]
+    if now_lines == lv.seen
+        if lv.changed_at != 0
+            lv.changed_at = 0
+            lv.pending = now_lines
+            self.live[i] = lv
+        return false
+    if now_lines != lv.pending or lv.changed_at == 0
+        lv.pending = now_lines
+        lv.changed_at = now
+        self.live[i] = lv
+        return false
+    if now - lv.changed_at < GUTTER_MS
+        return false
+    self.live[i] = computed(lv, now_lines)
+    true
+
+## The gutter kinds of `path`'s lines (`hunks.GUTTER_*`); empty when unknown.
+pub fn State.kinds_of(self, path str) List[int]
+    i := self.live_at(path)
+    if i < 0
+        return List[int]()
+    self.live[i].kinds
+
+## The hunks of `path` against its base.
+pub fn State.hunks_of(self, path str) List[hunks.Hunk]
+    i := self.live_at(path)
+    if i < 0
+        return List[hunks.Hunk]()
+    self.live[i].found
+
+## `path`'s base text; empty when unknown.
+pub fn State.base_of(self, path str) List[str]
+    i := self.live_at(path)
+    if i < 0
+        return List[str]()
+    self.live[i].base
+
+## Forgets every base, so each buffer takes its base again.
+pub fn State.clear_bases(mut self)
+    self.live = List[Live]()
+
+## The gutter mark of a kind: `+` added, `~` changed, `_` deleted below,
+## " " for none.
+pub fn mark_char(kind int) str
+    if kind == hunks.GUTTER_ADDED
+        return "+"
+    if kind == hunks.GUTTER_CHANGED
+        return "~"
+    if kind == hunks.GUTTER_DELETED
+        return "_"
+    " "
+
+## The 0-based line of the next change after `line` (or the previous one
+## before it), wrapping round; `none` without changes. `n` is the line count.
+pub fn next_change(found List[hunks.Hunk], line int, n int, forward bool) int?
+    if found.is_empty()
+        return none
+    mut at := List[int]()
+    for h in found
+        at.push(h.new_start.min((n - 1).max(0)))
+    if forward
+        for a in at
+            if a > line
+                return a
+        return at[0]
+    mut k := at.len() - 1
+    while k >= 0
+        if at[k] < line
+            return at[k]
+        k -= 1
+    at[at.len() - 1]
+
+## The hunk at 0-based `line`: one whose new lines hold it, or a deletion
+## marked on it.
+pub fn hunk_at(found List[hunks.Hunk], line int, n int) int?
+    for i in 0..found.len()
+        h := found[i]
+        if h.new_count > 0
+            if line >= h.new_start and line < h.new_start + h.new_count
+                return i
+        elif line == h.new_start.min((n - 1).max(0))
+            return i
+    none
+
+## One hunk as the panel shows it: unified rows with 3 lines of context.
+pub fn peek_rows(base List[str], h hunks.Hunk) List[str]
+    b := hunks.with_context([h], CONTEXT, base.len())[0]
+    hunks.unified(b, base)
+
+# ---- Agent marks and the Agent changes list ---------------------------------------
+
+## The 0-based lines of `path` in the change set's hunks: the agent `+`
+## marks (a deletion marks the line after it).
+pub fn State.changed_lines(self, path str) Set[int]
+    mut out := Set[int]()
+    for f in self.files
+        if f.path != path
+            continue
+        n := f.after.len()
+        for h in f.hunks
+            if h.new_count == 0
+                if n > 0
+                    out.add(h.new_start.min(n - 1))
+            else
+                for j in h.new_start..h.new_start + h.new_count
+                    out.add(j)
+    out
+
+## The Agent changes list: a row per changed file with the lines its hunks
+## cover now and where the first one is, then the files with no base.
+pub fn State.agent_rows(self) List[Row]
+    mut out := List[Row]()
+    for fi in 0..self.files.len()
+        f := self.files[fi]
+        if f.hunks.is_empty()
+            continue
+        out.push(row(
+            RowKind.File,
+            "{f.path}: {f.added} line(s) changed by an agent",
+            fi,
+            -1,
+            f.path,
+            shown_line(f.hunks[0], f.after.len()),
+        ))
+    turn := self.compared()
+    for l in self.loose
+        if l.turn >= turn
+            out.push(row(RowKind.NoBase, "{l.path}: changed on disk (no base)", -1, -1, l.path, 1))
+    out
+
+# ---- JSON (D4) ------------------------------------------------------------------
+
+fn quoted(s str) str
+    Json.Str(s).to_text()
+
+fn quoted_all(xs List[str]) str
+    mut items := List[str]()
+    for x in xs
+        items.push(quoted(x))
+    "[{items.join(",")}]"
+
+## The review panel under `--print --json` (D4): its title, the compared
+## checkpoint, every checkpoint's label, the summary, the files and the rows.
+pub fn State.json(self, title str) str
+    mut fs_out := List[str]()
+    for f in self.files
+        item := "\{\"path\":{quoted(f.path)},\"kind\":{quoted(f.kind.name())},\"added\":{f.added},\"removed\":{f.removed},\"hunks\":{f.hunks.len()}}"
+        fs_out.push(item)
+    mut nb := List[str]()
+    turn := self.compared()
+    for l in self.loose
+        if l.turn >= turn
+            nb.push(l.path)
+    summary := hunks.summary(self.changes())
+    "\{\"panel\":{quoted(title)},\"against\":{quoted(self.label())},\"checkpoints\":{quoted_all(self.stack.labels())},\"summary\":{quoted(summary)},\"files\":[{fs_out.join(",")}],\"no_base\":{quoted_all(nb)},\"rows\":{quoted_all(self.texts())}}"
+
+## The side-by-side view under `--print --json`.
+pub fn State.side_json(self) str
+    mut texts := List[str]()
+    for p in self.side.pairs
+        texts.push(pair_text(p))
+    "\{\"panel\":\"side by side\",\"path\":{quoted(self.side.path)},\"against\":{quoted(self.side.label)},\"rows\":{quoted_all(texts)}}"
+
+# ---- `ail review --json` --------------------------------------------------------
+
+## The findings of `ail review --json` (api.rev.5) as rows: a count line,
+## then `SECTION: LINE` for each line of each shown section. Empty when the
+## output is not the report.
+pub fn findings(out str) List[str]
+    mut found := List[str]()
+    j := parse_json(out.trim()) else return found
+    caps := j.int("new_capabilities") else 0
+    breaking := j.int("breaking") else 0
+    untested := j.int("untested") else 0
+    found.push("ail review: {caps} new capabilities, {breaking} breaking, {untested} untested")
+    sec := j.get("sections") else return found
+    if members := sec.as_obj()
+        for m in members
+            items := m.value.as_arr() else List[Json]()
+            for l in items
+                text := l.as_str() else l.to_text()
+                found.push("{m.key}: {text}")
+        return found
+    parts := sec.as_arr() else return found
+    for it in parts
+        name := it.str("name") else (it.str("section") else "")
+        items := it.arr("lines") else List[Json]()
+        for l in items
+            text := l.as_str() else l.to_text()
+            found.push("{name}: {text}")
+    found
+
+## The declaration id a finding names (`fn:add`, `type:P`), or "".
+pub fn finding_id(text str) str
+    kinds := ID_KINDS.split(" ")
+    for w in text.split(" ")
+        t := w.strip_suffix(":") else w
+        c := t.find(":") else continue
+        if c > 0 and kinds.contains(t.slice(0, c))
+            return t
+    ""
+
+fn cut_name(w str) str
+    mut end := w.len()
+    for stop in ["(", "[", ":"]
+        if at := w.find(stop)
+            end = end.min(at)
+    w.slice(0, end)
+
+## The 1-based line of `lines` that declares the name of `id` (`fn:add`,
+## `fn:P.area`, `type:P`; a field's type for `field:P.x`), else 0.
+pub fn decl_line(lines List[str], id str) int
+    c := id.find(":") else return 0
+    mut name := id.slice(c + 1, id.len())
+    if id.starts_with("field:")
+        name = name.split(".")[0]
+    starts := DECL_WORDS.split(" ")
+    for i in 0..lines.len()
+        mut t := lines[i].trim()
+        if p := t.strip_prefix("pub ")
+            t = p
+        words := t.split(" ")
+        if words.len() < 2 or not starts.contains(words[0])
+            continue
+        for w in words[1..words.len().min(3)]
+            if cut_name(w) == name
+                return i + 1
+    0
+
+# ---- Tests --------------------------------------------------------------------
+
+fn cur(path str, lines List[str]) hunks.Current
+    hunks.Current(path: path, lines: lines)
+
+OLD_A := ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
+
+fn new_a() List[str]
+    ["a", "B", "c", "d", "e", "f", "g", "h", "i", "j", "k"]
+
+## A review of one file with two hunks: line 1 changed, line 10 added.
+fn two_hunks() State
+    mut st := State.new()
+    st.outside("a.ail", OLD_A, 1000)
+    st.refresh([cur("a.ail", new_a())])
+    st
+
+fn hunk_row(st State, n int) int
+    mut seen := 0
+    for i in 0..st.rows.len()
+        if st.rows[i].kind == RowKind.Hunk
+            if seen == n
+                return i
+            seen += 1
+    -1
+
+@test fn an_outside_change_starts_a_turn_that_ends_after_five_seconds()
+    mut st := State.new()
+    st.outside("a.ail", ["x"], 1000)
+    st.outside("b.ail", ["y"], 3000)
+    assert_eq(st.stack.labels(), ["agent turn 1"])
+    assert(st.in_turn(7999))
+    assert(not st.in_turn(8000))
+    st.outside("a.ail", ["changed"], 9000)
+    assert_eq(st.stack.labels(), ["agent turn 1", "agent turn 2"])
+    st.outside("c.ail", none, 9100)
+    assert_eq(st.loose.len(), 1)
+    st.refresh([cur("a.ail", ["changed"])])
+    assert_eq(st.rows[st.rows.len() - 1].kind, RowKind.NoBase)
+    assert(st.rows[st.rows.len() - 1].text.contains("no base"))
+    assert_eq(st.before_apply("a.ail", ["z"]), "agent edit 3")
+
+@test fn the_panel_rows_are_a_summary_files_and_unified_hunks()
+    st := two_hunks()
+    assert_eq(st.rows[0].text, "agent turn 1: 1 file, +2 -1")
+    assert_eq(st.rows[1].kind, RowKind.File)
+    assert_eq(st.rows[1].text, "a.ail  +2 -1")
+    assert_eq(st.rows[1].line, 2)
+    assert_eq(st.rows[2].kind, RowKind.Hunk)
+    assert_eq(st.rows[2].text, "@@ -1,5 +1,5 @@")
+    assert_eq(st.rows[3].text, " a")
+    assert_eq(st.rows[4].text, "-b")
+    assert_eq(st.rows[5].text, "+B")
+    assert_eq(st.rows[5].line, 2)
+    assert_eq(st.rows[6].line, 3)
+    h2 := hunk_row(st, 1)
+    assert_eq(st.rows[h2].text, "@@ -8,3 +8,4 @@")
+    assert_eq(st.rows[h2].line, 11)
+    assert_eq(st.rows[st.rows.len() - 1].text, "+k")
+    assert_eq(st.step_hunk(0, true), 2)
+    assert_eq(st.step_hunk(2, true), h2)
+    assert_eq(st.step_hunk(h2, true), h2)
+    assert_eq(st.step_hunk(h2, false), 2)
+    assert_eq(State.new().texts().len(), 0)
+
+@test fn keep_and_revert_in_either_order_meet()
+    # Revert the first hunk, then keep the second.
+    mut a := two_hunks()
+    r1 := a.key("r", hunk_row(a, 0))
+    assert_eq(r1.what, "revert")
+    assert_eq(r1.writes[0].lines, ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"])
+    k2 := a.key("k", hunk_row(a, 0))
+    assert_eq(k2.what, "keep")
+    assert_eq(a.files.len(), 0)
+    assert_eq(a.rows[1].text, "no changes since agent turn 1")
+    # Keep the second hunk first, then revert the first.
+    mut b := two_hunks()
+    _ := b.key("k", hunk_row(b, 1))
+    assert_eq(b.files[0].hunks.len(), 1)
+    r2 := b.key("r", hunk_row(b, 0))
+    assert_eq(r2.writes[0].lines, r1.writes[0].lines)
+    assert_eq(b.files.len(), 0)
+    # Both ways the base keeps the added line, so a refresh finds nothing.
+    b.refresh([cur("a.ail", r2.writes[0].lines)])
+    assert_eq(b.files.len(), 0)
+    # Revert both, last first: the old text comes back.
+    mut c := two_hunks()
+    _ := c.key("r", hunk_row(c, 1))
+    r3 := c.key("r", hunk_row(c, 0))
+    assert_eq(r3.writes[0].lines, OLD_A)
+    # A key off a hunk only says where to go.
+    mut d := two_hunks()
+    assert(d.key("k", 0).note.contains("on a hunk"))
+    assert(not d.key("x", 0).used)
+
+@test fn whole_file_keep_and_revert()
+    mut a := two_hunks()
+    rf := a.key("R", 1)
+    assert_eq(rf.writes[0].lines, OLD_A)
+    assert(not rf.writes[0].remove)
+    assert_eq(a.files.len(), 0)
+    mut b := two_hunks()
+    _ := b.key("K", 3)
+    assert_eq(b.files.len(), 0)
+    b.refresh([cur("a.ail", new_a())])
+    assert_eq(b.files.len(), 0)
+    b.refresh([cur("a.ail", ["changed again"])])
+    assert_eq(b.files.len(), 1)
+    assert_eq(b.files[0].before, new_a())
+
+@test fn restore_needs_two_presses_and_cycle_walks_the_checkpoints()
+    mut st := two_hunks()
+    st.outside("b.ail", ["p"], 9000)
+    st.refresh([cur("a.ail", new_a()), cur("b.ail", ["q"])])
+    assert_eq(st.label(), "agent turn 2")
+    assert_eq(st.files.len(), 1)
+    cy := st.key("c", 0)
+    assert_eq(cy.what, "cycle")
+    assert(cy.note.contains("agent turn 1 (1 of 2"))
+    st.refresh([cur("a.ail", new_a()), cur("b.ail", ["q"])])
+    assert_eq(st.files.len(), 2)
+    _ := st.key("c", 0)
+    assert_eq(st.label(), "agent turn 2")
+    _ := st.key("c", 0)
+    first := st.key("u", 0)
+    assert_eq(first.what, "")
+    assert(st.armed)
+    _ := st.key("]", 0)
+    assert(not st.armed)
+    _ := st.key("u", 0)
+    done := st.key("u", 0)
+    assert_eq(done.what, "restore")
+    assert_eq(done.writes.len(), 2)
+    assert_eq(done.writes[0], hunks.Restore(path: "a.ail", lines: OLD_A, remove: false))
+    assert_eq(done.writes[1], hunks.Restore(path: "b.ail", lines: ["p"], remove: false))
+    assert_eq(st.stack.items.len(), 0)
+
+@test fn side_by_side_cells_emphasise_the_changed_span()
+    mut st := two_hunks()
+    p := st.key("s", 5)
+    assert_eq(p.what, "side")
+    assert(st.side.open)
+    assert_eq(st.side.pairs[1].kind, hunks.RowKind.Changed)
+    assert_eq(pair_text(st.side.pairs[1]), "   2 b |    2 B")
+    changed := hunks.Pair(
+        left: 0,
+        right: 0,
+        left_text: "x = 1",
+        right_text: "x = 22",
+        kind: hunks.RowKind.Changed,
+    )
+    cells := side_row(changed, 40)
+    assert_eq(cells[0], Cell(col: 0, text: "   1 ", look: Look.Number))
+    assert_eq(cells[1], Cell(col: 5, text: "x = ", look: Look.Old))
+    assert_eq(cells[2], Cell(col: 9, text: "1", look: Look.OldMark))
+    assert_eq(cells[3], Cell(col: 19, text: "|", look: Look.Plain))
+    assert_eq(cells[6], Cell(col: 29, text: "22", look: Look.NewMark))
+    skipped := "... 2 unchanged lines"
+    gap_pair := hunks.Pair(
+        left: 3,
+        right: 3,
+        left_text: skipped,
+        right_text: skipped,
+        kind: hunks.RowKind.Gap,
+    )
+    gap := side_row(gap_pair, 40)
+    assert_eq(gap.len(), 1)
+    assert(st.side_key("down", 10))
+    assert_eq(st.side.top, 1)
+    assert(not st.side_key("x", 10))
+    assert(st.side_key("escape", 10))
+    assert(not st.side.open)
+    assert(st.side_json().contains("\"panel\":\"side by side\""))
+
+@test fn the_live_gutter_waits_for_the_edits_to_settle()
+    mut st := State.new()
+    assert(st.needs_base("t.ail", 0))
+    st.set_base("t.ail", ["a", "b", "c"], 0, ["a", "b", "c"])
+    assert(not st.needs_base("t.ail", 0))
+    assert(st.needs_base("t.ail", 1))
+    assert_eq(st.kinds_of("t.ail"), [0, 0, 0])
+    edited := ["a", "X", "c", "d"]
+    assert(not st.tick("t.ail", edited, 1000))
+    assert(not st.tick("t.ail", edited, 1200))
+    assert(st.tick("t.ail", edited, 1300))
+    assert_eq(st.kinds_of("t.ail"), [0, 2, 0, 1])
+    assert_eq(mark_char(st.kinds_of("t.ail")[1]), "~")
+    found := st.hunks_of("t.ail")
+    assert_eq(next_change(found, 0, 4, true) else -1, 1)
+    assert_eq(next_change(found, 1, 4, true) else -1, 3)
+    assert_eq(next_change(found, 3, 4, true) else -1, 1)
+    assert_eq(next_change(found, 1, 4, false) else -1, 3)
+    assert_eq(hunk_at(found, 3, 4) else -1, 1)
+    assert_eq(hunk_at(found, 0, 4) else -1, -1)
+    assert_eq(next_change(List[hunks.Hunk](), 0, 4, true) else -1, -1)
+    assert_eq(peek_rows(st.base_of("t.ail"), found[0]), ["@@ -1,3 +1,3 @@", " a", "-b", "+X", " c"])
+    st.set_base("t.ail", ["a", "c"], 1, ["a"])
+    assert_eq(mark_char(st.kinds_of("t.ail")[0]), "_")
+
+@test fn agent_marks_and_list_read_the_change_set()
+    mut st := two_hunks()
+    lines := st.changed_lines("a.ail")
+    assert(lines.contains(1) and lines.contains(10))
+    assert(not lines.contains(0))
+    rows := st.agent_rows()
+    assert_eq(rows.len(), 1)
+    assert_eq(rows[0].text, "a.ail: 2 line(s) changed by an agent")
+    assert_eq(rows[0].line, 2)
+    assert(st.json("review").contains("\"checkpoints\":[\"agent turn 1\"]"))
+    want := "\"files\":[\{\"path\":\"a.ail\",\"kind\":\"Modified\",\"added\":2,\"removed\":1,\"hunks\":2}]"
+    assert(st.json("review").contains(want))
+
+@test fn ail_review_findings_become_rows_that_name_declarations()
+    out := "\{\"range\":\"x\",\"new_capabilities\":1,\"breaking\":0,\"untested\":1,\"sections\":\{\"effects\":[\"NEW CAPABILITY fn:main: +net\"],\"untested\":[\"fn:helper\"]}}"
+    rows := findings(out)
+    assert_eq(rows, [
+        "ail review: 1 new capabilities, 0 breaking, 1 untested",
+        "effects: NEW CAPABILITY fn:main: +net",
+        "untested: fn:helper",
+    ])
+    assert_eq(findings("not json"), [])
+    assert_eq(finding_id(rows[1]), "fn:main")
+    assert_eq(finding_id(rows[2]), "fn:helper")
+    assert_eq(finding_id(rows[0]), "")
+    src := [
+        "struct P",
+        "    x int",
+        "",
+        "pub fn helper(a int) int",
+        "    a",
+        "fn P.area(self) int",
+        "    1",
+    ]
+    assert_eq(decl_line(src, "fn:helper"), 4)
+    assert_eq(decl_line(src, "fn:P.area"), 6)
+    assert_eq(decl_line(src, "type:P"), 1)
+    assert_eq(decl_line(src, "field:P.x"), 1)
+    assert_eq(decl_line(src, "fn:none"), 0)
