@@ -28,4 +28,5 @@ fi
 "$ail_dir/ail" fmt --check .
 "$ail_dir/ail" test edit.ail
 "$ail_dir/ail" test features/probes/probes.ail
-"$ail_dir/ail" test features/agent
+# `ail test` takes a file (test.run.1); a module's tests run from its own file.
+"$ail_dir/ail" test features/agent/agent.ail
