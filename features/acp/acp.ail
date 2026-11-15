@@ -156,19 +156,19 @@ fn jnum(n int) Json
     Json.Num(n.to_float())
 
 fn request(id int, method str, params Json) str
-    Json.Obj([
-        jm("jsonrpc", Json.Str("2.0")),
-        jm("id", jnum(id)),
-        jm("method", Json.Str(method)),
-        jm("params", params),
-    ]).to_text()
+    Json
+        .Obj([
+            jm("jsonrpc", Json.Str("2.0")),
+            jm("id", jnum(id)),
+            jm("method", Json.Str(method)),
+            jm("params", params),
+        ])
+        .to_text()
 
 fn notify(method str, params Json) str
-    Json.Obj([
-        jm("jsonrpc", Json.Str("2.0")),
-        jm("method", Json.Str(method)),
-        jm("params", params),
-    ]).to_text()
+    Json
+        .Obj([jm("jsonrpc", Json.Str("2.0")), jm("method", Json.Str(method)), jm("params", params)])
+        .to_text()
 
 fn reply(id Json, result Json) str
     Json.Obj([jm("jsonrpc", Json.Str("2.0")), jm("id", id), jm("result", result)]).to_text()
@@ -719,7 +719,7 @@ fn Session.on_update(mut self, session str, update Update) Action
         ToolChange(change) => self.tool_changed(change)
         PlanChange(entries) => self.plan_changed(entries)
         Commands(cmds) => self.commands = cmds
-        ModeChange(mode) => self.mode = mode
+        ModeChange(new_mode) => self.mode = new_mode
         OtherUpdate(_) => return Action.Nothing
     Action.Nothing
 
@@ -824,7 +824,7 @@ fn entry(content str, priority str, status str) str
 fn update_in(line str) Update
     match parse(line)
         SessionUpdate(_, up) => up
-        _ => Update.OtherUpdate(name: "not an update")
+        Reply | Failure | AskPermission | ReadText | WriteText | Unknown => Update.OtherUpdate(name: "not an update")
 
 fn r(who Who, kind RowKind, text str, tag str, call str) Row
     Row(who: who, kind: kind, text: text, tag: tag, call: call)
@@ -1005,7 +1005,7 @@ fn r(who Who, kind RowKind, text str, tag str, call str) Row
     ask := s.take(agent_req(5, "session/request_permission", params))
     asked := match ask
         Ask(req) => req.options.len()
-        _ => 0
+        Nothing | SendLines | ReadFile | WriteFile => 0
     assert_eq(asked, 2)
     answer := s.answer_permission("allow")
     assert_eq(answer, [ok(5, "'outcome':\{'outcome':'selected','optionId':'allow'}")])
