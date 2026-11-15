@@ -1,0 +1,1600 @@
+## Git in the editor, the pure half (gap row C9, lane P11 of
+## docs/parity-plan-2026-11.md): the argument lists of the git commands the
+## editor runs, parsers for their machine output, the source control panel
+## (rows, keys as intents, the commit message box), blame notes, conflict
+## markers and one plain sentence for each common failure. The wiring runs
+## `proc.run("git", args, input, timeout)` in a job, from the repository's
+## top directory, and passes the output in. The tree's status marks stay in
+## `features/workspace/git.ail` and the diff model in `features/hunks/`;
+## `parse_diff` reads `git diff -U0` into `hunks.Hunk`s.
+use features.hunks
+
+## A first commit line longer than this gets a warning in the message box.
+pub SUBJECT_MAX := 72
+
+MINUTE := 60
+HOUR := 3600
+DAY := 86400
+MONTH := 2592000
+YEAR := 31536000
+
+## The field separator of the log and branch formats (ASCII unit separator).
+US := "\u{1f}"
+
+## The record separator of `status -z`.
+NUL := "\0"
+
+## Fields of `log_args`: full sha, short sha, author, relative date, subject.
+LOG_FORMAT := "--pretty=format:%H%x1f%h%x1f%an%x1f%ar%x1f%s"
+
+## Fields of `branches_args`: `*` on the current branch, the full ref name,
+## the short name, the upstream, the short sha and the subject.
+REF_FORMAT := "--format=%(HEAD)%1f%(refname)%1f%(refname:short)%1f%(upstream:short)%1f%(objectname:short)%1f%(subject)"
+
+HEX := "0123456789abcdef"
+
+# ---- Status -------------------------------------------------------------------
+
+## The state of a path in the index or in the work tree, as one letter of
+## the porcelain `XY` code says it.
+pub enum FileState
+    Unmodified
+    Modified
+    Added
+    Deleted
+    Renamed
+    Copied
+    TypeChanged
+    Unmerged
+    Untracked
+    Ignored
+
+## One changed path. `orig` is the path before a rename or copy ("" for
+## none); `code` is the raw `XY` (`.M`, `R.`, `UU`, `??`, `!!`).
+pub struct Entry
+    pub path str
+    pub orig str
+    pub index FileState
+    pub worktree FileState
+    pub code str
+
+## What `git status --porcelain=v2 --branch -z` says. `branch` is "" when
+## the head is detached (`detached`), and `oid` is the head commit
+## (`(initial)` before the first commit). `ahead` and `behind` count against
+## `upstream` ("" when the branch has none).
+pub struct Status
+    pub oid str
+    pub branch str
+    pub detached bool
+    pub upstream str
+    pub ahead int
+    pub behind int
+    pub entries List[Entry]
+
+## A status with no branch and no entries, before the first refresh.
+pub fn Status.empty() Status
+    Status(
+        oid: "",
+        branch: "",
+        detached: false,
+        upstream: "",
+        ahead: 0,
+        behind: 0,
+        entries: List[Entry](),
+    )
+
+## `git status`: version 2 porcelain with the branch headers, NUL-separated
+## so paths come unquoted.
+pub fn status_args() List[str]
+    ["status", "--porcelain=v2", "--branch", "-z"]
+
+fn state_of(c str) FileState
+    match c
+        "M" => FileState.Modified
+        "A" => FileState.Added
+        "D" => FileState.Deleted
+        "R" => FileState.Renamed
+        "C" => FileState.Copied
+        "T" => FileState.TypeChanged
+        "U" => FileState.Unmerged
+        _ => FileState.Unmodified
+
+fn half(xy str, i int) str
+    if xy.len() != 2
+        return "."
+    xy.slice(i, i + 1)
+
+fn entry_of(xy str, path str, orig str) Entry
+    Entry(
+        path: path,
+        orig: orig,
+        index: state_of(half(xy, 0)),
+        worktree: state_of(half(xy, 1)),
+        code: xy,
+    )
+
+fn plain_entry(path str, st FileState, xy str) Entry
+    Entry(path: path, orig: "", index: st, worktree: st, code: xy)
+
+fn signed(s str) int
+    t := s.strip_prefix("+") else (s.strip_prefix("-") else s)
+    t.to_int() else 0
+
+## Reads `git status --porcelain=v2 --branch -z` output: the `# branch.*`
+## headers, then ordinary (`1`), rename or copy (`2`, whose original path
+## is the next NUL record), unmerged (`u`), untracked (`?`) and ignored
+## (`!`) records. Output without NULs (no `-z`) is read line by line, a
+## rename's paths split at the tab; its quoted paths are left as git wrote
+## them.
+pub fn parse_status(out str) Status
+    nul := out.contains(NUL)
+    sep := if nul then NUL else "\n"
+    recs := out.split(sep)
+    mut st := Status.empty()
+    mut entries := List[Entry]()
+    mut i := 0
+    while i < recs.len()
+        r := recs[i]
+        i += 1
+        if r.is_empty()
+            continue
+        if r.starts_with("# ")
+            h := r.slice(2, r.len())
+            sp := h.find(" ") else continue
+            key := h.slice(0, sp)
+            val := h.slice(sp + 1, h.len())
+            if key == "branch.oid"
+                st.oid = val
+            elif key == "branch.head"
+                if val == "(detached)"
+                    st.detached = true
+                else
+                    st.branch = val
+            elif key == "branch.upstream"
+                st.upstream = val
+            elif key == "branch.ab"
+                ab := val.split(" ")
+                if ab.len() == 2
+                    st.ahead = signed(ab[0])
+                    st.behind = signed(ab[1])
+        elif r.starts_with("1 ")
+            f1 := r.split(" ", 9)
+            if f1.len() == 9
+                entries.push(entry_of(f1[1], f1[8], ""))
+        elif r.starts_with("2 ")
+            f2 := r.split(" ", 10)
+            if f2.len() == 10
+                mut path := f2[9]
+                mut orig := ""
+                if nul
+                    if i < recs.len()
+                        orig = recs[i]
+                        i += 1
+                else
+                    if tab := path.find("\t")
+                        orig = path.slice(tab + 1, path.len())
+                        path = path.slice(0, tab)
+                entries.push(entry_of(f2[1], path, orig))
+        elif r.starts_with("u ")
+            f3 := r.split(" ", 11)
+            if f3.len() == 11
+                entries.push(plain_entry(f3[10], FileState.Unmerged, f3[1]))
+        elif r.starts_with("? ")
+            entries.push(plain_entry(r.slice(2, r.len()), FileState.Untracked, "??"))
+        elif r.starts_with("! ")
+            entries.push(plain_entry(r.slice(2, r.len()), FileState.Ignored, "!!"))
+    st.entries = entries
+    st
+
+## The number of entries that are not ignored.
+pub fn changed_count(st Status) int
+    mut n := 0
+    for e in st.entries
+        if e.index != FileState.Ignored
+            n += 1
+    n
+
+## The status bar text: the branch (or `(abc1234)` when detached), then
+## `+N` commits ahead, `-N` behind and `*N` changed paths, each only when
+## not zero: `main +2 -1 *3`. ASCII only.
+pub fn summary(st Status) str
+    mut out := st.branch
+    if st.detached
+        out = "({st.oid.slice(0, st.oid.len().min(7))})"
+    if st.ahead > 0
+        out = "{out} +{st.ahead}"
+    if st.behind > 0
+        out = "{out} -{st.behind}"
+    n := changed_count(st)
+    if n > 0
+        out = "{out} *{n}"
+    out
+
+# ---- Panel rows ---------------------------------------------------------------
+
+## The panel's sections, in the order they are drawn.
+pub enum Section
+    Staged
+    Changes
+    Untracked
+    Conflicts
+
+## A section's title.
+pub fn section_name(s Section) str
+    match s
+        Section.Staged => "Staged"
+        Section.Changes => "Changes"
+        Section.Untracked => "Untracked"
+        Section.Conflicts => "Conflicts"
+
+## The one-letter mark of a state: `M` `A` `D` `R` `C` `T`, `U` for a
+## conflict, `?` untracked, `!` ignored, a space when unmodified.
+pub fn letter(s FileState) str
+    match s
+        FileState.Unmodified => " "
+        FileState.Modified => "M"
+        FileState.Added => "A"
+        FileState.Deleted => "D"
+        FileState.Renamed => "R"
+        FileState.Copied => "C"
+        FileState.TypeChanged => "T"
+        FileState.Unmerged => "U"
+        FileState.Untracked => "?"
+        FileState.Ignored => "!"
+
+fn is_change(s FileState) bool
+    match s
+        FileState.Unmodified | FileState.Unmerged | FileState.Untracked | FileState.Ignored => false
+        FileState.Modified | FileState.Added | FileState.Deleted => true
+        FileState.Renamed | FileState.Copied | FileState.TypeChanged => true
+
+## Whether entry `e` is listed in section `s`. A path staged and changed
+## again (`MM`) is in both Staged and Changes.
+pub fn in_section(e Entry, s Section) bool
+    match s
+        Section.Staged => is_change(e.index)
+        Section.Changes => is_change(e.worktree)
+        Section.Untracked => e.index == FileState.Untracked
+        Section.Conflicts => e.index == FileState.Unmerged
+
+## How many entries section `s` lists.
+pub fn section_count(st Status, s Section) int
+    mut n := 0
+    for e in st.entries
+        if in_section(e, s)
+            n += 1
+    n
+
+## What a panel row is: a section title, a path, or a note.
+pub enum RowKind
+    Header
+    Item
+    Note
+
+## One panel row. `mark` and `path` are set on items (`orig` too for a
+## rename); `text` is what the row draws: `Staged (2)` for a header,
+## `M edit.ail` or `R old.ail -> new.ail` for an item.
+pub struct Row
+    pub kind RowKind
+    pub section Section
+    pub mark str
+    pub path str
+    pub orig str
+    pub text str
+
+fn item_row(e Entry, s Section) Row
+    mut m := letter(e.worktree)
+    if s == Section.Staged
+        m = letter(e.index)
+    elif s == Section.Conflicts
+        m = "U"
+    mut shown := "{m} {e.path}"
+    if e.orig != "" and s == Section.Staged
+        shown = "{m} {e.orig} -> {e.path}"
+    Row(kind: RowKind.Item, section: s, mark: m, path: e.path, orig: e.orig, text: shown)
+
+## The panel rows: each section that lists something, as a header with its
+## count and a row per path, in the order Staged, Changes, Untracked,
+## Conflicts. A clean tree is one note row.
+pub fn panel_rows(st Status) List[Row]
+    mut out := List[Row]()
+    for s in [Section.Staged, Section.Changes, Section.Untracked, Section.Conflicts]
+        n := section_count(st, s)
+        if n == 0
+            continue
+        out.push(Row(
+            kind: RowKind.Header,
+            section: s,
+            mark: "",
+            path: "",
+            orig: "",
+            text: "{section_name(s)} ({n})",
+        ))
+        for e in st.entries
+            if in_section(e, s)
+                out.push(item_row(e, s))
+    if out.is_empty()
+        out.push(Row(
+            kind: RowKind.Note,
+            section: Section.Changes,
+            mark: "",
+            path: "",
+            orig: "",
+            text: "nothing to commit, working tree clean",
+        ))
+    out
+
+# ---- Commit message box -------------------------------------------------------
+
+## The commit message being written: its lines and the caret (0-based line,
+## column in characters).
+pub struct MessageBox
+    pub lines List[str]
+    pub line int
+    pub col int
+
+## An empty message box.
+pub fn MessageBox.new() MessageBox
+    MessageBox(lines: [""], line: 0, col: 0)
+
+## The message as one text, lines joined with `\n`.
+pub fn MessageBox.text(self) str
+    self.lines.join("\n")
+
+## Whether the message has nothing but spaces.
+pub fn MessageBox.blank(self) bool
+    self.text().trim().is_empty()
+
+## Types `s` (no line breaks) at the caret.
+pub fn MessageBox.insert(mut self, s str)
+    cur := self.lines[self.line]
+    head := cur.slice(0, self.col)
+    tail := cur.slice(self.col, cur.len())
+    self.lines[self.line] = "{head}{s}{tail}"
+    self.col += s.len()
+
+## Splits the line at the caret.
+pub fn MessageBox.newline(mut self)
+    cur := self.lines[self.line]
+    head := cur.slice(0, self.col)
+    tail := cur.slice(self.col, cur.len())
+    self.lines[self.line] = head
+    self.lines.insert(self.line + 1, tail)
+    self.line += 1
+    self.col = 0
+
+## Deletes the character before the caret, joining lines at a line start.
+pub fn MessageBox.backspace(mut self)
+    if self.col > 0
+        cur := self.lines[self.line]
+        self.lines[self.line] = "{cur.slice(0, self.col - 1)}{cur.slice(self.col, cur.len())}"
+        self.col -= 1
+        return
+    if self.line == 0
+        return
+    above := self.lines[self.line - 1]
+    joined := "{above}{self.lines[self.line]}"
+    _ := self.lines.remove_at(self.line)
+    self.line -= 1
+    self.lines[self.line] = joined
+    self.col = above.len()
+
+## Moves the caret: `Left`, `Right`, `Up`, `Down`, `Home` or `End`. False
+## for any other key.
+pub fn MessageBox.move_caret(mut self, k str) bool
+    n := self.lines[self.line].len()
+    if k == "Left"
+        if self.col > 0
+            self.col -= 1
+        elif self.line > 0
+            self.line -= 1
+            self.col = self.lines[self.line].len()
+    elif k == "Right"
+        if self.col < n
+            self.col += 1
+        elif self.line + 1 < self.lines.len()
+            self.line += 1
+            self.col = 0
+    elif k == "Up"
+        if self.line > 0
+            self.line -= 1
+            self.col = self.col.min(self.lines[self.line].len())
+    elif k == "Down"
+        if self.line + 1 < self.lines.len()
+            self.line += 1
+            self.col = self.col.min(self.lines[self.line].len())
+    elif k == "Home"
+        self.col = 0
+    elif k == "End"
+        self.col = n
+    else
+        return false
+    true
+
+## The warning under the box: "" or why the first line is too long.
+pub fn MessageBox.warning(self) str
+    n := self.lines[0].len()
+    if n > SUBJECT_MAX
+        return "first line is {n} characters; keep it to {SUBJECT_MAX}"
+    ""
+
+# ---- Panel keys ---------------------------------------------------------------
+
+## What a panel key asks the wiring to do. `Discard` comes only after a
+## second `d`; its `untracked` says the path is not in git, so discarding
+## it deletes the file (through the trash). `OpenDiff` shows the index
+## against HEAD when `staged`, else the work tree against the index.
+## `CommitAmend` with an empty message keeps the old one. `SwitchBranch`
+## opens the branch picker (`branches_args`). `Nothing` changes only the
+## panel.
+pub enum Intent
+    Stage(path str)
+    Unstage(path str)
+    StageAll
+    UnstageAll
+    Discard(path str, untracked bool)
+    OpenDiff(path str, staged bool)
+    Commit(message str)
+    CommitAmend(message str)
+    Push
+    Pull
+    Fetch
+    Refresh
+    SwitchBranch
+    Nothing
+
+## Where the panel's keys go: the file list or the message box.
+pub enum Focus
+    Files
+    Message
+
+## The source control panel. `sel` is the selected row (-1 when no row is
+## an item); `confirm` is the path a first `d` asked about ("" for none);
+## `note` is the line the panel shows under its rows.
+pub struct Panel
+    pub status Status
+    pub rows List[Row]
+    pub sel int
+    pub focus Focus
+    pub confirm str
+    pub message MessageBox
+    pub note str
+
+## A panel before the first status.
+pub fn Panel.new() Panel
+    mut p := Panel(
+        status: Status.empty(),
+        rows: List[Row](),
+        sel: -1,
+        focus: Focus.Files,
+        confirm: "",
+        message: MessageBox.new(),
+        note: "",
+    )
+    p.load(Status.empty())
+    p
+
+fn Panel.first_item(self) int
+    for i in 0..self.rows.len()
+        if self.rows[i].kind == RowKind.Item
+            return i
+    -1
+
+## Takes a new status. The selection stays on the same path in the same
+## section when it is still listed, else on the item nearest its old place.
+pub fn Panel.load(mut self, st Status)
+    mut was_path := ""
+    mut was_section := Section.Changes
+    if self.sel >= 0 and self.sel < self.rows.len()
+        was_path = self.rows[self.sel].path
+        was_section = self.rows[self.sel].section
+    old := self.sel
+    self.status = st
+    self.rows = panel_rows(st)
+    self.confirm = ""
+    for i in 0..self.rows.len()
+        r := self.rows[i]
+        if r.kind == RowKind.Item and r.path == was_path and r.section == was_section
+            self.sel = i
+            return
+    self.sel = -1
+    mut k := old.min(self.rows.len() - 1)
+    while k >= 0
+        if self.rows[k].kind == RowKind.Item
+            self.sel = k
+            return
+        k -= 1
+    self.sel = self.first_item()
+
+## The selected item row, or `none`.
+pub fn Panel.selected(self) Row?
+    if self.sel < 0 or self.sel >= self.rows.len()
+        return none
+    if self.rows[self.sel].kind != RowKind.Item
+        return none
+    self.rows[self.sel]
+
+fn Panel.step(mut self, forward bool)
+    if forward
+        for i in self.sel + 1..self.rows.len()
+            if self.rows[i].kind == RowKind.Item
+                self.sel = i
+                return
+        return
+    mut j := self.sel - 1
+    while j >= 0
+        if self.rows[j].kind == RowKind.Item
+            self.sel = j
+            return
+        j -= 1
+
+## Clears the message box after the wiring's commit succeeded.
+pub fn Panel.committed(mut self)
+    self.message = MessageBox.new()
+    self.focus = Focus.Files
+    self.note = ""
+
+fn Panel.commit_intent(mut self, amend bool) Intent
+    text := self.message.text().trim_end()
+    if amend
+        return Intent.CommitAmend(message: text)
+    if self.message.blank()
+        self.focus = Focus.Message
+        self.note = "write a commit message (Ctrl+Enter commits, Escape leaves the box)"
+        return Intent.Nothing
+    if section_count(self.status, Section.Staged) == 0
+        self.note = "nothing staged: s stages the selected file, S stages every change"
+        return Intent.Nothing
+    Intent.Commit(message: text)
+
+fn Panel.discard_key(mut self, r Row) Intent
+    if r.section == Section.Staged
+        self.note = "u unstages {r.path} first; d then discards its changes"
+        return Intent.Nothing
+    if r.section == Section.Conflicts
+        self.note = "resolve {r.path} (take ours, theirs or both) and stage it"
+        return Intent.Nothing
+    untracked := r.section == Section.Untracked
+    if self.confirm == r.path
+        self.confirm = ""
+        return Intent.Discard(path: r.path, untracked: untracked)
+    self.confirm = r.path
+    if untracked
+        self.note = "d again moves {r.path} to the trash; any other key cancels"
+    else
+        self.note = "d again discards the changes to {r.path}; any other key cancels"
+    Intent.Nothing
+
+fn Panel.message_key(mut self, k str, ctrl bool) Intent
+    if k == "Enter" and ctrl
+        return self.commit_intent(false)
+    if ctrl
+        return Intent.Nothing
+    if k == "Escape" or k == "Tab"
+        self.focus = Focus.Files
+    elif k == "Enter"
+        self.message.newline()
+    elif k == "Backspace"
+        self.message.backspace()
+    elif self.message.move_caret(k)
+        self.note = ""
+    elif k.len() == 1
+        self.message.insert(k)
+    self.note = self.message.warning()
+    Intent.Nothing
+
+## What key `k` does (`ctrl` held or not). Keys are single characters or
+## the names `Enter`, `Escape`, `Tab`, `Backspace`, `Up`, `Down`, `Left`,
+## `Right`, `Home`, `End`. In the file list: `Up` `Down` (or `k` `j`) move,
+## `s` stages and `u` unstages the selected path, `S` `U` all of them,
+## `d` twice discards, `Enter` opens the diff, `c` commits the message (or
+## opens the box when it is empty), `a` amends, `p` push, `P` pull, `f`
+## fetch, `r` refresh, `b` switch branch, `Tab` the message box. In the
+## message box keys type, `Ctrl+Enter` commits, `Escape` or `Tab` leaves.
+pub fn Panel.key(mut self, k str, ctrl bool) Intent
+    if self.focus == Focus.Message
+        self.confirm = ""
+        return self.message_key(k, ctrl)
+    if k != "d"
+        self.confirm = ""
+    self.note = ""
+    if ctrl
+        return Intent.Nothing
+    if k == "Down" or k == "j"
+        self.step(true)
+        return Intent.Nothing
+    if k == "Up" or k == "k"
+        self.step(false)
+        return Intent.Nothing
+    if k == "Tab"
+        self.focus = Focus.Message
+        return Intent.Nothing
+    if k == "S"
+        return Intent.StageAll
+    if k == "U"
+        return Intent.UnstageAll
+    if k == "c"
+        return self.commit_intent(false)
+    if k == "a"
+        return self.commit_intent(true)
+    if k == "p"
+        return Intent.Push
+    if k == "P"
+        return Intent.Pull
+    if k == "f"
+        return Intent.Fetch
+    if k == "r"
+        return Intent.Refresh
+    if k == "b"
+        return Intent.SwitchBranch
+    r := self.selected() else return Intent.Nothing
+    if k == "s"
+        if r.section == Section.Staged
+            self.note = "{r.path} is staged"
+            return Intent.Nothing
+        return Intent.Stage(path: r.path)
+    if k == "u"
+        if r.section != Section.Staged
+            self.note = "{r.path} is not staged"
+            return Intent.Nothing
+        return Intent.Unstage(path: r.path)
+    if k == "d"
+        return self.discard_key(r)
+    if k == "Enter"
+        return Intent.OpenDiff(path: r.path, staged: r.section == Section.Staged)
+    Intent.Nothing
+
+## The rows' texts, as the pane draws them.
+pub fn Panel.texts(self) List[str]
+    mut out := List[str]()
+    for r in self.rows
+        out.push(r.text)
+    out
+
+fn jm(key str, value Json) JsonMember
+    JsonMember(key: key, value: value)
+
+fn jnum(n int) Json
+    Json.Num(n.to_float())
+
+fn jstrs(xs List[str]) Json
+    mut items := List[Json]()
+    for x in xs
+        items.push(Json.Str(x))
+    Json.Arr(items)
+
+## The panel under `--print --json`: the branch, upstream, counts, summary,
+## sections with counts, rows, selection, pending discard, focus, message
+## lines with the warning, and the note.
+pub fn Panel.json(self) str
+    st := self.status
+    mut secs := List[Json]()
+    for s in [Section.Staged, Section.Changes, Section.Untracked, Section.Conflicts]
+        secs.push(Json.Obj([
+            jm("name", Json.Str(section_name(s))),
+            jm("count", jnum(section_count(st, s))),
+        ]))
+    mut picked := ""
+    if r := self.selected()
+        picked = r.path
+    focus_name := if self.focus == Focus.Message then "message" else "files"
+    box := Json.Obj([
+        jm("lines", jstrs(self.message.lines)),
+        jm("warning", Json.Str(self.message.warning())),
+    ])
+    Json
+        .Obj([
+            jm("panel", Json.Str("git")),
+            jm("branch", Json.Str(st.branch)),
+            jm("detached", Json.Bool(st.detached)),
+            jm("upstream", Json.Str(st.upstream)),
+            jm("ahead", jnum(st.ahead)),
+            jm("behind", jnum(st.behind)),
+            jm("summary", Json.Str(summary(st))),
+            jm("sections", Json.Arr(secs)),
+            jm("rows", jstrs(self.texts())),
+            jm("selected", Json.Str(picked)),
+            jm("confirm", Json.Str(self.confirm)),
+            jm("focus", Json.Str(focus_name)),
+            jm("message", box),
+            jm("note", Json.Str(self.note)),
+        ])
+        .to_text()
+
+# ---- Command builders ---------------------------------------------------------
+
+fn with_paths(head List[str], paths List[str]) List[str]
+    mut out := head
+    out.push("--")
+    out.extend(paths)
+    out
+
+## `git add -- PATHS` (also marks a conflict resolved).
+pub fn stage_args(paths List[str]) List[str]
+    with_paths(["add"], paths)
+
+## `git add -A`: every change, new files included.
+pub fn stage_all_args() List[str]
+    ["add", "-A"]
+
+## `git restore --staged -- PATHS`: back out of the index, the work tree
+## kept.
+pub fn unstage_args(paths List[str]) List[str]
+    with_paths(["restore", "--staged"], paths)
+
+## `git restore --staged -- :/`: unstage everything (`:/` is the top of the
+## tree). Before the first commit there is no HEAD to restore from; the
+## wiring uses `git rm --cached -r -q -- :/` then.
+pub fn unstage_all_args() List[str]
+    ["restore", "--staged", "--", ":/"]
+
+## `git restore -- PATH`: the work tree's copy of a tracked file goes back
+## to the index's. An untracked file has no copy in git: discarding it is a
+## file delete, which the wiring does itself through the trash, not git.
+pub fn discard_args(path str) List[str]
+    with_paths(["restore"], [path])
+
+## `git commit -F -`: the wiring passes the message as standard input.
+pub fn commit_args() List[str]
+    ["commit", "-F", "-"]
+
+## `git commit --amend`: with the message on standard input (`-F -`), or
+## `--no-edit` to keep the old one when `keep` is true.
+pub fn amend_args(keep bool) List[str]
+    if keep
+        return ["commit", "--amend", "--no-edit"]
+    ["commit", "--amend", "-F", "-"]
+
+## `git push`; a branch with no upstream pushes to `origin` and sets it
+## (`-u`).
+pub fn push_args(st Status) List[str]
+    if st.upstream == "" and st.branch != ""
+        return ["push", "-u", "origin", st.branch]
+    ["push"]
+
+## `git pull --ff-only`: never makes a merge commit; when both sides moved
+## it fails (see `explain`).
+pub fn pull_args() List[str]
+    ["pull", "--ff-only"]
+
+## `git fetch --prune`.
+pub fn fetch_args() List[str]
+    ["fetch", "--prune"]
+
+## `git for-each-ref` over local and remote branches, in the format
+## `parse_branches` reads.
+pub fn branches_args() List[str]
+    ["for-each-ref", REF_FORMAT, "refs/heads", "refs/remotes"]
+
+## `git switch NAME`. For a remote branch pass its local name
+## (`Branch.local_name`): git makes a tracking branch from the one remote
+## that has it.
+pub fn switch_args(name str) List[str]
+    ["switch", name]
+
+## `git switch -c NAME [START]`: a new branch at `start` ("" for HEAD).
+pub fn create_branch_args(name str, start str) List[str]
+    mut out := ["switch", "-c", name]
+    if start != ""
+        out.push(start)
+    out
+
+## `git show REV:PATH`: the file at a revision (`HEAD`, or `""` for the
+## index, which git writes `:PATH`). `path` is from the top of the tree.
+pub fn show_args(rev str, path str) List[str]
+    ["show", "{rev}:{path}"]
+
+## `git diff --no-color -U0 -- PATH`: the work tree against the index, or
+## the index against HEAD when `staged` (`--cached`). `parse_diff` reads it.
+pub fn diff_args(path str, staged bool) List[str]
+    mut out := ["diff", "--no-color", "-U0"]
+    if staged
+        out.push("--cached")
+    with_paths(out, [path])
+
+## `git diff --no-color -U0 REV -- PATH`: the work tree against a revision.
+pub fn diff_rev_args(rev str, path str) List[str]
+    with_paths(["diff", "--no-color", "-U0", rev], [path])
+
+## `git stash push --include-untracked [-m MESSAGE]`.
+pub fn stash_push_args(message str) List[str]
+    mut out := ["stash", "push", "--include-untracked"]
+    if message != ""
+        out.push("-m")
+        out.push(message)
+    out
+
+## `git stash pop`.
+pub fn stash_pop_args() List[str]
+    ["stash", "pop"]
+
+## `git log` with the fields `parse_log` reads, the newest `limit` commits
+## (none when `limit` is 0), of one path when `path` is not "".
+pub fn log_args(limit int, path str) List[str]
+    mut out := ["log", LOG_FORMAT]
+    if limit > 0
+        out.push("-n")
+        out.push("{limit}")
+    if path != ""
+        return with_paths(out, [path])
+    out
+
+## `git blame --porcelain -- PATH`, over lines `first..=last` (1-based)
+## when `first` is above 0.
+pub fn blame_args(path str, first int, last int) List[str]
+    mut out := ["blame", "--porcelain"]
+    if first > 0
+        out.push("-L")
+        out.push("{first},{last.max(first)}")
+    with_paths(out, [path])
+
+## The git arguments an intent runs. Empty for `Nothing` and for an
+## untracked `Discard` (a delete through the trash). `Commit` and a
+## `CommitAmend` with a message take that message on standard input.
+## `Refresh` is the status; `SwitchBranch` lists the branches to pick from.
+pub fn intent_args(i Intent, st Status) List[str]
+    match i
+        Stage(p1) => stage_args([p1])
+        Unstage(p2) => unstage_args([p2])
+        StageAll => stage_all_args()
+        UnstageAll => unstage_all_args()
+        Discard(p3, untracked) => if untracked then List[str]() else discard_args(p3)
+        OpenDiff(p4, staged) => diff_args(p4, staged)
+        Commit(_) => commit_args()
+        CommitAmend(m) => amend_args(m == "")
+        Push => push_args(st)
+        Pull => pull_args()
+        Fetch => fetch_args()
+        Refresh => status_args()
+        SwitchBranch => branches_args()
+        Nothing => List[str]()
+
+# ---- Branches and log ---------------------------------------------------------
+
+## One branch. `remote` is set for `refs/remotes/...` (`name` is then
+## `origin/feature`); `current` marks the checked-out one.
+pub struct Branch
+    pub name str
+    pub refname str
+    pub remote bool
+    pub current bool
+    pub upstream str
+    pub sha str
+    pub subject str
+
+## The name `switch_args` takes: a remote branch without its remote
+## (`origin/feature` gives `feature`).
+pub fn Branch.local_name(self) str
+    if not self.remote
+        return self.name
+    at := self.name.find("/") else return self.name
+    self.name.slice(at + 1, self.name.len())
+
+## Reads `branches_args` output, one branch per line. A remote's symbolic
+## `HEAD` is left out.
+pub fn parse_branches(out str) List[Branch]
+    mut res := List[Branch]()
+    for l in out.split("\n")
+        f := l.split(US)
+        if f.len() < 6
+            continue
+        full := f[1]
+        if full.ends_with("/HEAD")
+            continue
+        res.push(Branch(
+            name: f[2],
+            refname: full,
+            remote: full.starts_with("refs/remotes/"),
+            current: f[0] == "*",
+            upstream: f[3],
+            sha: f[4],
+            subject: f[5],
+        ))
+    res
+
+## One commit of `log_args`: `date` is git's relative date (`3 days ago`).
+pub struct LogEntry
+    pub sha str
+    pub short str
+    pub author str
+    pub date str
+    pub subject str
+
+## Reads `log_args` output, newest first.
+pub fn parse_log(out str) List[LogEntry]
+    mut res := List[LogEntry]()
+    for l in out.split("\n")
+        f := l.split(US, 5)
+        if f.len() < 5
+            continue
+        res.push(LogEntry(sha: f[0], short: f[1], author: f[2], date: f[3], subject: f[4]))
+    res
+
+# ---- Diff ---------------------------------------------------------------------
+
+## A `-a,b` or `+c,d` range as a 0-based start and a count. A missing count
+## is 1; with a count of 0 git names the line before, which is the 0-based
+## line after.
+fn range_of(s str)(int, int)
+    parts := s.slice(1, s.len()).split(",")
+    first := parts[0].to_int() else 0
+    mut n := 1
+    if parts.len() > 1
+        n = parts[1].to_int() else 0
+    if n == 0
+        return (first, 0)
+    (first - 1, n)
+
+fn hunk_of(o (int, int), w (int, int), removed List[str], added List[str]) hunks.Hunk
+    hunks.Hunk(
+        old_start: o.0,
+        old_count: o.1,
+        new_start: w.0,
+        new_count: w.1,
+        removed: removed,
+        added: added,
+    )
+
+## The hunks of `diff_args` output for one file, as `hunks.diff` would give
+## them: each `@@ -a,b +c,d @@` header and its `-` and `+` lines (no
+## context, `-U0`). Lines before the first header and `\ No newline` lines
+## are skipped.
+pub fn parse_diff(out str) List[hunks.Hunk]
+    mut res := List[hunks.Hunk]()
+    mut open := false
+    mut o := (0, 0)
+    mut w := (0, 0)
+    mut rem := List[str]()
+    mut add := List[str]()
+    for l in out.split("\n")
+        if l.starts_with("@@ ")
+            if open
+                res.push(hunk_of(o, w, rem, add))
+            ranges := l.split(" ")
+            if ranges.len() < 3
+                open = false
+                continue
+            o = range_of(ranges[1])
+            w = range_of(ranges[2])
+            rem = List[str]()
+            add = List[str]()
+            open = true
+            continue
+        if not open
+            continue
+        if l.starts_with("-") and rem.len() < o.1
+            rem.push(l.slice(1, l.len()))
+        elif l.starts_with("+") and add.len() < w.1
+            add.push(l.slice(1, l.len()))
+    if open
+        res.push(hunk_of(o, w, rem, add))
+    res
+
+# ---- Blame --------------------------------------------------------------------
+
+## One line of the file as blame tells it: its 1-based `line`, the commit
+## (`sha`, `short` of 7), the author, the author time in seconds since
+## 1970, the commit's subject, and the line's text.
+pub struct BlameLine
+    pub line int
+    pub sha str
+    pub short str
+    pub author str
+    pub time int
+    pub summary str
+    pub text str
+
+struct Info
+    author str
+    time int
+    summary str
+
+fn is_sha(s str) bool
+    if s.len() < 40
+        return false
+    for c in s.chars()
+        if not HEX.contains(c)
+            return false
+    true
+
+## Reads `blame --porcelain` output. Each line comes as a header (`SHA
+## ORIG FINAL [COUNT]`), the commit's `author`, `author-time`, `summary`
+## and other key lines the first time that commit appears only, then the
+## text after a tab. Later lines of a known commit take its details from
+## its first appearance.
+pub fn parse_blame(out str) List[BlameLine]
+    mut res := List[BlameLine]()
+    mut known := Map[str, int]()
+    mut infos := List[Info]()
+    mut sha := ""
+    mut at := -1
+    mut final_no := 0
+    for l in out.split("\n")
+        if l.starts_with("\t")
+            mut who := Info(author: "", time: 0, summary: "")
+            if at >= 0
+                who = infos[at]
+            res.push(BlameLine(
+                line: final_no,
+                sha: sha,
+                short: sha.slice(0, sha.len().min(7)),
+                author: who.author,
+                time: who.time,
+                summary: who.summary,
+                text: l.slice(1, l.len()),
+            ))
+            continue
+        sp := l.find(" ") else continue
+        head := l.slice(0, sp)
+        val := l.slice(sp + 1, l.len())
+        if is_sha(head)
+            sha = head
+            nums := val.split(" ")
+            if nums.len() >= 2
+                final_no = nums[1].to_int() else 0
+            if k := known.get(sha)
+                at = k
+            else
+                infos.push(Info(author: "", time: 0, summary: ""))
+                at = infos.len() - 1
+                known[sha] = at
+            continue
+        if at < 0
+            continue
+        if head == "author"
+            infos[at].author = val
+        elif head == "author-time"
+            infos[at].time = val.to_int() else 0
+        elif head == "summary"
+            infos[at].summary = val
+    res
+
+fn count_of(n int, unit str) str
+    if n == 1
+        return "1 {unit} ago"
+    "{n} {unit}s ago"
+
+## How long ago `seconds` is, in the largest whole unit: `just now`,
+## `5 minutes ago`, `1 hour ago`, `3 days ago`, `2 months ago` (30 days),
+## `1 year ago` (365 days). A negative span is `just now`.
+pub fn ago(seconds int) str
+    if seconds < MINUTE
+        return "just now"
+    if seconds < HOUR
+        return count_of(seconds / MINUTE, "minute")
+    if seconds < DAY
+        return count_of(seconds / HOUR, "hour")
+    if seconds < MONTH
+        return count_of(seconds / DAY, "day")
+    if seconds < YEAR
+        return count_of(seconds / MONTH, "month")
+    count_of(seconds / YEAR, "year")
+
+## The note blame draws after a line: `kaleb, 3 days ago: Fix caret blink`,
+## or `not committed yet` for a line only in the work tree.
+pub fn blame_note(b BlameLine, now_seconds int) str
+    if b.sha.starts_with("0000000")
+        return "not committed yet"
+    "{b.author}, {ago(now_seconds - b.time)}: {b.summary}"
+
+# ---- Conflict markers ---------------------------------------------------------
+
+## One conflict in a file, by 0-based line: `start` is `<<<<<<<`, `base`
+## is `|||||||` (-1 without diff3 style), `middle` is `=======`, `end` is
+## `>>>>>>>`. Ours is `ours_start..ours_start + ours_count`, theirs
+## `theirs_start..theirs_start + theirs_count`; the base lines are neither.
+pub struct Conflict
+    pub start int
+    pub base int
+    pub middle int
+    pub end int
+    pub ours_start int
+    pub ours_count int
+    pub theirs_start int
+    pub theirs_count int
+
+fn is_marker(l str, m str) bool
+    l == m or l.starts_with("{m} ")
+
+## The conflicts in `lines`, in order. A `<<<<<<<` inside an open conflict
+## starts again from it; an unclosed conflict at the end is left out.
+pub fn parse_conflict_markers(lines List[str]) List[Conflict]
+    mut res := List[Conflict]()
+    mut start := -1
+    mut base := -1
+    mut middle := -1
+    for i in 0..lines.len()
+        l := lines[i]
+        if is_marker(l, "<<<<<<<")
+            start = i
+            base = -1
+            middle = -1
+        elif start < 0
+            continue
+        elif is_marker(l, "|||||||") and middle < 0 and base < 0
+            base = i
+        elif is_marker(l, "=======") and middle < 0
+            middle = i
+        elif is_marker(l, ">>>>>>>") and middle >= 0
+            ours_end := if base >= 0 then base else middle
+            res.push(Conflict(
+                start: start,
+                base: base,
+                middle: middle,
+                end: i,
+                ours_start: start + 1,
+                ours_count: ours_end - start - 1,
+                theirs_start: middle + 1,
+                theirs_count: i - middle - 1,
+            ))
+            start = -1
+    res
+
+fn replaced(lines List[str], c Conflict, with_lines List[str]) List[str]
+    mut out := lines[..c.start]
+    out.extend(with_lines)
+    out.extend(lines[c.end + 1..])
+    out
+
+fn ours_of(lines List[str], c Conflict) List[str]
+    lines[c.ours_start..c.ours_start + c.ours_count]
+
+fn theirs_of(lines List[str], c Conflict) List[str]
+    lines[c.theirs_start..c.theirs_start + c.theirs_count]
+
+## The lines with conflict `c` replaced by our side. Later conflicts move:
+## parse the result again before taking another.
+pub fn take_ours(lines List[str], c Conflict) List[str]
+    replaced(lines, c, ours_of(lines, c))
+
+## The lines with conflict `c` replaced by their side.
+pub fn take_theirs(lines List[str], c Conflict) List[str]
+    replaced(lines, c, theirs_of(lines, c))
+
+## The lines with conflict `c` replaced by our side, then theirs.
+pub fn take_both(lines List[str], c Conflict) List[str]
+    mut both := ours_of(lines, c)
+    both.extend(theirs_of(lines, c))
+    replaced(lines, c, both)
+
+# ---- Failures -----------------------------------------------------------------
+
+## One plain sentence for what git printed on failure (pass stderr, and
+## stdout too for `commit`, which says "nothing to commit" there): not a
+## repository, a held `index.lock`, nothing to commit, a rejected push, a
+## pull that cannot fast-forward, a merge conflict, no upstream, failed
+## authentication. Anything else is its first non-empty line.
+pub fn explain(stderr str) str
+    t := stderr.to_lower()
+    if t.contains("not a git repository")
+        return "This folder is not inside a git repository."
+    if t.contains("index.lock")
+        return "Another git command holds .git/index.lock; if none is running, delete that file."
+    if t.contains("nothing to commit") or t.contains("no changes added to commit")
+        return "There is nothing to commit: stage a change first."
+    if t.contains("non-fast-forward") or t.contains("fetch first")
+        return "The remote has commits you do not have: pull, then push again."
+    if t.contains("not possible to fast-forward")
+        return "Your branch and its upstream have both moved: merge or rebase them before pulling."
+    if t.contains("conflict") or t.contains("unmerged") or t.contains("needs merge")
+        return "There are merge conflicts: resolve them, stage the files and commit."
+    if t.contains("no upstream") or t.contains("no tracking information")
+        return "This branch has no upstream branch: push it once to set one."
+    auth := t.contains("authentication failed") or t.contains("could not read username")
+    if auth or t.contains("permission denied (publickey)")
+        return "Authentication failed: check your credentials or SSH key for the remote."
+    for l in stderr.split("\n")
+        if l.trim() != ""
+            return l.trim()
+    ""
+
+# ---- Tests --------------------------------------------------------------------
+
+## Commit and blob ids for the samples.
+SHA_A := "4f2a9c1d8e7b6a5f4e3d2c1b0a9f8e7d6c5b4a39"
+SHA_B := "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a291807"
+H1 := "3b18e512dba79e4c8300dd08aeb37f8e728b8dad"
+H2 := "7c4a8d09ca3762af61e59520943dc26494f8941b"
+H3 := "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+H4 := "d670460b4b4aece5915caf5c68d12f560a9fe3e4"
+H5 := "257cc5642cb1a054f08cc83f2d943e56fd3ebe99"
+H6 := "5716ca5987cbf97d6bb54920bea6adde242d87e6"
+H7 := "76018072e09c5d31c8c6e3113b8aa0fe625195ca"
+
+## `git status --porcelain=v2 --branch -z` in a repository with a staged
+## modification that was changed again, a staged rename, a work-tree
+## deletion, a conflict, a path with spaces and an untracked file.
+fn status_sample() str
+    recs := [
+        "# branch.oid 4f2a9c1d8e7b6a5f4e3d2c1b0a9f8e7d6c5b4a39",
+        "# branch.head main",
+        "# branch.upstream origin/main",
+        "# branch.ab +2 -1",
+        "1 MM N... 100644 100644 100644 {H1} {H2} edit.ail",
+        "2 R. N... 100644 100644 100644 {H3} {H3} R100 docs/new name.md",
+        "docs/old name.md",
+        "1 .D N... 100644 100644 000000 {H4} {H4} gone.ail",
+        "u UU N... 100644 100644 100644 100644 {H5} {H6} {H7} clash.ail",
+        "? notes.txt",
+        "! build/",
+    ]
+    "{recs.join(NUL)}{NUL}"
+
+@test fn status_v2_is_read_with_renames_conflicts_and_counts()
+    st := parse_status(status_sample())
+    assert_eq(status_args(), ["status", "--porcelain=v2", "--branch", "-z"])
+    assert_eq(st.branch, "main")
+    assert_eq(st.upstream, "origin/main")
+    assert_eq(st.ahead, 2)
+    assert_eq(st.behind, 1)
+    assert_eq(st.entries.len(), 6)
+    assert_eq(st.entries[0].index, FileState.Modified)
+    assert_eq(st.entries[0].worktree, FileState.Modified)
+    assert_eq(st.entries[1].path, "docs/new name.md")
+    assert_eq(st.entries[1].orig, "docs/old name.md")
+    assert_eq(st.entries[1].index, FileState.Renamed)
+    assert_eq(st.entries[1].worktree, FileState.Unmodified)
+    assert_eq(st.entries[2].worktree, FileState.Deleted)
+    assert_eq(st.entries[3].index, FileState.Unmerged)
+    assert_eq(st.entries[3].code, "UU")
+    assert_eq(st.entries[4].index, FileState.Untracked)
+    assert_eq(st.entries[5].index, FileState.Ignored)
+    assert_eq(changed_count(st), 5)
+    assert_eq(summary(st), "main +2 -1 *5")
+
+@test fn detached_initial_and_line_separated_status()
+    oid := "# branch.oid 4f2a9c1d8e7b6a5f4e3d2c1b0a9f8e7d6c5b4a39"
+    det := parse_status("{oid}\0# branch.head (detached)\0")
+    assert(det.detached)
+    assert_eq(summary(det), "(4f2a9c1)")
+    fresh := parse_status("# branch.oid (initial)\0# branch.head main\0? a.ail\0")
+    assert_eq(fresh.oid, "(initial)")
+    assert_eq(summary(fresh), "main *1")
+    lines := "# branch.head dev\n2 R. N... 100644 100644 100644 {H3} {H3} R90 b.ail\ta.ail\n"
+    st := parse_status(lines)
+    assert_eq(st.entries[0].path, "b.ail")
+    assert_eq(st.entries[0].orig, "a.ail")
+    assert_eq(summary(Status.empty()), "")
+
+@test fn panel_rows_have_sections_counts_and_marks()
+    st := parse_status(status_sample())
+    rows := panel_rows(st)
+    texts := [
+        "Staged (2)",
+        "M edit.ail",
+        "R docs/old name.md -> docs/new name.md",
+        "Changes (2)",
+        "M edit.ail",
+        "D gone.ail",
+        "Untracked (1)",
+        "? notes.txt",
+        "Conflicts (1)",
+        "U clash.ail",
+    ]
+    mut got := List[str]()
+    for r in rows
+        got.push(r.text)
+    assert_eq(got, texts)
+    assert_eq(rows[0].kind, RowKind.Header)
+    assert_eq(rows[1].mark, "M")
+    assert_eq(section_count(st, Section.Staged), 2)
+    assert(in_section(st.entries[0], Section.Changes))
+    assert_eq(section_name(Section.Conflicts), "Conflicts")
+    assert_eq(letter(FileState.TypeChanged), "T")
+    clean := panel_rows(Status.empty())
+    assert_eq(clean[0].text, "nothing to commit, working tree clean")
+
+@test fn the_message_box_types_moves_and_warns()
+    mut b := MessageBox.new()
+    assert(b.blank())
+    b.insert("Fix caret")
+    b.newline()
+    b.insert("body")
+    assert_eq(b.text(), "Fix caret\nbody")
+    assert(b.move_caret("Home"))
+    b.backspace()
+    assert_eq(b.text(), "Fix caretbody")
+    assert_eq(b.col, 9)
+    b.insert(" ")
+    assert(b.move_caret("Left"))
+    assert(b.move_caret("End"))
+    assert_eq(b.col, 14)
+    assert(not b.move_caret("x"))
+    assert_eq(b.warning(), "")
+    b.insert("x".repeat(60))
+    assert_eq(b.warning(), "first line is 74 characters; keep it to 72")
+    assert(not b.blank())
+
+@test fn panel_keys_give_intents_and_discard_asks_twice()
+    mut p := Panel.new()
+    assert_eq(p.sel, -1)
+    p.load(parse_status(status_sample()))
+    assert_eq(p.sel, 1)
+    assert_eq(p.key("Enter", false), Intent.OpenDiff(path: "edit.ail", staged: true))
+    assert_eq(p.key("u", false), Intent.Unstage(path: "edit.ail"))
+    assert_eq(p.key("s", false), Intent.Nothing)
+    assert_eq(p.key("j", false), Intent.Nothing)
+    assert_eq(p.key("j", false), Intent.Nothing)
+    assert_eq(p.sel, 4)
+    assert_eq(p.key("s", false), Intent.Stage(path: "edit.ail"))
+    assert_eq(p.key("Down", false), Intent.Nothing)
+    assert_eq(p.key("d", false), Intent.Nothing)
+    assert_eq(p.confirm, "gone.ail")
+    assert_eq(p.key("d", false), Intent.Discard(path: "gone.ail", untracked: false))
+    assert_eq(p.key("d", false), Intent.Nothing)
+    assert_eq(p.key("x", false), Intent.Nothing)
+    assert_eq(p.confirm, "")
+    p.step(true)
+    _ := p.key("d", false)
+    assert_eq(p.key("d", false), Intent.Discard(path: "notes.txt", untracked: true))
+    assert_eq(p.key("S", false), Intent.StageAll)
+    assert_eq(p.key("U", false), Intent.UnstageAll)
+    assert_eq(p.key("p", false), Intent.Push)
+    assert_eq(p.key("P", false), Intent.Pull)
+    assert_eq(p.key("f", false), Intent.Fetch)
+    assert_eq(p.key("r", false), Intent.Refresh)
+    assert_eq(p.key("b", false), Intent.SwitchBranch)
+    assert_eq(p.key("a", false), Intent.CommitAmend(message: ""))
+
+@test fn commit_from_the_box_and_selection_survives_a_reload()
+    mut p := Panel.new()
+    p.load(parse_status(status_sample()))
+    assert_eq(p.key("c", false), Intent.Nothing)
+    assert_eq(p.focus, Focus.Message)
+    for k in ["F", "i", "x"]
+        _ := p.key(k, false)
+    _ := p.key("Enter", false)
+    _ := p.key("y", false)
+    assert_eq(p.key("Enter", true), Intent.Commit(message: "Fix\ny"))
+    _ := p.key("Escape", false)
+    assert_eq(p.focus, Focus.Files)
+    assert_eq(p.key("c", false), Intent.Commit(message: "Fix\ny"))
+    p.committed()
+    assert(p.message.blank())
+    p.step(true)
+    p.step(true)
+    p.step(true)
+    assert_eq(p.selected()?.path, "gone.ail")
+    p.load(parse_status(status_sample()))
+    assert_eq(p.selected()?.path, "gone.ail")
+    p.load(parse_status("# branch.head main\0? notes.txt\0"))
+    assert_eq(p.selected()?.path, "notes.txt")
+    _ := p.key("Tab", false)
+    _ := p.key("m", false)
+    assert_eq(p.key("Enter", true), Intent.Nothing)
+    assert(p.note.starts_with("nothing staged"))
+
+@test fn the_panel_dumps_json()
+    mut p := Panel.new()
+    p.load(parse_status(status_sample()))
+    j := parse_json(p.json())?
+    assert_eq(j.text("branch", ""), "main")
+    assert_eq(j.text("summary", ""), "main +2 -1 *5")
+    assert_eq(j.int("ahead") else -1, 2)
+    assert_eq(j.text("selected", ""), "edit.ail")
+    assert_eq(j.text("focus", ""), "files")
+    rows := j.arr("rows") else List[Json]()
+    assert_eq(rows.len(), 10)
+    assert_eq(p.texts()[0], "Staged (2)")
+
+@test fn command_builders()
+    assert_eq(stage_args(["a.ail"]), ["add", "--", "a.ail"])
+    assert_eq(stage_all_args(), ["add", "-A"])
+    assert_eq(unstage_args(["a.ail"]), ["restore", "--staged", "--", "a.ail"])
+    assert_eq(unstage_all_args(), ["restore", "--staged", "--", ":/"])
+    assert_eq(discard_args("a.ail"), ["restore", "--", "a.ail"])
+    assert_eq(commit_args(), ["commit", "-F", "-"])
+    assert_eq(amend_args(true), ["commit", "--amend", "--no-edit"])
+    assert_eq(amend_args(false), ["commit", "--amend", "-F", "-"])
+    mut st := Status.empty()
+    st.branch = "feat"
+    assert_eq(push_args(st), ["push", "-u", "origin", "feat"])
+    st.upstream = "origin/feat"
+    assert_eq(push_args(st), ["push"])
+    assert_eq(pull_args(), ["pull", "--ff-only"])
+    assert_eq(fetch_args(), ["fetch", "--prune"])
+    assert_eq(branches_args()[0], "for-each-ref")
+    assert_eq(switch_args("dev"), ["switch", "dev"])
+    assert_eq(create_branch_args("x", ""), ["switch", "-c", "x"])
+    assert_eq(create_branch_args("x", "origin/main"), ["switch", "-c", "x", "origin/main"])
+    assert_eq(show_args("HEAD", "src/a.ail"), ["show", "HEAD:src/a.ail"])
+    assert_eq(diff_args("a.ail", true), ["diff", "--no-color", "-U0", "--cached", "--", "a.ail"])
+    assert_eq(diff_rev_args("HEAD", "a.ail"), ["diff", "--no-color", "-U0", "HEAD", "--", "a.ail"])
+    assert_eq(stash_push_args(""), ["stash", "push", "--include-untracked"])
+    assert_eq(stash_push_args("wip"), ["stash", "push", "--include-untracked", "-m", "wip"])
+    assert_eq(stash_pop_args(), ["stash", "pop"])
+    assert_eq(log_args(20, "a.ail"), ["log", LOG_FORMAT, "-n", "20", "--", "a.ail"])
+    assert_eq(log_args(0, ""), ["log", LOG_FORMAT])
+    assert_eq(blame_args("a.ail", 3, 9), ["blame", "--porcelain", "-L", "3,9", "--", "a.ail"])
+    assert_eq(blame_args("a.ail", 0, 0), ["blame", "--porcelain", "--", "a.ail"])
+    assert_eq(intent_args(Intent.Discard(path: "n.txt", untracked: true), st), List[str]())
+    assert_eq(intent_args(Intent.Stage(path: "a.ail"), st), ["add", "--", "a.ail"])
+    assert_eq(intent_args(Intent.CommitAmend(message: "m"), st), ["commit", "--amend", "-F", "-"])
+    assert_eq(intent_args(Intent.Refresh, st), status_args())
+    assert_eq(intent_args(Intent.Nothing, st), List[str]())
+
+@test fn branches_and_log_are_parsed()
+    refs := [
+        "*{US}refs/heads/main{US}main{US}origin/main{US}4f2a9c1{US}Fix caret blink",
+        " {US}refs/heads/dev{US}dev{US}{US}9e8d7c6{US}Try wrap",
+        " {US}refs/remotes/origin/HEAD{US}origin{US}{US}4f2a9c1{US}Fix caret blink",
+        " {US}refs/remotes/origin/feat{US}origin/feat{US}{US}1a2b3c4{US}Add blame",
+    ]
+    bs := parse_branches(refs.join("\n"))
+    assert_eq(bs.len(), 3)
+    assert(bs[0].current)
+    assert_eq(bs[0].upstream, "origin/main")
+    assert(not bs[1].current)
+    assert_eq(bs[1].upstream, "")
+    assert(bs[2].remote)
+    assert_eq(bs[2].local_name(), "feat")
+    assert_eq(bs[1].local_name(), "dev")
+    lg := [
+        "{SHA_A}{US}4f2a9c1{US}kaleb{US}3 days ago{US}Fix caret blink",
+        "{SHA_B}{US}9e8d7c6{US}Ann Lee{US}2 weeks ago{US}Wrap: keep a{US}b",
+    ]
+    es := parse_log(lg.join("\n"))
+    assert_eq(es.len(), 2)
+    assert_eq(es[0].short, "4f2a9c1")
+    assert_eq(es[0].date, "3 days ago")
+    assert_eq(es[1].author, "Ann Lee")
+    assert_eq(es[1].subject, "Wrap: keep a{US}b")
+    assert_eq(parse_log("").len(), 0)
+
+@test fn zero_context_diffs_become_hunks()
+    out := [
+        "diff --git a/a.ail b/a.ail",
+        "index 3b18e51..7c4a8d0 100644",
+        "--- a/a.ail",
+        "+++ b/a.ail",
+        "@@ -2 +2,2 @@ fn main()",
+        "-    print(1)",
+        "+    print(2)",
+        "+    print(3)",
+        "@@ -5,0 +7 @@",
+        "+# end",
+        "@@ -9,2 +10,0 @@",
+        "-a",
+        "--- not a header",
+        "\\ No newline at end of file",
+    ]
+    hs := parse_diff(out.join("\n"))
+    assert_eq(hs.len(), 3)
+    assert_eq(hs[0].old_start, 1)
+    assert_eq(hs[0].old_count, 1)
+    assert_eq(hs[0].new_start, 1)
+    assert_eq(hs[0].new_count, 2)
+    assert_eq(hs[0].added, ["    print(2)", "    print(3)"])
+    assert_eq(hs[1].old_start, 5)
+    assert_eq(hs[1].old_count, 0)
+    assert_eq(hs[1].new_start, 6)
+    assert_eq(hs[2].old_start, 8)
+    assert_eq(hs[2].new_start, 10)
+    assert_eq(hs[2].removed, ["a", "-- not a header"])
+    old := ["a", "b", "c"]
+    new := ["a", "B", "c", "d"]
+    assert_eq(parse_diff("@@ -2 +2 @@\n-b\n+B\n@@ -3,0 +4 @@\n+d\n"), hunks.diff(old, new))
+
+## `git blame --porcelain` over three lines: two from one commit (shown in
+## full once, then a bare header), one not committed yet.
+fn blame_sample() str
+    ls := [
+        "4f2a9c1d8e7b6a5f4e3d2c1b0a9f8e7d6c5b4a39 1 1 2",
+        "author kaleb",
+        "author-mail <kaleb@example.com>",
+        "author-time 1762000000",
+        "author-tz -0600",
+        "committer kaleb",
+        "committer-mail <kaleb@example.com>",
+        "committer-time 1762000000",
+        "committer-tz -0600",
+        "summary Fix caret blink",
+        "previous 9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a291807 edit.ail",
+        "filename edit.ail",
+        "\tfn main()",
+        "4f2a9c1d8e7b6a5f4e3d2c1b0a9f8e7d6c5b4a39 2 2",
+        "\t    blink()",
+        "0000000000000000000000000000000000000000 3 3 1",
+        "author Not Committed Yet",
+        "author-mail <not.committed.yet>",
+        "author-time 1763000000",
+        "author-tz +0000",
+        "committer Not Committed Yet",
+        "committer-mail <not.committed.yet>",
+        "committer-time 1763000000",
+        "committer-tz +0000",
+        "summary Version of edit.ail from edit.ail",
+        "filename edit.ail",
+        "\t    draw()",
+        "4f2a9c1d8e7b6a5f4e3d2c1b0a9f8e7d6c5b4a39 3 4 1",
+        "filename edit.ail",
+        "\t# end",
+    ]
+    ls.join("\n")
+
+@test fn blame_porcelain_is_read_with_repeated_commits()
+    bl := parse_blame(blame_sample())
+    assert_eq(bl.len(), 4)
+    assert_eq(bl[0].line, 1)
+    assert_eq(bl[0].short, "4f2a9c1")
+    assert_eq(bl[0].author, "kaleb")
+    assert_eq(bl[0].summary, "Fix caret blink")
+    assert_eq(bl[0].text, "fn main()")
+    assert_eq(bl[1].author, "kaleb")
+    assert_eq(bl[1].time, bl[0].time)
+    assert_eq(bl[1].text, "    blink()")
+    assert_eq(bl[2].author, "Not Committed Yet")
+    assert_eq(bl[3].line, 4)
+    assert_eq(bl[3].summary, "Fix caret blink")
+    t := bl[0].time
+    assert_eq(blame_note(bl[0], t + 3 * DAY + 5), "kaleb, 3 days ago: Fix caret blink")
+    assert_eq(blame_note(bl[2], t), "not committed yet")
+    assert_eq(ago(-5), "just now")
+    assert_eq(ago(59), "just now")
+    assert_eq(ago(60), "1 minute ago")
+    assert_eq(ago(2 * HOUR), "2 hours ago")
+    assert_eq(ago(45 * DAY), "1 month ago")
+    assert_eq(ago(800 * DAY), "2 years ago")
+
+@test fn conflict_markers_and_taking_a_side()
+    ls := [
+        "a",
+        "<<<<<<< HEAD",
+        "ours 1",
+        "ours 2",
+        "||||||| base",
+        "base",
+        "=======",
+        "theirs",
+        ">>>>>>> feature",
+        "b",
+        "<<<<<<< HEAD",
+        "x",
+        "=======",
+        ">>>>>>> feature",
+    ]
+    cs := parse_conflict_markers(ls)
+    assert_eq(cs.len(), 2)
+    assert_eq(cs[0].start, 1)
+    assert_eq(cs[0].base, 4)
+    assert_eq(cs[0].middle, 6)
+    assert_eq(cs[0].end, 8)
+    assert_eq(cs[0].ours_count, 2)
+    assert_eq(cs[0].theirs_start, 7)
+    assert_eq(cs[0].theirs_count, 1)
+    assert_eq(cs[1].base, -1)
+    assert_eq(cs[1].theirs_count, 0)
+    ours := take_ours(ls, cs[0])
+    assert_eq(ours[..4], ["a", "ours 1", "ours 2", "b"])
+    theirs := take_theirs(ls, cs[0])
+    assert_eq(theirs[..3], ["a", "theirs", "b"])
+    both := take_both(ls, cs[0])
+    assert_eq(both[..5], ["a", "ours 1", "ours 2", "theirs", "b"])
+    assert_eq(take_theirs(ls, cs[1]), ls[..10])
+    assert_eq(parse_conflict_markers(["<<<<<<< HEAD", "x", "======="]).len(), 0)
+    assert_eq(parse_conflict_markers(["<<<<<<<< not", "======== no"]).len(), 0)
+
+fn says(stderr str, start str) bool
+    explain(stderr).starts_with(start)
+
+@test fn failures_are_explained_in_one_sentence()
+    repo := "fatal: not a git repository (or any of the parent directories): .git\n"
+    assert_eq(explain(repo), "This folder is not inside a git repository.")
+    lock := "fatal: Unable to create '/r/.git/index.lock': File exists.\n\nAnother git process"
+    assert(explain(lock).contains("index.lock"))
+    assert(says("On branch main\nnothing to commit, working tree clean\n", "There is nothing"))
+    rejected := " ! [rejected]        main -> main (non-fast-forward)\nerror: failed to push\n"
+    assert(says(rejected, "The remote has commits"))
+    assert(says(" ! [rejected]        main -> main (fetch first)\n", "The remote has commits"))
+    assert(says("fatal: Not possible to fast-forward, aborting.\n", "Your branch"))
+    conflict := "CONFLICT (content): Merge conflict in a.ail\nAutomatic merge failed\n"
+    assert(says(conflict, "There are merge conflicts"))
+    up := "fatal: The current branch feat has no upstream branch.\n"
+    assert(says(up, "This branch has no upstream"))
+    assert(says("There is no tracking information for the current branch.\n", "This branch"))
+    auth := "remote: Invalid username or password.\nfatal: Authentication failed for 'h/r'\n"
+    assert(says(auth, "Authentication failed"))
+    assert(says("git@example.com: Permission denied (publickey).\n", "Authentication"))
+    other := "\nerror: pathspec 'x' did not match any file(s) known to git\nmore\n"
+    assert_eq(explain(other), "error: pathspec 'x' did not match any file(s) known to git")
+    assert_eq(explain(""), "")
