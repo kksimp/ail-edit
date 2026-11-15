@@ -1,0 +1,941 @@
+## A pure terminal emulator (parity plan D6, lane W2): text from a child
+## process goes in through `Term.feed`, a grid of coloured cells comes out.
+## It first shows command output with colour (fed line by line from pipes)
+## and later backs a terminal panel when ail has a pty. Rows and columns
+## are 0-based. A character takes one cell (wide characters are not
+## doubled), and `feed` takes decoded text, so a character is never split.
+
+## A colour is -1 (the default), 0..255 (a palette index), or `RGB` plus
+## 0xRRGGBB (true colour); `to_rgb` turns any of them into 0xRRGGBB.
+RGB := 16777216
+
+S_GROUND := 0
+S_ESC := 1
+S_CSI := 2
+S_OSC := 3
+S_OSC_ESC := 4
+S_CHARSET := 5
+S_STR := 6
+S_STR_ESC := 7
+
+## One cell of the grid: its character, colours and flags.
+pub struct Cell
+    pub ch char
+    pub fg int
+    pub bg int
+    pub bold bool
+    pub underline bool
+    pub reverse bool
+
+## Cells side by side with the same look, for one draw call each. `reverse`
+## is left to the drawer, which swaps `fg` and `bg`.
+pub struct Run
+    pub col int
+    pub text str
+    pub fg int
+    pub bg int
+    pub bold bool
+    pub underline bool
+    pub reverse bool
+
+## The terminal. `cells` is the visible grid, row by row (`rows * cols`);
+## `line` and `col` are the cursor; `pen` holds the attributes the next
+## character is written with. `top` and `bottom` are the scroll region
+## (inclusive). On the alternate screen `main_cells` keeps the main grid.
+## `history` is the scrollback, oldest first, at most `limit` rows. `lf_cr`
+## makes LF also return to column 0, as a pty's output translation does;
+## a panel over a real pty sets it false. `mode` and `buf` are the parser
+## state, kept between `feed` calls so a sequence may arrive in pieces.
+pub struct Term
+    pub cols int
+    pub rows int
+    pub cells List[Cell]
+    pub line int
+    pub col int
+    pub pen Cell
+    pub saved_line int
+    pub saved_col int
+    pub saved_pen Cell
+    pub top int
+    pub bottom int
+    pub alt bool
+    pub main_cells List[Cell]
+    pub history List[List[Cell]]
+    pub limit int
+    pub title str
+    pub cursor_visible bool
+    pub autowrap bool
+    pub lf_cr bool
+    pub wrap_next bool
+    pub mode int
+    pub buf List[char]
+
+fn clamp(v int, lo int, hi int) int
+    v.max(lo).min(hi)
+
+fn plain() Cell
+    Cell(ch: ' ', fg: -1, bg: -1, bold: false, underline: false, reverse: false)
+
+fn blank_cell(bg int) Cell
+    Cell(ch: ' ', fg: -1, bg: bg, bold: false, underline: false, reverse: false)
+
+fn blank_grid(n int) List[Cell]
+    mut out := List[Cell]()
+    for _ in 0..n
+        out.push(plain())
+    out
+
+## A terminal of `cols` by `rows` cells keeping at most `scrollback` rows
+## that scrolled off the top.
+pub fn Term.new(cols int, rows int, scrollback int) Term
+    c := clamp(cols, 1, 1000)
+    r := clamp(rows, 1, 1000)
+    Term(
+        cols: c,
+        rows: r,
+        cells: blank_grid(c * r),
+        line: 0,
+        col: 0,
+        pen: plain(),
+        saved_line: 0,
+        saved_col: 0,
+        saved_pen: plain(),
+        top: 0,
+        bottom: r - 1,
+        alt: false,
+        main_cells: [],
+        history: [],
+        limit: scrollback.max(0),
+        title: "",
+        cursor_visible: true,
+        autowrap: true,
+        lf_cr: true,
+        wrap_next: false,
+        mode: S_GROUND,
+        buf: [],
+    )
+
+## Runs `text` through the terminal: prints characters, moves the cursor and
+## applies the control and escape sequences. Unknown sequences are consumed
+## and dropped, never printed.
+pub fn Term.feed(mut self, text str)
+    for c in text.chars()
+        self.step(c)
+
+fn Term.step(mut self, c char)
+    n := c.code()
+    m := self.mode
+    if m == S_GROUND
+        if n == 27
+            self.mode = S_ESC
+        elif n < 32 or n == 127
+            self.control(n)
+        elif n < 128 or n >= 160
+            self.put_char(c)
+    elif m == S_ESC
+        self.escape(c)
+    elif m == S_CSI
+        if n >= 64 and n <= 126
+            self.mode = S_GROUND
+            self.csi(n)
+            self.buf.clear()
+        elif n == 27
+            self.buf.clear()
+            self.mode = S_ESC
+        elif n == 24 or n == 26 or n >= 127
+            self.buf.clear()
+            self.mode = S_GROUND
+        elif n < 32
+            self.control(n)
+        elif self.buf.len() < 64
+            self.buf.push(c)
+    elif m == S_OSC
+        if n == 7
+            self.osc_done()
+            self.mode = S_GROUND
+        elif n == 27
+            self.mode = S_OSC_ESC
+        elif n == 24 or n == 26
+            self.buf.clear()
+            self.mode = S_GROUND
+        elif self.buf.len() < 4096
+            self.buf.push(c)
+    elif m == S_OSC_ESC
+        self.osc_done()
+        self.mode = S_GROUND
+        if n != 92
+            self.escape(c)
+    elif m == S_CHARSET
+        self.mode = S_GROUND
+    elif m == S_STR
+        if n == 7 or n == 24 or n == 26
+            self.mode = S_GROUND
+        elif n == 27
+            self.mode = S_STR_ESC
+    else
+        self.mode = S_GROUND
+        if n != 92
+            self.escape(c)
+
+## The parser state after ESC and the character with code `n`.
+fn esc_mode(n int) int
+    if n == 91
+        return S_CSI
+    if n == 93
+        return S_OSC
+    if n == 80 or n == 88 or n == 94 or n == 95
+        return S_STR
+    if n >= 32 and n <= 47
+        return S_CHARSET
+    if n == 27
+        return S_ESC
+    S_GROUND
+
+fn Term.escape(mut self, c char)
+    n := c.code()
+    self.buf.clear()
+    self.mode = esc_mode(n)
+    if self.mode != S_GROUND
+        return
+    if n < 32
+        self.control(n)
+        self.mode = S_ESC
+    elif n == 55
+        self.save_cursor()
+    elif n == 56
+        self.restore_cursor()
+    elif n == 68
+        self.linefeed()
+    elif n == 69
+        self.col = 0
+        self.linefeed()
+    elif n == 77
+        self.reverse_index()
+    elif n == 99
+        self.reset()
+
+fn Term.control(mut self, n int)
+    if n == 8
+        self.col = (self.col - 1).max(0)
+        self.wrap_next = false
+    elif n == 9
+        self.col = ((self.col / 8 + 1) * 8).min(self.cols - 1)
+        self.wrap_next = false
+    elif n == 10 or n == 11 or n == 12
+        if self.lf_cr
+            self.col = 0
+        self.linefeed()
+    elif n == 13
+        self.col = 0
+        self.wrap_next = false
+
+fn Term.put_char(mut self, c char)
+    if self.wrap_next and self.autowrap
+        self.col = 0
+        self.linefeed()
+    self.wrap_next = false
+    mut cell := self.pen
+    cell.ch = c
+    self.cells[self.line * self.cols + self.col] = cell
+    if self.col == self.cols - 1
+        self.wrap_next = true
+    else
+        self.col += 1
+
+fn Term.linefeed(mut self)
+    self.wrap_next = false
+    if self.line == self.bottom
+        self.shift_up(self.top, 1, true)
+    elif self.line < self.rows - 1
+        self.line += 1
+
+fn Term.reverse_index(mut self)
+    self.wrap_next = false
+    if self.line == self.top
+        self.shift_down(self.top, 1)
+    elif self.line > 0
+        self.line -= 1
+
+fn Term.reset(mut self)
+    self.cells = blank_grid(self.cols * self.rows)
+    self.line = 0
+    self.col = 0
+    self.pen = plain()
+    self.saved_line = 0
+    self.saved_col = 0
+    self.saved_pen = plain()
+    self.top = 0
+    self.bottom = self.rows - 1
+    self.alt = false
+    self.main_cells = []
+    self.title = ""
+    self.cursor_visible = true
+    self.autowrap = true
+    self.wrap_next = false
+
+fn Term.save_cursor(mut self)
+    self.saved_line = self.line
+    self.saved_col = self.col
+    self.saved_pen = self.pen
+
+fn Term.restore_cursor(mut self)
+    self.line = self.saved_line.min(self.rows - 1)
+    self.col = self.saved_col.min(self.cols - 1)
+    self.pen = self.saved_pen
+    self.wrap_next = false
+
+fn Term.push_history(mut self, row List[Cell])
+    if self.limit == 0
+        return
+    self.history.push(row)
+    if self.history.len() > self.limit
+        self.history = self.history[self.history.len() - self.limit..]
+
+fn Term.copy_row(mut self, src int, dst int)
+    for c in 0..self.cols
+        self.cells[dst * self.cols + c] = self.cells[src * self.cols + c]
+
+## Blanks the flat cell indexes `a` up to `b`, with the pen's background.
+fn Term.clear_span(mut self, a int, b int)
+    for i in a..b
+        self.cells[i] = blank_cell(self.pen.bg)
+
+fn Term.clear_row(mut self, r int)
+    self.clear_span(r * self.cols, (r + 1) * self.cols)
+
+## Moves rows `first..=bottom` up by `n`, blanking the rows freed at the
+## bottom. With `keep`, rows leaving the top of the screen go to scrollback.
+fn Term.shift_up(mut self, first int, n int, keep bool)
+    bot := self.bottom
+    if first > bot
+        return
+    k := n.min(bot - first + 1)
+    if keep and first == 0 and not self.alt
+        for r1 in 0..k
+            self.push_history(self.row_cells(r1))
+    for r2 in first..bot + 1 - k
+        self.copy_row(r2 + k, r2)
+    for r3 in bot + 1 - k..bot + 1
+        self.clear_row(r3)
+
+## Moves rows `first..=bottom` down by `n`, blanking the rows freed at `first`.
+fn Term.shift_down(mut self, first int, n int)
+    bot := self.bottom
+    if first > bot
+        return
+    k := n.min(bot - first + 1)
+    mut r := bot
+    while r >= first + k
+        self.copy_row(r - k, r)
+        r -= 1
+    for q in first..first + k
+        self.clear_row(q)
+
+## The numbers of a CSI parameter string; an empty one reads as 0. A `:`
+## counts as `;` (so the colour-space form `38:2::r:g:b` is not read).
+fn params(body str) List[int]
+    mut out := List[int]()
+    if body == ""
+        return out
+    for p in body.replace(":", ";").split(";")
+        out.push(clamp(p.to_int() else 0, 0, 65535))
+    out
+
+## Parameter `i`, or `d` when it is missing or 0.
+fn arg(ps List[int], i int, d int) int
+    if i < ps.len() and ps[i] > 0 then ps[i] else d
+
+fn Term.csi(mut self, f int)
+    raw := self.buf.join("")
+    mut private := false
+    mut body := raw
+    if raw.starts_with("?")
+        private = true
+        body = raw.slice(1, raw.len())
+    elif raw.starts_with(">") or raw.starts_with("<") or raw.starts_with("=")
+        return
+    for ch in body.chars()
+        if ch.code() < 48
+            return
+    ps := params(body)
+    if private
+        if f == 104
+            self.set_modes(ps, true)
+        elif f == 108
+            self.set_modes(ps, false)
+        return
+    if f == 109
+        self.sgr(ps)
+        return
+    self.wrap_next = false
+    n := arg(ps, 0, 1)
+    first := if ps.len() > 0 then ps[0] else 0
+    if f == 65 or f == 70
+        lo := if self.line >= self.top then self.top else 0
+        self.line = (self.line - n).max(lo)
+        if f == 70
+            self.col = 0
+    elif f == 66 or f == 69
+        hi := if self.line <= self.bottom then self.bottom else self.rows - 1
+        self.line = (self.line + n).min(hi)
+        if f == 69
+            self.col = 0
+    elif f == 67
+        self.col = (self.col + n).min(self.cols - 1)
+    elif f == 68
+        self.col = (self.col - n).max(0)
+    elif f == 71 or f == 96
+        self.col = clamp(n - 1, 0, self.cols - 1)
+    elif f == 72 or f == 102
+        self.line = clamp(n - 1, 0, self.rows - 1)
+        self.col = clamp(arg(ps, 1, 1) - 1, 0, self.cols - 1)
+    elif f == 100
+        self.line = clamp(n - 1, 0, self.rows - 1)
+    elif f == 74
+        self.erase_display(first)
+    elif f == 75
+        self.erase_line(first)
+    elif f == 76
+        if self.line >= self.top and self.line <= self.bottom
+            self.shift_down(self.line, n)
+            self.col = 0
+    elif f == 77
+        if self.line >= self.top and self.line <= self.bottom
+            self.shift_up(self.line, n, false)
+            self.col = 0
+    elif f == 64
+        self.insert_chars(n)
+    elif f == 80
+        self.delete_chars(n)
+    elif f == 88
+        at := self.line * self.cols + self.col
+        self.clear_span(at, at + n.min(self.cols - self.col))
+    elif f == 83
+        self.shift_up(self.top, n, false)
+    elif f == 84
+        self.shift_down(self.top, n)
+    elif f == 114
+        t := arg(ps, 0, 1) - 1
+        b := arg(ps, 1, self.rows).min(self.rows) - 1
+        if t < b
+            self.top = t
+            self.bottom = b
+            self.line = 0
+            self.col = 0
+    elif f == 115
+        self.save_cursor()
+    elif f == 117
+        self.restore_cursor()
+
+fn Term.erase_display(mut self, how int)
+    at := self.line * self.cols + self.col
+    total := self.cols * self.rows
+    if how == 0
+        self.clear_span(at, total)
+    elif how == 1
+        self.clear_span(0, at + 1)
+    elif how == 2
+        self.clear_span(0, total)
+    elif how == 3
+        self.history = []
+
+fn Term.erase_line(mut self, how int)
+    at := self.line * self.cols + self.col
+    start := self.line * self.cols
+    if how == 0
+        self.clear_span(at, start + self.cols)
+    elif how == 1
+        self.clear_span(start, at + 1)
+    elif how == 2
+        self.clear_span(start, start + self.cols)
+
+fn Term.insert_chars(mut self, n int)
+    start := self.line * self.cols
+    k := n.min(self.cols - self.col)
+    mut c := self.cols - 1
+    while c >= self.col + k
+        self.cells[start + c] = self.cells[start + c - k]
+        c -= 1
+    self.clear_span(start + self.col, start + self.col + k)
+
+fn Term.delete_chars(mut self, n int)
+    start := self.line * self.cols
+    k := n.min(self.cols - self.col)
+    for c in self.col..self.cols - k
+        self.cells[start + c] = self.cells[start + c + k]
+    self.clear_span(start + self.cols - k, start + self.cols)
+
+## The colour at `ps[i]` onwards after a 38 or 48: `5;n` or `2;r;g;b`.
+## Gives the colour (or -2 when malformed) and how many parameters it used.
+fn ext_colour(ps List[int], i int) List[int]
+    if i + 2 < ps.len() and ps[i + 1] == 5
+        return [ps[i + 2].min(255), 2]
+    if i + 4 < ps.len() and ps[i + 1] == 2
+        r := ps[i + 2].min(255)
+        g := ps[i + 3].min(255)
+        b := ps[i + 4].min(255)
+        return [RGB + r * 65536 + g * 256 + b, 4]
+    [-2, ps.len()]
+
+fn Term.sgr(mut self, ps List[int])
+    if ps.len() == 0
+        self.pen = plain()
+        return
+    mut i := 0
+    while i < ps.len()
+        p := ps[i]
+        if p == 0
+            self.pen = plain()
+        elif p == 1
+            self.pen.bold = true
+        elif p == 4
+            self.pen.underline = true
+        elif p == 7
+            self.pen.reverse = true
+        elif p == 22
+            self.pen.bold = false
+        elif p == 24
+            self.pen.underline = false
+        elif p == 27
+            self.pen.reverse = false
+        elif p >= 30 and p <= 37
+            self.pen.fg = p - 30
+        elif p == 39
+            self.pen.fg = -1
+        elif p >= 40 and p <= 47
+            self.pen.bg = p - 40
+        elif p == 49
+            self.pen.bg = -1
+        elif p >= 90 and p <= 97
+            self.pen.fg = p - 82
+        elif p >= 100 and p <= 107
+            self.pen.bg = p - 92
+        elif p == 38 or p == 48
+            got := ext_colour(ps, i)
+            if got[0] >= -1
+                if p == 38
+                    self.pen.fg = got[0]
+                else
+                    self.pen.bg = got[0]
+            i += got[1]
+        i += 1
+
+fn Term.set_modes(mut self, ps List[int], on bool)
+    for p in ps
+        if p == 25
+            self.cursor_visible = on
+        elif p == 7
+            self.autowrap = on
+            self.wrap_next = false
+        elif p == 1049
+            if on
+                self.save_cursor()
+                self.enter_alt()
+            else
+                self.leave_alt()
+                self.restore_cursor()
+        elif p == 47 or p == 1047
+            if on
+                self.enter_alt()
+            else
+                self.leave_alt()
+        elif p == 1048
+            if on
+                self.save_cursor()
+            else
+                self.restore_cursor()
+
+fn Term.enter_alt(mut self)
+    if self.alt
+        return
+    self.main_cells = self.cells
+    self.cells = blank_grid(self.cols * self.rows)
+    self.alt = true
+    self.wrap_next = false
+
+fn Term.leave_alt(mut self)
+    if not self.alt
+        return
+    self.cells = self.main_cells
+    self.main_cells = []
+    self.alt = false
+    self.wrap_next = false
+
+fn Term.osc_done(mut self)
+    text := self.buf.join("")
+    self.buf.clear()
+    k := text.find(";") else return
+    code := text.slice(0, k).to_int() else return
+    if code == 0 or code == 2
+        self.title = text.slice(k + 1, text.len())
+
+## `old`, a grid of `oc` by `orows` cells, as `nc` by `nr` cells starting
+## at its row `skip`: cut at the right and bottom, padded with blanks.
+fn regrid(old List[Cell], oc int, orows int, nc int, nr int, skip int) List[Cell]
+    mut out := List[Cell]()
+    for r in 0..nr
+        src := r + skip
+        for c in 0..nc
+            if src < orows and c < oc
+                out.push(old[src * oc + c])
+            else
+                out.push(plain())
+    out
+
+## Changes the size to `ncols` by `nrows`. Content keeps its place from the
+## top left; when the cursor row would fall off the bottom, rows leave the
+## top (to scrollback on the main screen) so it stays visible. Lines are
+## cut, not rewrapped. The scroll region resets to the whole screen.
+pub fn Term.resize(mut self, ncols int, nrows int)
+    nc := clamp(ncols, 1, 1000)
+    nr := clamp(nrows, 1, 1000)
+    if nc == self.cols and nr == self.rows
+        return
+    mut skip := 0
+    if self.line >= nr
+        skip = self.line - nr + 1
+    if not self.alt
+        for r in 0..skip
+            self.push_history(self.row_cells(r))
+    self.cells = regrid(self.cells, self.cols, self.rows, nc, nr, skip)
+    if self.alt
+        self.main_cells = regrid(self.main_cells, self.cols, self.rows, nc, nr, 0)
+    self.line = (self.line - skip).min(nr - 1)
+    self.col = self.col.min(nc - 1)
+    self.saved_line = self.saved_line.min(nr - 1)
+    self.saved_col = self.saved_col.min(nc - 1)
+    self.cols = nc
+    self.rows = nr
+    self.top = 0
+    self.bottom = nr - 1
+    self.wrap_next = false
+
+## The cells of visible row `r`, or an empty list out of range.
+pub fn Term.row_cells(self, r int) List[Cell]
+    if r < 0 or r >= self.rows
+        return List[Cell]()
+    a := r * self.cols
+    b := a + self.cols
+    self.cells[a..b]
+
+## The characters of `cells`, without trailing blanks.
+pub fn cells_text(cells List[Cell]) str
+    mut cs := List[char]()
+    for cell in cells
+        cs.push(cell.ch)
+    cs.join("").trim_end()
+
+## The text of visible row `r`, without trailing blanks.
+pub fn Term.row_text(self, r int) str
+    cells_text(self.row_cells(r))
+
+## How many rows the scrollback holds.
+pub fn Term.scrollback_len(self) int
+    self.history.len()
+
+## The cells of scrollback row `i` (0 is the oldest), or an empty list.
+pub fn Term.scrollback_cells(self, i int) List[Cell]
+    if i < 0 or i >= self.history.len()
+        return List[Cell]()
+    self.history[i]
+
+## The text of scrollback row `i` (0 is the oldest), without trailing blanks.
+pub fn Term.scrollback_text(self, i int) str
+    cells_text(self.scrollback_cells(i))
+
+fn same_look(a Cell, b Cell) bool
+    looks := a.fg == b.fg and a.bg == b.bg and a.bold == b.bold
+    looks and a.underline == b.underline and a.reverse == b.reverse
+
+fn run_of(cell Cell, col int, text List[char]) Run
+    Run(
+        col: col,
+        text: text.join(""),
+        fg: cell.fg,
+        bg: cell.bg,
+        bold: cell.bold,
+        underline: cell.underline,
+        reverse: cell.reverse,
+    )
+
+## `cells` cut into runs of equal look, left to right, covering every cell.
+pub fn runs_of(cells List[Cell]) List[Run]
+    mut out := List[Run]()
+    mut start := 0
+    mut text := List[char]()
+    for i in 0..cells.len()
+        if i > start and not same_look(cells[i], cells[start])
+            out.push(run_of(cells[start], start, text))
+            start = i
+            text.clear()
+        text.push(cells[i].ch)
+    if cells.len() > 0
+        out.push(run_of(cells[start], start, text))
+    out
+
+## The runs of visible row `r`, for drawing.
+pub fn Term.runs(self, r int) List[Run]
+    runs_of(self.row_cells(r))
+
+fn palette16(n int) int
+    base := [
+        0x000000, 0xCD0000, 0x00CD00, 0xCDCD00, 0x0000EE, 0xCD00CD, 0x00CDCD, 0xE5E5E5,
+        0x7F7F7F, 0xFF0000, 0x00FF00, 0xFFFF00, 0x5C5CFF, 0xFF00FF, 0x00FFFF, 0xFFFFFF,
+    ]
+    base[n]
+
+fn cube_level(i int) int
+    if i == 0 then 0 else 55 + i * 40
+
+## Colour `c` as 0xRRGGBB (xterm's palette), or `fallback` when it is -1.
+pub fn to_rgb(c int, fallback int) int
+    if c >= RGB
+        return c - RGB
+    if c < 0 or c > 255
+        return fallback
+    if c < 16
+        return palette16(c)
+    if c >= 232
+        g := 8 + (c - 232) * 10
+        return g * 65536 + g * 256 + g
+    i := c - 16
+    cube_level(i / 36) * 65536 + cube_level(i / 6 % 6) * 256 + cube_level(i % 6)
+
+## `text` with every escape sequence removed, for plain output panes. Newlines
+## and tabs stay; other control characters go.
+pub fn strip(text str) str
+    mut out := List[char]()
+    mut m := S_GROUND
+    for c in text.chars()
+        n := c.code()
+        if m == S_GROUND
+            if n == 27
+                m = S_ESC
+            elif n == 10 or n == 9
+                out.push(c)
+            elif n >= 32 and n != 127 and (n < 128 or n >= 160)
+                out.push(c)
+        elif m == S_ESC
+            m = esc_mode(n)
+        elif m == S_CSI
+            if n >= 64 and n <= 126 or n == 24 or n == 26 or n >= 127
+                m = S_GROUND
+            elif n == 27
+                m = S_ESC
+        elif m == S_OSC or m == S_STR
+            if n == 7 or n == 24 or n == 26
+                m = S_GROUND
+            elif n == 27
+                m = S_STR_ESC
+        elif m == S_CHARSET
+            m = S_GROUND
+        else
+            m = if n == 92 then S_GROUND else esc_mode(n)
+    out.join("")
+
+ESC := "\u{1b}"
+
+@test fn plain_text_wraps_at_the_right_edge()
+    mut t := Term.new(5, 3, 10)
+    t.feed("hello")
+    assert_eq(t.row_text(0), "hello")
+    assert_eq(t.col, 4)
+    assert(t.wrap_next)
+    t.feed("ab")
+    assert_eq(t.row_text(1), "ab")
+    assert_eq(t.line, 1)
+    mut u := Term.new(5, 3, 10)
+    u.feed("hello\r\nx\tz")
+    assert_eq(u.line, 1)
+    assert_eq(u.row_text(1), "x   z")
+    u.feed("\u{08}\u{08}y\u{07}")
+    assert_eq(u.row_text(1), "x y z")
+    assert_eq(u.row_cells(1).len(), 5)
+    assert_eq(u.row_cells(7).len(), 0)
+
+@test fn sgr_sets_colours_and_flags()
+    mut t := Term.new(10, 2, 0)
+    t.feed("{ESC}[31mA{ESC}[1;44mB{ESC}[0mC{ESC}[38;5;200mD{ESC}[48;2;1;2;3mE")
+    t.feed("{ESC}[94;103mF{ESC}[4;7mG{ESC}[24;27;22;39;49mH")
+    cs := t.row_cells(0)
+    assert_eq(cs[0].fg, 1)
+    assert(cs[1].bold and cs[1].bg == 4 and cs[1].fg == 1)
+    assert_eq(cs[2], Cell(ch: 'C', fg: -1, bg: -1, bold: false, underline: false, reverse: false))
+    assert_eq(cs[3].fg, 200)
+    assert_eq(cs[4].bg, RGB + 66051)
+    assert_eq(cs[5].fg, 12)
+    assert_eq(cs[5].bg, 11)
+    assert(cs[6].underline and cs[6].reverse)
+    assert(not cs[7].underline and not cs[7].reverse and cs[7].fg == -1)
+    assert_eq(t.row_text(0), "ABCDEFGH")
+
+@test fn runs_group_equal_cells()
+    mut t := Term.new(6, 1, 0)
+    t.feed("{ESC}[31mab{ESC}[1mc{ESC}[mde")
+    rs := t.runs(0)
+    assert_eq(rs.len(), 3)
+    assert_eq(rs[0].text, "ab")
+    assert_eq(rs[0].fg, 1)
+    assert_eq(rs[1].col, 2)
+    assert(rs[1].bold)
+    assert_eq(rs[2].text, "de ")
+    assert_eq(rs[2].fg, -1)
+    assert_eq(runs_of(List[Cell]()).len(), 0)
+
+@test fn colours_map_to_rgb()
+    assert_eq(to_rgb(-1, 7), 7)
+    assert_eq(to_rgb(1, 0), 0xCD0000)
+    assert_eq(to_rgb(16, 0), 0)
+    assert_eq(to_rgb(231, 0), 0xFFFFFF)
+    assert_eq(to_rgb(232, 0), 0x080808)
+    assert_eq(to_rgb(RGB + 0x123456, 0), 0x123456)
+
+@test fn cursor_addressing()
+    mut t := Term.new(10, 5, 0)
+    t.feed("{ESC}[2;3HX{ESC}[3dY{ESC}[GZ")
+    assert_eq(t.row_text(1), "  X")
+    assert_eq(t.row_text(2), "Z  Y")
+    t.feed("{ESC}[H{ESC}[2B{ESC}[4CQ{ESC}[A{ESC}[2DW")
+    assert_eq(t.row_text(1), "  XW")
+    t.feed("{ESC}[99;99H")
+    assert_eq(t.line, 4)
+    assert_eq(t.col, 9)
+    t.feed("{ESC}[2E")
+    assert_eq(t.line, 4)
+    assert_eq(t.col, 0)
+    t.feed("{ESC}[3F")
+    assert_eq(t.line, 1)
+    t.feed("{ESC}7{ESC}[5;5H{ESC}8")
+    assert_eq(t.line, 1)
+    t.feed("{ESC}[s{ESC}[1;1H{ESC}[u")
+    assert_eq(t.line, 1)
+
+@test fn erase_in_display_and_line()
+    mut t := Term.new(5, 3, 0)
+    t.feed("aaaaa\r\nbbbbb\r\nccccc")
+    t.feed("{ESC}[2;3H{ESC}[K")
+    assert_eq(t.row_text(1), "bb")
+    t.feed("{ESC}[1K")
+    assert_eq(t.row_text(1), "")
+    t.feed("{ESC}[3;2H{ESC}[1J")
+    assert_eq(t.row_text(0), "")
+    assert_eq(t.row_text(2), "  ccc")
+    t.feed("{ESC}[1;1H{ESC}[J")
+    assert_eq(t.row_text(2), "")
+    t.feed("xyz{ESC}[2K")
+    assert_eq(t.row_text(0), "")
+
+@test fn insert_and_delete_lines_and_chars()
+    mut t := Term.new(5, 3, 0)
+    t.feed("abcde\r\nfg\r\nhi")
+    t.feed("{ESC}[1;2H{ESC}[2@")
+    assert_eq(t.row_text(0), "a  bc")
+    t.feed("{ESC}[P")
+    assert_eq(t.row_text(0), "a bc")
+    t.feed("{ESC}[2X")
+    assert_eq(t.row_text(0), "a  c")
+    t.feed("{ESC}[2;1H{ESC}[L")
+    assert_eq(t.row_text(1), "")
+    assert_eq(t.row_text(2), "fg")
+    t.feed("{ESC}[M")
+    assert_eq(t.row_text(1), "fg")
+    assert_eq(t.row_text(2), "")
+
+@test fn scroll_moves_a_line_into_scrollback()
+    mut t := Term.new(4, 2, 2)
+    t.feed("a\nb\nc\nd")
+    assert_eq(t.row_text(0), "c")
+    assert_eq(t.row_text(1), "d")
+    assert_eq(t.scrollback_len(), 2)
+    assert_eq(t.scrollback_text(0), "a")
+    assert_eq(t.scrollback_text(1), "b")
+    t.feed("\ne")
+    assert_eq(t.scrollback_len(), 2)
+    assert_eq(t.scrollback_text(0), "b")
+    assert_eq(t.scrollback_cells(5).len(), 0)
+    t.feed("{ESC}[S")
+    assert_eq(t.row_text(0), "e")
+    t.feed("{ESC}[T")
+    assert_eq(t.row_text(1), "e")
+    assert_eq(t.scrollback_len(), 2)
+
+@test fn scroll_region_keeps_lines_outside()
+    mut t := Term.new(4, 4, 10)
+    t.feed("1\n2\n3\n4{ESC}[2;3r")
+    assert_eq(t.line, 0)
+    t.feed("{ESC}[3;1H\nX")
+    assert_eq(t.row_text(0), "1")
+    assert_eq(t.row_text(1), "3")
+    assert_eq(t.row_text(2), "X")
+    assert_eq(t.row_text(3), "4")
+    assert_eq(t.scrollback_len(), 0)
+    t.feed("{ESC}[2;1H{ESC}M")
+    assert_eq(t.row_text(1), "")
+    assert_eq(t.row_text(2), "3")
+    assert_eq(t.row_text(3), "4")
+
+@test fn alternate_screen_in_and_out()
+    mut t := Term.new(8, 2, 10)
+    t.feed("main{ESC}[?1049h")
+    assert(t.alt)
+    assert_eq(t.row_text(0), "")
+    t.feed("alt{ESC}[?25l")
+    assert_eq(t.row_text(0), "    alt")
+    assert(not t.cursor_visible)
+    t.feed("{ESC}[?1049l")
+    assert(not t.alt)
+    assert_eq(t.row_text(0), "main")
+    assert_eq(t.col, 4)
+    t.feed("{ESC}[?47h")
+    assert_eq(t.row_text(0), "")
+    t.feed("{ESC}[?47l{ESC}[?25h")
+    assert_eq(t.row_text(0), "main")
+    assert(t.cursor_visible)
+
+@test fn sequence_split_across_feeds()
+    mut t := Term.new(10, 2, 0)
+    t.feed("{ESC}")
+    t.feed("[3")
+    t.feed("1mR")
+    assert_eq(t.row_text(0), "R")
+    assert_eq(t.row_cells(0)[0].fg, 1)
+    t.feed("{ESC}]0;my ti")
+    t.feed("tle\u{07}x")
+    assert_eq(t.title, "my title")
+    t.feed("{ESC}]2;other{ESC}")
+    t.feed("\u{5c}y")
+    assert_eq(t.title, "other")
+    assert_eq(t.row_text(0), "Rxy")
+
+@test fn unknown_sequences_are_dropped()
+    mut t := Term.new(10, 2, 0)
+    t.feed("{ESC}[5ia{ESC}[?1hb{ESC}(Bc{ESC}Pq#0{ESC}\u{5c}d{ESC}[>4;1me{ESC}=f")
+    assert_eq(t.row_text(0), "abcdef")
+    t.feed("{ESC}[?7l{ESC}[1;9Hxyz")
+    assert_eq(t.row_text(0), "abcdef  xz")
+    t.feed("{ESC}c")
+    assert_eq(t.row_text(0), "")
+    assert(t.autowrap)
+
+@test fn resize_keeps_content()
+    mut t := Term.new(5, 3, 10)
+    t.feed("ab\ncd\nef")
+    t.resize(3, 2)
+    assert_eq(t.row_text(0), "cd")
+    assert_eq(t.row_text(1), "ef")
+    assert_eq(t.scrollback_text(0), "ab")
+    assert_eq(t.line, 1)
+    t.resize(6, 4)
+    assert_eq(t.row_text(0), "cd")
+    assert_eq(t.row_text(1), "ef")
+    assert_eq(t.row_text(3), "")
+    assert_eq(t.bottom, 3)
+    t.feed("\n\n\ngh")
+    assert_eq(t.row_text(3), "gh")
+    assert_eq(t.row_text(0), "ef")
+    assert_eq(t.scrollback_text(1), "cd")
+
+@test fn strip_removes_escapes()
+    s := strip("{ESC}[1;31merror{ESC}[0m: x{ESC}]0;t\u{07}\r\n\tok{ESC}(B{ESC}]2;u{ESC}\u{5c}!")
+    assert_eq(s, "error: x\n\tok!")
+    assert_eq(strip("plain"), "plain")
