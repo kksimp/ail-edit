@@ -1,0 +1,625 @@
+## Find and project search (editor plan P9, lane W5). Match options (case,
+## whole word, regex, find in a selection), every match in a buffer with the
+## current index and the next one, replacement text that keeps the case, the
+## query history, and the scope and result rows of a search across files.
+## Everything is a pure function of the lines and the options, so the
+## editor's headless tests drive it. Positions are 0-based, columns count
+## characters (`line.chars()`).
+use std.regex
+
+## A span of the buffer, from (`start_line`, `start_col`) up to but not
+## including (`end_line`, `end_col`): the selection for find in selection.
+pub struct Span
+    pub start_line int
+    pub start_col int
+    pub end_line int
+    pub end_col int
+
+## How the query matches. `within` limits matches to a selection; `none`
+## searches the whole buffer.
+pub struct Options
+    pub case bool
+    pub word bool
+    pub is_regex bool
+    pub within Span?
+
+## One match: where it starts and how many characters it covers.
+pub struct Match
+    pub line int
+    pub col int
+    pub len int
+
+impl Ord for Match
+
+## A query ready to run: compiled once, then used on every line. The editor
+## keeps one while the query and the options stay the same.
+pub struct Matcher
+    pub opts Options
+    q List[char]
+    re regex.Regex?
+
+## Options with every toggle off, over the whole buffer.
+pub fn plain() Options
+    Options(case: false, word: false, is_regex: false, within: none)
+
+## Smart case: a query is case sensitive only when it has an upper-case
+## letter, so `foo` finds `Foo` and `Foo` does not find `foo`.
+pub fn smart_case(query str) bool
+    for c in query.chars()
+        if c.is_upper()
+            return true
+    false
+
+fn fold_chars(cs List[char], case bool) List[char]
+    if case
+        return cs
+    mut out := List[char]()
+    for c in cs
+        out.push(c.to_lower())
+    out
+
+fn is_word(c char) bool
+    c.is_alnum() or c == '_'
+
+## Whether the `n` characters at `i` stand alone: no word character just
+## before or just after them.
+fn whole(cs List[char], i int, n int) bool
+    if i > 0 and is_word(cs[i - 1])
+        return false
+    if i + n < cs.len() and is_word(cs[i + n])
+        return false
+    true
+
+## The pattern a regex query compiles to: `\b` around it for whole word and
+## `(?i)` in front when case does not matter.
+pub fn pattern_of(query str, opts Options) str
+    mut pat := query
+    if opts.word
+        pat = "\\b(?:{pat})\\b"
+    if not opts.case
+        pat = "(?i){pat}"
+    pat
+
+## Compiles the query once. A regex that does not compile fails with
+## std.regex's error, whose `message` the find bar shows; it never traps.
+pub fn prepare(query str, opts Options) Matcher ! regex.RegexError
+    if not opts.is_regex
+        return Matcher(opts: opts, q: fold_chars(query.chars(), opts.case), re: none)
+    re := regex.compile(pattern_of(query, opts))?
+    Matcher(opts: opts, q: List[char](), re: re)
+
+## The problem with a query, as the find bar shows it: "" when it is fine,
+## else the regex error's message.
+pub fn problem(query str, opts Options) str
+    if not opts.is_regex
+        return ""
+    _ := regex.compile(pattern_of(query, opts)) else err
+        return err.message
+    ""
+
+## The matches on one line `l` whose text is `text`, left to right, not
+## overlapping. An empty regex match (`^`, `a*` on `b`) is left out, so
+## stepping through matches always moves.
+pub fn Matcher.in_line(self, l int, text str) List[Match]
+    mut out := List[Match]()
+    if re := self.re
+        for m in regex.find_all(re, text)
+            if m.end > m.start
+                out.push(Match(line: l, col: m.start, len: m.end - m.start))
+        return out
+    q := self.q
+    if q.len() == 0
+        return out
+    cs := fold_chars(text.chars(), self.opts.case)
+    mut i := 0
+    while i + q.len() <= cs.len()
+        if cs[i..i + q.len()] == q and (not self.opts.word or whole(cs, i, q.len()))
+            out.push(Match(line: l, col: i, len: q.len()))
+            i += q.len()
+        else
+            i += 1
+    out
+
+fn before_eq(l1 int, c1 int, l2 int, c2 int) bool
+    l1 < l2 or l1 == l2 and c1 <= c2
+
+## Whether `m` lies inside the options' selection (always, without one).
+pub fn Matcher.inside(self, m Match) bool
+    s := self.opts.within else return true
+    starts_in := before_eq(s.start_line, s.start_col, m.line, m.col)
+    ends_in := before_eq(m.line, m.col + m.len, s.end_line, s.end_col)
+    starts_in and ends_in
+
+## Every match in `lines`, in buffer order, at most `limit` of them.
+pub fn Matcher.search(self, lines List[str], limit int) List[Match]
+    mut out := List[Match]()
+    mut first := 0
+    mut last := lines.len() - 1
+    if s := self.opts.within
+        first = s.start_line.max(0)
+        last = s.end_line.min(lines.len() - 1)
+    for l in first..last + 1
+        for m in self.in_line(l, lines[l])
+            if self.inside(m)
+                if out.len() >= limit
+                    return out
+                out.push(m)
+    out
+
+## Every match of `query` in `lines`, at most `limit`. The regex is
+## compiled once for all the lines.
+pub fn all(lines List[str], query str, opts Options, limit int) List[Match] ! regex.RegexError
+    m := prepare(query, opts)?
+    m.search(lines, limit)
+
+## The index of the match the caret is on (at its start, inside it or at its
+## end), or `none`.
+pub fn current(matches List[Match], line int, col int) int?
+    for i in 0..matches.len()
+        m := matches[i]
+        if m.line == line and col >= m.col and col <= m.col + m.len
+            return i
+    none
+
+## The count for the find bar: `3 of 17` when the caret is on the third
+## match, `? of 17` when it is on none, `no results` when there are none.
+pub fn count_label(matches List[Match], caret_line int, caret_col int) str
+    n := matches.len()
+    if n == 0
+        return "no results"
+    if i := current(matches, caret_line, caret_col)
+        return "{i + 1} of {n}"
+    "? of {n}"
+
+## The index of the match to go to from (`line`, `col`): the first that
+## starts after it going forward, the last that starts before it going back,
+## wrapping round the buffer; -1 when there are no matches.
+pub fn next(matches List[Match], line int, col int, forward bool) int
+    n := matches.len()
+    if n == 0
+        return -1
+    if forward
+        for i in 0..n
+            m := matches[i]
+            if m.line > line or m.line == line and m.col > col
+                return i
+        return 0
+    mut i := n - 1
+    while i >= 0
+        m := matches[i]
+        if m.line < line or m.line == line and m.col < col
+            return i
+        i -= 1
+    n - 1
+
+fn has_letter(s str) bool
+    for c in s.chars()
+        if c.is_alpha()
+            return true
+    false
+
+## The text to put in place of `found`. With `preserve_case`, an all
+## upper-case `found` gives `repl` upper-cased, and one that starts with a
+## capital gives `repl` with a capital first letter; otherwise `repl` as is.
+pub fn replace_text(found str, repl str, preserve_case bool) str
+    if not preserve_case or not has_letter(found)
+        return repl
+    if found == found.to_upper() and found.len() > 1
+        return repl.to_upper()
+    cs := found.chars()
+    if cs[0].is_upper()
+        rs := repl.chars()
+        if rs.len() == 0
+            return repl
+        return "{rs[0].to_upper()}{repl.slice(1, repl.len())}"
+    repl
+
+## The replacement for one match `found` of this query: a regex query
+## expands `$1` and `$name` in `repl` (std.regex.7), then the case is kept
+## as `replace_text` does.
+pub fn Matcher.replacement(self, found str, repl str, preserve_case bool) str
+    mut out := repl
+    if re := self.re
+        out = regex.replace_first(re, found, repl)
+    replace_text(found, out, preserve_case)
+
+# ---- History ----------------------------------------------------------------
+
+HISTORY_CAP := 30
+
+## The last 30 queries, oldest first, without repeats. `at` is where Up and
+## Down are while browsing; `items.len()` when not browsing.
+pub struct History
+    pub items List[str]
+    pub at int
+
+## An empty history.
+pub fn History.empty() History
+    History(items: List[str](), at: 0)
+
+## Records `q` as the newest query (moving it there if it was older) and
+## stops browsing. An empty query is not kept.
+pub fn History.push(mut self, q str)
+    if q != ""
+        if i := self.items.index_of(q)
+            _ := self.items.remove_at(i)
+        self.items.push(q)
+        while self.items.len() > HISTORY_CAP
+            _ := self.items.remove_at(0)
+    self.at = self.items.len()
+
+## One query older than the one shown (Up), or `none` at the oldest.
+pub fn History.older(mut self) str?
+    if self.at <= 0 or self.items.len() == 0
+        return none
+    self.at = (self.at - 1).min(self.items.len() - 1)
+    self.items[self.at]
+
+## One query newer (Down), or `none` past the newest, where browsing ends
+## and the bar shows what was typed.
+pub fn History.newer(mut self) str?
+    if self.at + 1 < self.items.len()
+        self.at += 1
+        return self.items[self.at]
+    self.at = self.items.len()
+    none
+
+# ---- Project search scope ---------------------------------------------------
+
+## Which files a project search reads: `include` globs (any one must match;
+## none means every file) and `exclude` globs (none may match).
+pub struct Scope
+    pub include List[str]
+    pub exclude List[str]
+
+## Directories a search never enters unless they are named: build output
+## and tool state. Hidden directories (a name starting with `.`) are left
+## out too.
+fn default_dirs() List[str]
+    ["build", "target", "dist", "node_modules"]
+
+## The scope the user typed: globs split by commas or spaces, `!` in front
+## for an exclude, as in `*.ail, docs/**, !build`.
+pub fn Scope.parse(text str) Scope
+    mut inc := List[str]()
+    mut exc := List[str]()
+    for piece in text.replace(",", " ").split(" ")
+        p := piece.trim()
+        if p == "" or p == "!"
+            continue
+        if rest := p.strip_prefix("!")
+            exc.push(rest)
+        else
+            inc.push(p)
+    Scope(include: inc, exclude: exc)
+
+## Whether glob `p` from index `i` matches `s` from index `j`: `*` is any run
+## of characters but `/`, `?` one character but `/`, `**` any run of
+## characters, and `**/` also no directory at all.
+fn glob_at(p List[char], i int, s List[char], j int) bool
+    if i == p.len()
+        return j == s.len()
+    if p[i] == '*'
+        if i + 1 < p.len() and p[i + 1] == '*'
+            k := i + 2
+            if k < p.len() and p[k] == '/' and glob_at(p, k + 1, s, j)
+                return true
+            for t in j..s.len() + 1
+                if glob_at(p, k, s, t)
+                    return true
+            return false
+        mut t := j
+        while t <= s.len()
+            if glob_at(p, i + 1, s, t)
+                return true
+            if t < s.len() and s[t] == '/'
+                return false
+            t += 1
+        return false
+    if j == s.len()
+        return false
+    if p[i] == '?'
+        return s[j] != '/' and glob_at(p, i + 1, s, j + 1)
+    p[i] == s[j] and glob_at(p, i + 1, s, j + 1)
+
+## Whether glob `pattern` matches the whole of `text`.
+pub fn glob(pattern str, text str) bool
+    glob_at(pattern.chars(), 0, text.chars(), 0)
+
+fn clean(path str) str
+    mut p := path
+    while true
+        rest := p.strip_prefix("./") else break
+        p = rest
+    p
+
+## Whether one glob names `path`. A glob without `/` matches the file name or
+## any directory on the way (`*.ail`, `build`); one with `/` matches the
+## whole path or a directory it starts with (`docs/**`, `docs/spec`).
+fn names(g str, path str) bool
+    pat := g.strip_suffix("/") else g
+    if not pat.contains("/")
+        for part in path.split("/")
+            if glob(pat, part)
+                return true
+        return false
+    glob(pat, path) or glob("{pat}/**", path)
+
+## Whether a project search reads `path` (relative to the project, `/`
+## separated): not in a hidden or build directory, not excluded, and
+## included when there are includes.
+pub fn Scope.accepts(self, path str) bool
+    p := clean(path)
+    parts := p.split("/")
+    for k in 0..parts.len() - 1
+        if parts[k].starts_with(".") or default_dirs().contains(parts[k])
+            return false
+    if p.ends_with(".edit-check.ail") or p.ends_with(".edit-query.ail")
+        return false
+    for g in self.exclude
+        if names(g, p)
+            return false
+    if self.include.len() == 0
+        return true
+    for g in self.include
+        if names(g, p)
+            return true
+    false
+
+## Whether a file is binary, from its first bytes read as text (lossy): a
+## NUL, or more than one character in ten a control character or the
+## replacement character U+FFFD.
+pub fn is_binary(first_bytes_as_text str) bool
+    cs := first_bytes_as_text.chars()
+    mut odd := 0
+    for c in cs
+        n := c.code()
+        if n == 0
+            return true
+        if n == 0xFFFD or n < 32 and n != 9 and n != 10 and n != 12 and n != 13
+            odd += 1
+    odd * 10 > cs.len()
+
+# ---- Result rows ------------------------------------------------------------
+
+## A match of a project search: the file, the 0-based place and length, and
+## the text of its line.
+pub struct Hit
+    pub path str
+    pub line int
+    pub col int
+    pub len int
+    pub text str
+
+## One row of the results panel. A file header has `header` true, `line`
+## -1 and the hit count in `count`; a match row has the hit's place, and the
+## matched span sits at `mark` for `len` characters of `text`.
+pub struct Row
+    pub header bool
+    pub path str
+    pub line int
+    pub col int
+    pub count int
+    pub text str
+    pub mark int
+    pub len int
+
+## A match row's text: the 1-based line number, then the line without its
+## leading blanks; `mark` follows the span to where it is drawn.
+fn match_row(h Hit) Row
+    prefix := "{h.line + 1:>5}: "
+    body := h.text.trim_start()
+    lead := h.text.len() - body.len()
+    mark := prefix.len() + (h.col - lead).max(0)
+    Row(
+        header: false,
+        path: h.path,
+        line: h.line,
+        col: h.col,
+        count: 0,
+        text: "{prefix}{body}",
+        mark: mark,
+        len: h.len,
+    )
+
+## The hits grouped by file, files in the order their first hit came: a
+## header row `path (n)` then a row per hit.
+pub fn group(hits List[Hit]) List[Row]
+    mut paths := List[str]()
+    for h in hits
+        if not paths.contains(h.path)
+            paths.push(h.path)
+    mut rows := List[Row]()
+    for p in paths
+        mut mine := List[Hit]()
+        for h in hits
+            if h.path == p
+                mine.push(h)
+        rows.push(Row(
+            header: true,
+            path: p,
+            line: -1,
+            col: 0,
+            count: mine.len(),
+            text: "{p} ({mine.len()})",
+            mark: 0,
+            len: 0,
+        ))
+        for h in mine
+            rows.push(match_row(h))
+    rows
+
+## The panel's title line: `17 results in 4 files`, or `no results`.
+pub fn summary(hits List[Hit]) str
+    if hits.len() == 0
+        return "no results"
+    mut paths := Set[str]()
+    for h in hits
+        _ := paths.add(h.path)
+    r := if hits.len() == 1 then "result" else "results"
+    f := if paths.len() == 1 then "file" else "files"
+    "{hits.len()} {r} in {paths.len()} {f}"
+
+# ---- Tests ------------------------------------------------------------------
+
+fn make_opts(case bool, word bool, is_regex bool) Options
+    Options(case: case, word: word, is_regex: is_regex, within: none)
+
+@test fn plain_find_ignores_case_by_default()
+    lines := ["Foo foo", "bar FOO"]
+    ms := all(lines, "foo", plain(), 100)?
+    assert_eq(ms.len(), 3)
+    assert_eq(ms[2], Match(line: 1, col: 4, len: 3))
+    sensitive := all(lines, "foo", make_opts(true, false, false), 100)?
+    assert_eq(sensitive, [Match(line: 0, col: 4, len: 3)])
+
+@test fn smart_case_turns_on_with_capitals()
+    assert(not smart_case("foo"))
+    assert(smart_case("Foo"))
+    assert(not smart_case("12_x"))
+
+@test fn whole_word_skips_parts_of_words()
+    lines := ["cat concat cat_x (cat)"]
+    ms := all(lines, "cat", make_opts(false, true, false), 100)?
+    assert_eq(ms, [Match(line: 0, col: 0, len: 3), Match(line: 0, col: 18, len: 3)])
+    rx := all(lines, "c.t", make_opts(false, true, true), 100)?
+    assert_eq(rx.len(), 2)
+
+@test fn regex_find_and_case()
+    lines := ["a1 b22", "C333"]
+    ms := all(lines, "[a-c]\\d+", plain_regex(), 100)?
+    assert_eq(ms.len(), 3)
+    assert_eq(ms[1], Match(line: 0, col: 3, len: 3))
+    exact := all(lines, "[a-c]\\d+", make_opts(true, false, true), 100)?
+    assert_eq(exact.len(), 2)
+    empty := all(lines, "x*", plain_regex(), 100)?
+    assert_eq(empty.len(), 0)
+
+fn plain_regex() Options
+    make_opts(false, false, true)
+
+@test fn bad_regex_is_an_error_value()
+    assert_err(all(["a"], "(a", plain_regex(), 10))
+    assert(problem("(a", plain_regex()) != "")
+    assert_eq(problem("(a", plain()), "")
+    assert_eq(problem("a+", plain_regex()), "")
+
+@test fn limit_caps_the_matches()
+    ms := all(["aaaa", "aaaa"], "a", plain(), 5)?
+    assert_eq(ms.len(), 5)
+
+@test fn find_in_selection()
+    lines := ["x x x", "x x x", "x x x"]
+    within := Span(start_line: 0, start_col: 2, end_line: 1, end_col: 3)
+    o := Options(case: false, word: false, is_regex: false, within: within)
+    ms := all(lines, "x", o, 100)?
+    assert_eq(ms, [
+        Match(line: 0, col: 2, len: 1),
+        Match(line: 0, col: 4, len: 1),
+        Match(line: 1, col: 0, len: 1),
+        Match(line: 1, col: 2, len: 1),
+    ])
+
+@test fn count_label_names_the_current_match()
+    ms := all(["ab ab", "ab"], "ab", plain(), 100)?
+    assert_eq(count_label(ms, 0, 3), "2 of 3")
+    assert_eq(count_label(ms, 1, 0), "3 of 3")
+    assert_eq(count_label(ms, 0, 2), "1 of 3")
+    assert_eq(count_label(ms, 5, 0), "? of 3")
+    assert_eq(count_label(List[Match](), 0, 0), "no results")
+    assert_eq(current(ms, 9, 9), none)
+
+@test fn next_wraps_both_ways()
+    ms := all(["ab ab", "ab"], "ab", plain(), 100)?
+    assert_eq(next(ms, 0, 0, true), 1)
+    assert_eq(next(ms, 0, 3, true), 2)
+    assert_eq(next(ms, 1, 0, true), 0)
+    assert_eq(next(ms, 1, 0, false), 1)
+    assert_eq(next(ms, 0, 0, false), 2)
+    assert_eq(next(List[Match](), 0, 0, true), -1)
+
+@test fn replacement_keeps_case()
+    assert_eq(replace_text("FOO", "bar", true), "BAR")
+    assert_eq(replace_text("Foo", "bar", true), "Bar")
+    assert_eq(replace_text("foo", "bar", true), "bar")
+    assert_eq(replace_text("Foo", "bar", false), "bar")
+    assert_eq(replace_text("A", "bar", true), "Bar")
+    m := prepare("(\\w+)=(\\w+)", plain_regex())?
+    assert_eq(m.replacement("a=b", "$2=$1", false), "b=a")
+    p := prepare("x", plain())?
+    assert_eq(p.replacement("X", "y", true), "Y")
+
+@test fn history_is_a_ring_without_repeats()
+    mut h := History.empty()
+    h.push("a")
+    h.push("b")
+    h.push("a")
+    assert_eq(h.items, ["b", "a"])
+    assert_eq(h.older(), "a")
+    assert_eq(h.older(), "b")
+    assert_eq(h.older(), none)
+    assert_eq(h.newer(), "a")
+    assert_eq(h.newer(), none)
+    for i in 0..40
+        h.push("q{i}")
+    assert_eq(h.items.len(), 30)
+    assert_eq(h.items[0], "q10")
+    assert_eq(h.older(), "q39")
+
+@test fn scope_parses_includes_and_excludes()
+    s := Scope.parse("*.ail, docs/**  !build,!*.md")
+    assert_eq(s.include, ["*.ail", "docs/**"])
+    assert_eq(s.exclude, ["build", "*.md"])
+    assert(s.accepts("edit.ail"))
+    assert(s.accepts("./features/find/find.ail"))
+    assert(s.accepts("docs/plan/x.txt"))
+    assert(not s.accepts("docs/a.md"))
+    assert(not s.accepts("README.md"))
+    assert(not s.accepts("tools/x.sh"))
+
+@test fn scope_defaults_skip_hidden_and_build()
+    s := Scope.parse("")
+    assert(s.accepts("a/b.txt"))
+    assert(not s.accepts(".git/config"))
+    assert(not s.accepts("a/.cache/x"))
+    assert(not s.accepts("build/out.ail"))
+    assert(not s.accepts("edit.edit-check.ail"))
+    assert(s.accepts(".gitignore"))
+
+@test fn globs_match_stars_and_marks()
+    assert(glob("*.ail", "a.ail"))
+    assert(not glob("*.ail", "a/b.ail"))
+    assert(glob("**/*.ail", "b.ail"))
+    assert(glob("**/*.ail", "a/b/c.ail"))
+    assert(glob("a/**/c", "a/c"))
+    assert(glob("a/**/c", "a/x/y/c"))
+    assert(glob("?.md", "a.md"))
+    assert(not glob("?.md", "ab.md"))
+    assert(Scope.parse("docs/spec").accepts("docs/spec/x.md"))
+
+@test fn binary_text_is_spotted()
+    assert(not is_binary("fn main()\n    print(1)\n"))
+    nul := '\u{0}'
+    assert(is_binary("ab{nul}cd"))
+    odd := '\u{1}'
+    assert(is_binary("{odd}{odd}{odd}abc"))
+    assert(not is_binary(""))
+
+@test fn hits_group_by_file()
+    hits := [
+        Hit(path: "a.ail", line: 2, col: 9, len: 3, text: "    x := foo"),
+        Hit(path: "b.ail", line: 0, col: 0, len: 3, text: "foo"),
+        Hit(path: "a.ail", line: 9, col: 0, len: 3, text: "foo()"),
+    ]
+    rows := group(hits)
+    assert_eq(rows.len(), 5)
+    assert(rows[0].header)
+    assert_eq(rows[0].text, "a.ail (2)")
+    assert_eq(rows[1].text, "    3: x := foo")
+    assert_eq(rows[1].mark, 12)
+    assert_eq(rows[1].text.slice(rows[1].mark, rows[1].mark + rows[1].len), "foo")
+    assert_eq(rows[2].line, 9)
+    assert_eq(rows[3].text, "b.ail (1)")
+    assert_eq(rows[3].count, 1)
+    assert_eq(summary(hits), "3 results in 2 files")
+    assert_eq(summary(List[Hit]()), "no results")
