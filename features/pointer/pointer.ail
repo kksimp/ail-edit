@@ -1,0 +1,640 @@
+## The pointer in the window (parity plan C1, B7, B8): where a point of the
+## canvas falls, the menu for each place, the drags (scrollbar thumb,
+## minimap, splitters, word and line selection), the hover's timing and the
+## clickable status segments. Everything here is a pure function of plain
+## values; `Shell` in `edit.ail` turns the results into workspace events.
+use window as win
+
+## How close (points) the pointer must be to a splitter to grab it.
+pub EDGE := 4.0
+## The pointer rests this long (ms) on a cell before the hover shows, and no
+## hover fires within `TYPING_MS` of a key.
+pub HOVER_MS := 400
+pub TYPING_MS := 1000
+## Where `win.status_ops` starts the status text, in points.
+pub STATUS_X := 10.0
+## The narrowest file tree and the lowest bottom pane a drag leaves, in cells.
+pub MIN_TREE := 12
+pub MIN_PANE := 2
+
+## What is under a point of the canvas.
+pub enum Place
+    OnTabs
+    OnActivity
+    OnBar
+    OnMap
+    OnTreeEdge
+    OnPaneEdge
+    OnStatus
+    OnTree
+    OnPane
+    OnGutter
+    OnText
+
+## The numbers `place` needs: the grid metrics, the tree's columns with its
+## separator (`left`, 0 when closed), the gutter's width, the grid row of the
+## status bar, the bottom pane's rows, and whether the minimap shows.
+pub struct Layout
+    pub m win.Metrics
+    pub left int
+    pub gutter int
+    pub status_row int
+    pub pane_rows int
+    pub minimap bool
+
+## The place under (`x`, `y`).
+pub fn place(l Layout, x float, y float) Place
+    m := l.m
+    if y < m.tab_h
+        return Place.OnTabs
+    if x < m.x0
+        return Place.OnActivity
+    if x >= m.w - win.SCROLL_W
+        return Place.OnBar
+    if l.minimap and x >= m.w - win.SCROLL_W - win.MAP_W
+        return Place.OnMap
+    cell := win.cell_at(m, x, y)
+    if l.left > 0
+        ex := m.x0 + (l.left - 1).to_float() * m.cw
+        if x >= ex - EDGE and x < ex + m.cw + EDGE and cell.row != l.status_row
+            return Place.OnTreeEdge
+    sy := win.row_y(m, l.status_row)
+    if l.pane_rows > 0 and cell.col >= l.left and (y - sy).abs() <= EDGE
+        return Place.OnPaneEdge
+    if cell.row == l.status_row
+        return Place.OnStatus
+    if cell.col < l.left
+        return Place.OnTree
+    if cell.row > l.status_row
+        return Place.OnPane
+    if cell.col - l.left < l.gutter
+        return Place.OnGutter
+    Place.OnText
+
+# ---- Menus ---------------------------------------------------------------
+
+## Every menu label that runs a key, and the key (`ctrl+c` form). The last
+## two are the old fixed menu's, kept so its labels still work.
+pub MENU_LABELS := [
+    "Go to definition",
+    "Find references",
+    "Rename",
+    "Quick fix",
+    "Explain diagnostic",
+    "Cut",
+    "Copy",
+    "Paste",
+    "Copy for agent",
+    "Command palette",
+    "Next tab",
+    "Close tab",
+]
+pub MENU_SPECS := [
+    "f12",
+    "shift+f12",
+    "f2",
+    "ctrl+.",
+    "f1",
+    "ctrl+x",
+    "ctrl+c",
+    "ctrl+v",
+    "alt+shift+c",
+    "ctrl+shift+p",
+    "ctrl+tab",
+    "ctrl+w",
+]
+
+## The tree's file commands a menu offers when the palette has them (another
+## slice adds them; the menu looks each up by name).
+pub TREE_COMMANDS := [
+    "New file",
+    "New folder",
+    "Rename file",
+    "Delete file",
+    "Move file",
+    "Duplicate file",
+    "Copy path",
+    "Reveal in Finder",
+]
+
+## The key a menu label presses, or "" for a label that is not a key.
+pub fn menu_spec(label str) str
+    at := MENU_LABELS.index_of(label) else return ""
+    MENU_SPECS[at]
+
+## The menu on the text; Quick fix and Explain diagnostic only over a diagnostic.
+pub fn text_menu(on_diag bool) List[str]
+    mut out := ["Go to definition", "Find references", "Rename"]
+    if on_diag
+        out.push("Quick fix")
+        out.push("Explain diagnostic")
+    out.extend(["Cut", "Copy", "Paste", "Copy for agent", "Command palette"])
+    out
+
+## The menu on a tab; Reveal in tree only when that command exists.
+pub fn tab_menu(reveal bool) List[str]
+    mut out := ["Close", "Close others", "Close to the right", "Copy path"]
+    if reveal
+        out.push("Reveal in tree")
+    out
+
+## The menu on the file tree: Open, then the file commands in `present`
+## (the names of `TREE_COMMANDS` the palette has).
+pub fn tree_menu(present List[str]) List[str]
+    mut out := ["Open"]
+    for name in TREE_COMMANDS
+        if present.contains(name)
+            out.push(name)
+    out
+
+# ---- Selection by words and lines ---------------------------------------
+
+## A stretch of the buffer, 0-based, from (line, col) up to (end_line, end_col).
+pub struct Sel
+    pub line int
+    pub col int
+    pub end_line int
+    pub end_col int
+
+## A selection as the editor keeps it: where it is anchored and the caret.
+pub struct Ends
+    pub anchor_line int
+    pub anchor_col int
+    pub line int
+    pub col int
+
+## A drag after a double or triple click: the selection covers the clicked
+## word or line (`anchor`) and the word or line under the pointer (`at`),
+## the caret on the side the pointer went.
+pub fn extend(anchor Sel, at Sel) Ends
+    if at.line < anchor.line or at.line == anchor.line and at.col < anchor.col
+        return Ends(
+            anchor_line: anchor.end_line,
+            anchor_col: anchor.end_col,
+            line: at.line,
+            col: at.col,
+        )
+    Ends(anchor_line: anchor.line, anchor_col: anchor.col, line: at.end_line, col: at.end_col)
+
+## Line `l` of `n` lines, `len` characters long, as a selection: to the start
+## of the next line, or to its end on the last line.
+pub fn line_sel(n int, l int, len int) Sel
+    if l + 1 < n
+        return Sel(line: l, col: 0, end_line: l + 1, end_col: 0)
+    Sel(line: l, col: 0, end_line: l, end_col: len)
+
+## Whether 0-based (`l`, `c`) is inside a diagnostic's span given 1-based, as
+## `ail check --json` gives it; an empty span covers one character.
+pub fn in_span(l int, c int, line int, col int, end_line int, end_col int) bool
+    start := line - 1
+    last := end_line - 1
+    sc := col - 1
+    mut ec := end_col - 1
+    if start == last and sc == ec
+        ec = sc + 1
+    if l < start or l > last
+        return false
+    not (l == start and c < sc or l == last and c >= ec)
+
+# ---- Scrollbar and minimap ----------------------------------------------
+
+## The scrollbar thumb's top and height, as `win.bar_ops` draws it.
+pub struct Thumb
+    pub y float
+    pub h float
+
+## The thumb for the first visible line `top` of `total`, `visible` shown, on
+## a track from `y0`, `h` points high.
+pub fn thumb(y0 float, h float, top int, total int, visible int) Thumb
+    t := total.max(1).to_float()
+    th := (h * visible.to_float() / t).min(h).max(18.0)
+    ty := y0 + (h - th) * top.to_float() / (t - visible.to_float()).max(1.0)
+    Thumb(y: ty, h: th)
+
+## A press on the scrollbar: grab the thumb (`off` points below its top), or
+## page up or down from a press above or below it.
+pub enum BarAct
+    Grab(off float)
+    PageAbove
+    PageBelow
+
+## What a press at `y` on the track does, given the thumb `t`.
+pub fn bar_press(y float, t Thumb) BarAct
+    if y < t.y
+        return BarAct.PageAbove
+    if y >= t.y + t.h
+        return BarAct.PageBelow
+    BarAct.Grab(off: y - t.y)
+
+## The first visible line while the thumb, grabbed `grab` points below its
+## top, is dragged to `y`.
+pub fn thumb_top(y float, grab float, y0 float, h float, total int, visible int) int
+    t := thumb(y0, h, 0, total, visible)
+    room := (h - t.h).max(1.0)
+    span := (total - visible).max(1).to_float()
+    at := ((y - grab - y0) / room * span).round().to_int()
+    at.max(0).min((total - 1).max(0))
+
+## The first visible line for a press or drag at `y` on the minimap: the line
+## there, centred in the view.
+pub fn map_top(y float, y0 float, h float, total int, visible int) int
+    if total <= 0
+        return 0
+    pitch := (h / total.to_float()).min(2.0)
+    at := ((y - y0) / pitch).floor().to_int() - visible / 2
+    at.max(0).min(total - 1)
+
+# ---- Splitters -----------------------------------------------------------
+
+## The tree width and bottom pane height the person chose, in cells; 0 for
+## the automatic size. Saved as the settings `treew` and `paneh`.
+pub struct Sizes
+    pub treew int
+    pub paneh int
+
+## The sizes from the settings' text values ("" or junk is automatic).
+pub fn sizes_of(treew str, paneh str) Sizes
+    Sizes(
+        treew: (treew.trim().to_int() else 0).max(0),
+        paneh: (paneh.trim().to_int() else 0).max(0),
+    )
+
+## The tree's columns (separator excluded): `fallback` when `want` is 0, else
+## `want` kept between `MIN_TREE` and half the grid.
+pub fn tree_width(want int, fallback int, cols int) int
+    if want <= 0
+        return fallback
+    want.min(cols / 2).max(MIN_TREE)
+
+## The bottom pane's rows for `want` in an editor of `rows` rows: at least
+## `MIN_PANE`, leaving four rows for the text and the status bar.
+pub fn pane_height(want int, rows int) int
+    want.min(rows - 5).max(MIN_PANE)
+
+## The tree width a splitter drag to `x` asks for.
+pub fn tree_from_x(x float, x0 float, cw float) int
+    ((x - x0) / cw.max(1.0)).round().to_int().max(1)
+
+## The pane height a splitter drag to grid row `row` asks for, in an editor
+## of `rows` rows below the tab strip: the status bar goes on that row.
+pub fn pane_from_row(rows int, row int) int
+    (rows - row).max(0)
+
+# ---- Wheel ----------------------------------------------------------------
+
+## The wheel's horizontal and vertical parts: Shift turns a vertical wheel
+## horizontal, and otherwise only the larger part counts, so a trackpad's
+## drift does not scroll sideways.
+pub struct Wheel
+    pub h float
+    pub v float
+
+## The wheel event's distances, with Shift held or not, as the two parts.
+pub fn wheel(dx float, dy float, shift bool) Wheel
+    if shift and dx == 0.0
+        return Wheel(h: dy, v: 0.0)
+    if dx.abs() > dy.abs()
+        return Wheel(h: dx, v: 0.0)
+    Wheel(h: 0.0, v: dy)
+
+## The first column after a horizontal wheel of `n` columns, when the longest
+## visible line (`longest` characters) is wider than the `view`.
+pub fn hscroll(left int, n int, longest int, view int) int
+    room := (longest - view + 1).max(0)
+    (left + n).max(0).min(room.max(left))
+
+## Ctrl-wheel: "+" to grow the font (wheel up), "-" to shrink it, "" for none.
+pub fn zoom_step(dy float) str
+    if dy < 0.0
+        return "+"
+    if dy > 0.0
+        return "-"
+    ""
+
+# ---- Status segments ------------------------------------------------------
+
+## The character of the status text at `x`, in the chrome font of `size`
+## points (the same estimate as `win.tab_w`).
+pub fn status_at(x float, size float) int
+    ((x - STATUS_X) / (size * 0.56)).floor().to_int()
+
+## The first `pat` in `cs` at or after `from`, or -1.
+fn find_from(cs List[char], pat str, from int) int
+    ps := pat.chars()
+    mut i := from.max(0)
+    while i + ps.len() <= cs.len()
+        mut k := 0
+        while k < ps.len() and cs[i + k] == ps[k]
+            k += 1
+        if k == ps.len()
+            return i
+        i += 1
+    -1
+
+## The segment of the status text (trimmed, as the window draws it) at
+## character `at`: `pos` for `Ln L, Col C`, `diags` for the counts, `theme`
+## and `font` when the text shows them, else "".
+pub fn status_segment(text str, at int) str
+    cs := text.chars()
+    if at < 0 or at >= cs.len()
+        return ""
+    ln := find_from(cs, "Ln ", 0)
+    if ln >= 0
+        c := find_from(cs, ", Col ", ln)
+        if c >= 0
+            mut e := c + 6
+            while e < cs.len() and cs[e].is_digit()
+                e += 1
+            if at >= ln and at < e
+                return "pos"
+    er := find_from(cs, " errors, ", 0)
+    if er >= 0
+        mut s := er
+        while s > 0 and cs[s - 1].is_digit()
+            s -= 1
+        w := find_from(cs, " warnings", er)
+        if w >= 0 and at >= s and at < w + 9
+            return "diags"
+    for name in ["theme", "font"]
+        t := find_from(cs, "{name} ", 0)
+        if t >= 0
+            mut e2 := t + name.chars().len() + 1
+            while e2 < cs.len() and cs[e2] != ' '
+                e2 += 1
+            if at >= t and at < e2
+                return name
+    ""
+
+## The key a status segment presses: Go to line, the problems list, settings.
+pub fn segment_spec(seg str) str
+    match seg
+        "pos" => "ctrl+g"
+        "diags" => "ctrl+shift+m"
+        "theme" | "font" => "ctrl+,"
+        _ => ""
+
+# ---- Gutter ---------------------------------------------------------------
+
+## What a click on the gutter of a line does.
+pub enum GutterAct
+    ToggleFold
+    ShowDiag
+    RunTest
+    SelectLine
+
+## The gutter action for a line: a folded line or a block header folds, a
+## diagnostic shows its message, a test's first line runs the test.
+pub fn gutter_act(folded bool, diag bool, test bool, opens bool) GutterAct
+    if folded
+        return GutterAct.ToggleFold
+    if diag
+        return GutterAct.ShowDiag
+    if test
+        return GutterAct.RunTest
+    if opens
+        return GutterAct.ToggleFold
+    GutterAct.SelectLine
+
+## Whether line `l` starts a test: `@test fn NAME(` on it, or `fn NAME(` after
+## a line that is `@test` (as `features/tests.test_at` finds tests).
+pub fn starts_test(lines List[str], l int) bool
+    if l < 0 or l >= lines.len()
+        return false
+    t := lines[l].trim()
+    if t.starts_with("@test fn ")
+        return true
+    t.starts_with("fn ") and l > 0 and lines[l - 1].trim() == "@test"
+
+## The pane rows that show a diagnostic: its message, then its help.
+pub fn diag_rows(severity str, rule str, message str, help str) List[str]
+    mut out := ["{severity}[{rule}] {message}"]
+    if help != ""
+        out.push("help: {help}")
+    out.push("F1 explains, Ctrl-. fixes")
+    out
+
+# ---- Gestures and hover ----------------------------------------------------
+
+## A drag in progress.
+pub enum Drag
+    NoDrag
+    ByWords
+    ByLines
+    ThumbDrag
+    MapDrag
+    TreeDrag
+    PaneDrag
+
+## The window's pointer state: the drag (with the thumb's grab offset and
+## the double- or triple-clicked word or line), what a context menu was
+## opened on (a tab index, -1 for none), where the pointer rests and since
+## when (ms), whether the hover fired for this rest, the last key (ms), and
+## the hover shown: on which tab, what it replaced (`prev_pane` 0 Diags,
+## 1 Text, 2 Outline) and what it shows.
+pub struct Gesture
+    pub drag Drag
+    pub grab float
+    pub anchor Sel
+    pub menu_tab int
+    pub rest_col int
+    pub rest_row int
+    pub rest_at int
+    pub fired bool
+    pub key_at int
+    pub shown bool
+    pub tab int
+    pub prev_pane int
+    pub prev_text List[str]
+    pub shown_text List[str]
+
+## The state before any pointer event.
+pub fn gesture() Gesture
+    Gesture(
+        drag: Drag.NoDrag,
+        grab: 0.0,
+        anchor: Sel(line: 0, col: 0, end_line: 0, end_col: 0),
+        menu_tab: -1,
+        rest_col: -1,
+        rest_row: -1,
+        rest_at: 0,
+        fired: false,
+        key_at: 0,
+        shown: false,
+        tab: -1,
+        prev_pane: 0,
+        prev_text: [],
+        shown_text: [],
+    )
+
+## The pointer is over cell (`c`, `r`) at `now`: a new cell starts a new rest.
+## True when it moved to another cell, so a shown hover goes away.
+pub fn Gesture.rest(mut self, c int, r int, now int) bool
+    if c == self.rest_col and r == self.rest_row
+        return false
+    self.rest_col = c
+    self.rest_row = r
+    self.rest_at = now
+    self.fired = false
+    true
+
+## Whether the hover should fire at `now`: the pointer has rested `HOVER_MS`
+## on a cell, it has not fired for this rest, and no key came within `TYPING_MS`.
+pub fn hover_due(g Gesture, now int) bool
+    if g.fired or g.rest_col < 0 or g.rest_at <= 0
+        return false
+    now - g.rest_at >= HOVER_MS and now - g.key_at >= TYPING_MS
+
+@test fn places_follow_the_layout()
+    m := win.metrics(800.0, 600.0, 8.0, 16.0, 13.0, true, win.ACT_W)
+    l := Layout(m: m, left: 29, gutter: 4, status_row: 10, pane_rows: 4, minimap: true)
+    assert_eq(place(l, 100.0, 2.0), Place.OnTabs)
+    assert_eq(place(l, 10.0, 100.0), Place.OnActivity)
+    assert_eq(place(l, 795.0, 100.0), Place.OnBar)
+    assert_eq(place(l, 800.0 - win.SCROLL_W - 10.0, 100.0), Place.OnMap)
+    edge := m.x0 + 28.0 * m.cw + 1.0
+    y := win.row_y(m, 3) + 2.0
+    assert_eq(place(l, edge, y), Place.OnTreeEdge)
+    assert_eq(place(l, m.x0 + 5.0 * m.cw, y), Place.OnTree)
+    assert_eq(place(l, m.x0 + 31.0 * m.cw + 1.0, y), Place.OnGutter)
+    assert_eq(place(l, m.x0 + 40.0 * m.cw, y), Place.OnText)
+    assert_eq(place(l, m.x0 + 40.0 * m.cw, win.row_y(m, 10) + m.ch / 2.0), Place.OnStatus)
+    assert_eq(place(l, m.x0 + 40.0 * m.cw, win.row_y(m, 10) + 1.0), Place.OnPaneEdge)
+    assert_eq(place(l, m.x0 + 40.0 * m.cw, win.row_y(m, 12) + 2.0), Place.OnPane)
+    closed := Layout(m: m, left: 0, gutter: 4, status_row: 10, pane_rows: 0, minimap: false)
+    assert_eq(place(closed, m.x0 + 2.0 * m.cw, y), Place.OnGutter)
+    assert_eq(place(closed, m.x0 + 40.0 * m.cw, win.row_y(m, 10) + 1.0), Place.OnStatus)
+
+@test fn menus_by_place()
+    assert_eq(text_menu(false).len(), 8)
+    assert(text_menu(true).contains("Quick fix"))
+    assert(text_menu(true).contains("Explain diagnostic"))
+    assert(not text_menu(false).contains("Quick fix"))
+    assert_eq(tab_menu(false), ["Close", "Close others", "Close to the right", "Copy path"])
+    assert_eq(tab_menu(true).len(), 5)
+    assert_eq(tree_menu(["Delete file", "Nope", "New file"]), ["Open", "New file", "Delete file"])
+    assert_eq(tree_menu([]), ["Open"])
+
+@test fn menu_labels_map_to_keys()
+    assert_eq(MENU_LABELS.len(), MENU_SPECS.len())
+    assert_eq(menu_spec("Go to definition"), "f12")
+    assert_eq(menu_spec("Copy"), "ctrl+c")
+    assert_eq(menu_spec("Close tab"), "ctrl+w")
+    assert_eq(menu_spec("Close others"), "")
+    for label in text_menu(true)
+        assert(menu_spec(label) != "", label)
+
+@test fn word_and_line_drags_extend_both_ways()
+    word := Sel(line: 2, col: 4, end_line: 2, end_col: 8)
+    after := extend(word, Sel(line: 3, col: 1, end_line: 3, end_col: 5))
+    assert_eq(after, Ends(anchor_line: 2, anchor_col: 4, line: 3, col: 5))
+    before := extend(word, Sel(line: 2, col: 0, end_line: 2, end_col: 2))
+    assert_eq(before, Ends(anchor_line: 2, anchor_col: 8, line: 2, col: 0))
+    assert_eq(line_sel(5, 1, 7), Sel(line: 1, col: 0, end_line: 2, end_col: 0))
+    assert_eq(line_sel(5, 4, 7), Sel(line: 4, col: 0, end_line: 4, end_col: 7))
+
+@test fn spans_cover_their_characters()
+    assert(in_span(0, 3, 1, 3, 1, 6))
+    assert(in_span(0, 4, 1, 3, 1, 6))
+    assert(not in_span(0, 5, 1, 3, 1, 6))
+    assert(not in_span(0, 1, 1, 3, 1, 6))
+    assert(in_span(0, 2, 1, 3, 1, 3))
+    assert(in_span(1, 0, 1, 3, 3, 2))
+    assert(not in_span(3, 0, 1, 3, 3, 2))
+
+@test fn the_thumb_grabs_drags_and_pages()
+    t := thumb(100.0, 400.0, 0, 200, 20)
+    assert_eq(t.y, 100.0)
+    assert_eq(t.h, 40.0)
+    assert_eq(bar_press(120.0, t), BarAct.Grab(off: 20.0))
+    assert_eq(bar_press(300.0, t), BarAct.PageBelow)
+    t2 := thumb(100.0, 400.0, 90, 200, 20)
+    assert_eq(bar_press(110.0, t2), BarAct.PageAbove)
+    assert_eq(thumb_top(120.0, 20.0, 100.0, 400.0, 200, 20), 0)
+    assert_eq(thumb_top(100.0 + 360.0 + 20.0, 20.0, 100.0, 400.0, 200, 20), 180)
+    assert_eq(thumb_top(100.0 + 180.0 + 20.0, 20.0, 100.0, 400.0, 200, 20), 90)
+    assert_eq(thumb_top(9000.0, 0.0, 100.0, 400.0, 200, 20), 199)
+    assert_eq(thumb_top(-50.0, 0.0, 100.0, 400.0, 200, 20), 0)
+
+@test fn the_minimap_centres_the_line()
+    assert_eq(map_top(100.0 + 200.0, 100.0, 400.0, 1000, 20), 490)
+    assert_eq(map_top(100.0, 100.0, 400.0, 1000, 20), 0)
+    assert_eq(map_top(100.0 + 6.0, 100.0, 400.0, 10, 4), 1)
+    assert_eq(map_top(100.0 + 50.0, 100.0, 400.0, 10, 4), 9)
+    assert_eq(map_top(5000.0, 100.0, 400.0, 1000, 20), 999)
+    assert_eq(map_top(5.0, 0.0, 10.0, 0, 4), 0)
+
+@test fn splitters_clamp_their_sizes()
+    assert_eq(tree_width(0, 28, 120), 28)
+    assert_eq(tree_width(0, 28, 40), 28)
+    assert_eq(tree_from_x(0.0, 40.0, 8.0), 1)
+    assert_eq(tree_width(40, 28, 120), 40)
+    assert_eq(tree_width(90, 28, 120), 60)
+    assert_eq(tree_width(3, 28, 120), MIN_TREE)
+    assert_eq(pane_height(8, 30), 8)
+    assert_eq(pane_height(1, 30), MIN_PANE)
+    assert_eq(pane_height(40, 30), 25)
+    assert_eq(tree_from_x(40.0 + 8.0 * 30.0 + 3.0, 40.0, 8.0), 30)
+    assert_eq(pane_from_row(30, 22), 8)
+    assert_eq(pane_from_row(30, 40), 0)
+    assert_eq(sizes_of("34", ""), Sizes(treew: 34, paneh: 0))
+    assert_eq(sizes_of("x", "9 "), Sizes(treew: 0, paneh: 9))
+
+@test fn the_wheel_scrolls_sideways_and_zooms()
+    assert_eq(wheel(0.0, 30.0, true), Wheel(h: 30.0, v: 0.0))
+    assert_eq(wheel(5.0, 30.0, false), Wheel(h: 0.0, v: 30.0))
+    assert_eq(wheel(-30.0, 5.0, false), Wheel(h: -30.0, v: 0.0))
+    assert_eq(hscroll(0, 3, 100, 40), 3)
+    assert_eq(hscroll(2, -5, 100, 40), 0)
+    assert_eq(hscroll(55, 10, 100, 40), 61)
+    assert_eq(hscroll(0, 4, 30, 40), 0)
+    assert_eq(zoom_step(-3.0), "+")
+    assert_eq(zoom_step(3.0), "-")
+    assert_eq(zoom_step(0.0), "")
+
+@test fn status_segments_are_found_by_their_text()
+    s := "t.ail *  Ln 12, Col 4  1 errors, 0 warnings  | saved"
+    assert_eq(status_segment(s, 10), "pos")
+    assert_eq(status_segment(s, 19), "pos")
+    assert_eq(status_segment(s, 23), "diags")
+    assert_eq(status_segment(s, 40), "diags")
+    assert_eq(status_segment(s, 2), "")
+    assert_eq(status_segment(s, 50), "")
+    assert_eq(status_segment(s, -1), "")
+    assert_eq(status_segment("x  theme dark  font 20", 4), "theme")
+    assert_eq(status_segment("x  theme dark  font 20", 16), "font")
+    assert_eq(segment_spec("pos"), "ctrl+g")
+    assert_eq(segment_spec("diags"), "ctrl+shift+m")
+    assert_eq(segment_spec("font"), "ctrl+,")
+    assert_eq(segment_spec(""), "")
+    assert_eq(status_at(STATUS_X + 1.0, 10.0), 0)
+    assert_eq(status_at(STATUS_X + 5.6 * 3.0 + 0.5, 10.0), 3)
+
+@test fn gutter_clicks_pick_an_action()
+    assert_eq(gutter_act(true, true, true, true), GutterAct.ToggleFold)
+    assert_eq(gutter_act(false, true, true, true), GutterAct.ShowDiag)
+    assert_eq(gutter_act(false, false, true, true), GutterAct.RunTest)
+    assert_eq(gutter_act(false, false, false, true), GutterAct.ToggleFold)
+    assert_eq(gutter_act(false, false, false, false), GutterAct.SelectLine)
+    ls := ["@test fn a()", "    x", "@test", "fn b()", "fn c()"]
+    assert(starts_test(ls, 0))
+    assert(not starts_test(ls, 1))
+    assert(starts_test(ls, 3))
+    assert(not starts_test(ls, 4))
+    assert(not starts_test(ls, 9))
+    assert_eq(diag_rows("error", "r.1", "bad", ""), ["error[r.1] bad", "F1 explains, Ctrl-. fixes"])
+    assert_eq(diag_rows("warning", "r.2", "meh", "try x").len(), 3)
+
+@test fn the_hover_waits_for_a_rest_away_from_typing()
+    mut g := gesture()
+    assert(not hover_due(g, 5000))
+    assert(g.rest(3, 4, 10000))
+    assert(not g.rest(3, 4, 10200))
+    assert(not hover_due(g, 10300))
+    assert(hover_due(g, 10400))
+    g.key_at = 9800
+    assert(not hover_due(g, 10500))
+    assert(hover_due(g, 10800))
+    g.fired = true
+    assert(not hover_due(g, 20000))
+    assert(g.rest(4, 4, 20000))
+    assert(not g.fired)
