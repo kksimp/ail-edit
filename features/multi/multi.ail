@@ -164,8 +164,8 @@ fn is_word(c char) bool
     c.is_alnum() or c == '_'
 
 ## Moves every caret. `dir` is left, right, up, down, home, end, word_left
-## or word_right; `select` keeps the anchors, else they follow the heads.
-pub fn move_each(lines List[str], carets List[Caret], dir str, select bool) List[Caret]
+## or word_right; `extend` keeps the anchors, else they follow the heads.
+pub fn move_each(lines List[str], carets List[Caret], dir str, extend bool) List[Caret]
     mut out := List[Caret]()
     for c in carets
         mut l := c.line
@@ -207,7 +207,7 @@ pub fn move_each(lines List[str], carets List[Caret], dir str, select bool) List
                 col += 1
             while col < n and is_word(cs[col])
                 col += 1
-        if select
+        if extend
             out.push(Caret(
                 line: l,
                 col: col,
