@@ -195,9 +195,9 @@ root, else `ail` on `PATH`. A check of unsaved changes writes the buffer to
 `FILE.edit-check.ail` beside the file and removes it afterwards, so relative
 imports resolve as they will on save.
 
-## Status (2026-11-11)
+## Status (2026-11-15)
 
-- Pinned to ail `3896938b` (`.ail-version`); `tools/check.sh` checks, formats and tests against it, and fails when the editor's `KEYWORDS` differ from the lexer's (lex.kw.1).
+- Pinned to ail v0.1.0 (`64f5caef`) (`.ail-version`); `tools/check.sh` checks, formats and tests against it, and fails when the editor's `KEYWORDS` differ from the lexer's (lex.kw.1).
 - Front ends: the `std.app` window (default), the old `std.ui` cell grid (`--grid`), and `--print` / `--print --json` for tests and agents. The headless core is tested by `@test`s run with `ail test` (not `ail selftest`).
 - The repo is a package (`ail.pkg`) with an agent kit (`AGENTS.md`, `.mcp.json`).
 - Highlighting and auto-indent know every reserved word of the lexer, including `requires`, `ensures`, `invariant`, `par` and `with`; the contract words `then`, `result` and `old(` and the hole `uhwhatnow?` are marked too.
