@@ -1,0 +1,661 @@
+## Keymap presets (parity plan C7, decision D11, lane P12): which key runs
+## which command. `classic` is today's key table; `vscode` follows the keys
+## people and agents already know from VS Code. The editor still starts on
+## `classic` until the designer confirms the flip (D11). Keys are specs as
+## `edit.ail` writes them: modifiers in the order ctrl, alt, shift, then the
+## key in lower case (`ctrl+shift+p`, `alt+left`, `f5`). On macOS the host
+## maps Command to ctrl, so a preset writes `ctrl+` for both. Chords such as
+## Ctrl-K Ctrl-C are not supported; every binding is one key press.
+
+## One key of a preset: pressing `key` runs the command named `command`, as
+## the palette names it (`KeyRow.name` in `edit.ail`).
+pub struct Binding
+    pub command str
+    pub key str
+
+## One row of the README key table: the keys as the table shows them for
+## `classic`, the command's palette name ("" for rows that are no command,
+## such as the arrows) and what it does.
+pub struct Row
+    pub keys str
+    pub name str
+    pub does str
+
+## Commands `classic` binds that `vscode` leaves to the palette: their
+## classic key is a well-known VS Code key of another command.
+pub PALETTE_ONLY_IN_VSCODE := ["Next theme", "Join lines"]
+
+## The palette-only commands of the key table (rows with a name and no key)
+## on this base, so a test can check that every preset names real commands.
+pub PALETTE_COMMANDS := [
+    "Select all occurrences",
+    "Fold all",
+    "Trace tree",
+    "Schedule sanitizer",
+    "Race detector",
+    "Leak report",
+    "API diff",
+    "Git change gutter",
+    "Update preview",
+    "Apply test update",
+    "Record tests",
+    "Trace replay",
+    "Agent changes",
+    "Toggle agent marks",
+    "Count tokens",
+    "Toggle token meter",
+    "Rebind a key",
+    "Welcome screen",
+    "New file",
+    "Semantic layer",
+    "Fix with ail fix",
+    "Toggle minimap",
+    "Toggle zen mode",
+    "Font larger",
+    "Font smaller",
+    "Font reset",
+    "Stop the running job",
+    "Run again",
+    "Show jobs",
+    "Select word",
+    "Select line",
+    "Reopen closed tab",
+    "Bookmarks",
+    "Go to last edit",
+    "Revert file",
+    "Compare with disk",
+    "Reveal in tree",
+    "Open folder",
+    "Sort lines ascending",
+    "Sort lines descending",
+    "Sort lines unique",
+    "Reverse lines",
+    "Upper case",
+    "Lower case",
+    "Title case",
+    "Delete line",
+    "Transpose characters",
+    "Indent lines",
+    "Outdent lines",
+    "Toggle line endings",
+    "Take checkpoint",
+    "Compare side by side",
+    "Revert this change",
+    "Peek change",
+]
+
+## Key names a spec may end with besides one character and `f1` to `f24`.
+NAMED := [
+    "up",
+    "down",
+    "left",
+    "right",
+    "home",
+    "end",
+    "pageup",
+    "pagedown",
+    "tab",
+    "enter",
+    "escape",
+    "backspace",
+    "delete",
+    "insert",
+    "space",
+]
+
+fn bind(command str, key str) Binding
+    Binding(command: command, key: key)
+
+## Today's key table: every row of `key_rows()` in `edit.ail` that has a
+## key, with the key exactly as that row writes it, in the table's order.
+pub fn classic() List[Binding]
+    [
+        bind("Go to the start of the file", "ctrl+home"),
+        bind("Go to the end of the file", "ctrl+end"),
+        bind("Select all", "ctrl+a"),
+        bind("Copy", "ctrl+c"),
+        bind("Cut", "ctrl+x"),
+        bind("Paste", "ctrl+v"),
+        bind("Complete", "ctrl+space"),
+        bind("Go to definition", "f12"),
+        bind("Find references", "shift+f12"),
+        bind("Show info", "ctrl+i"),
+        bind("Rename", "f2"),
+        bind("Format", "alt+shift+f"),
+        bind("Toggle comment", "ctrl+/"),
+        bind("Duplicate line", "ctrl+d"),
+        bind("Move line up", "alt+up"),
+        bind("Move line down", "alt+down"),
+        bind("Add next occurrence", "alt+d"),
+        bind("Add caret above", "alt+shift+up"),
+        bind("Add caret below", "alt+shift+down"),
+        bind("Fold or unfold block", "ctrl+shift+["),
+        bind("Unfold all", "ctrl+shift+]"),
+        bind("Zen mode", "f11"),
+        bind("Split view", "ctrl+\\"),
+        bind("Go to line", "ctrl+g"),
+        bind("Undo", "ctrl+z"),
+        bind("Redo", "ctrl+y"),
+        bind("Find", "ctrl+f"),
+        bind("Find regex", "alt+r"),
+        bind("Find next", "f3"),
+        bind("Replace", "ctrl+r"),
+        bind("Save", "ctrl+s"),
+        bind("Check", "ctrl+k"),
+        bind("Apply fix", "ctrl+."),
+        bind("Explain diagnostic", "f1"),
+        bind("Outline", "ctrl+o"),
+        bind("Run file", "f5"),
+        bind("Test file", "f6"),
+        bind("Run with trace", "shift+f5"),
+        bind("Probe line", "ctrl+shift+r"),
+        bind("Watch variable", "ctrl+shift+w"),
+        bind("Trap values", "shift+f7"),
+        bind("Next probe or trace hit", "f9"),
+        bind("Failure paths", "ctrl+shift+e"),
+        bind("Problems", "ctrl+shift+m"),
+        bind("Program card", "ctrl+shift+i"),
+        bind("Test coverage", "ctrl+shift+c"),
+        bind("Semantic diff", "ctrl+shift+d"),
+        bind("Verify change", "ctrl+shift+v"),
+        bind("File tree", "ctrl+b"),
+        bind("Tests on save", "ctrl+shift+u"),
+        bind("Test tree", "ctrl+shift+j"),
+        bind("Test under the cursor", "shift+f6"),
+        bind("Replay failed test", "ctrl+shift+y"),
+        bind("Shrink failure", "ctrl+shift+z"),
+        bind("Check contracts", "ctrl+shift+x"),
+        bind("Task panel", "ctrl+shift+k"),
+        bind("Affected tests", "f8"),
+        bind("Task verify", "f7"),
+        bind("Copy for agent", "alt+shift+c"),
+        bind("Apply agent edit", "alt+shift+v"),
+        bind("Replace in files", "ctrl+shift+h"),
+        bind("Search the project", "ctrl+shift+f"),
+        bind("Ask", "ctrl+shift+a"),
+        bind("Call hierarchy", "alt+shift+h"),
+        bind("Go to symbol", "ctrl+t"),
+        bind("Next search result", "f4"),
+        bind("Open file", "ctrl+p"),
+        bind("Next tab", "ctrl+tab"),
+        bind("Previous tab", "ctrl+shift+tab"),
+        bind("Close tab", "ctrl+w"),
+        bind("Larger font", "ctrl+="),
+        bind("Smaller font", "ctrl+-"),
+        bind("Default font size", "ctrl+0"),
+        bind("Next theme", "ctrl+shift+t"),
+        bind("Settings", "ctrl+,"),
+        bind("New project", "ctrl+shift+n"),
+        bind("Fix all", "ctrl+shift+."),
+        bind("Signature help", "ctrl+shift+space"),
+        bind("Inlay hints", "alt+i"),
+        bind("Quit", "ctrl+q"),
+        bind("Match case", "alt+c"),
+        bind("Whole word", "alt+w"),
+        bind("Find previous", "shift+f3"),
+        bind("Go back", "alt+left"),
+        bind("Go forward", "alt+right"),
+        bind("Toggle bookmark", "ctrl+alt+k"),
+        bind("Next bookmark", "ctrl+alt+l"),
+        bind("Previous bookmark", "ctrl+alt+j"),
+        bind("Go to matching bracket", "ctrl+shift+\\"),
+        bind("Save as", "ctrl+shift+s"),
+        bind("Save all", "ctrl+alt+s"),
+        bind("Join lines", "ctrl+j"),
+        bind("Select line", "ctrl+l"),
+        bind("Expand selection", "alt+shift+right"),
+        bind("Shrink selection", "alt+shift+left"),
+        bind("Box select up", "ctrl+alt+up"),
+        bind("Box select down", "ctrl+alt+down"),
+        bind("Toggle word wrap", "alt+z"),
+        bind("Review changes", "ctrl+alt+r"),
+        bind("Next change", "alt+f5"),
+        bind("Previous change", "shift+alt+f5"),
+    ]
+
+## The proposed default: the key VS Code users expect for each command
+## where VS Code has a well-known single key, else the classic key, else a
+## free Ctrl-Alt key, else the palette (`PALETTE_ONLY_IN_VSCODE`). Moved from
+## classic: Ctrl-D adds the next occurrence (Duplicate line is
+## Alt-Shift-Down), Ctrl-H replaces, Ctrl-Shift-T reopens a closed tab,
+## Ctrl-Shift-K deletes the line, Ctrl-Shift-E reveals the file in the tree,
+## Shift-F5 stops the job, Ctrl-Shift-O is the outline, Ctrl-Alt-Up and
+## Down add carets (box selection adds Shift). F1 and F8 are left free: F1
+## opens the palette (`palette_keys`) and F8 is next problem in VS Code,
+## which this editor has no command for yet. A command may have two keys
+## (Redo: Ctrl-Y and Ctrl-Shift-Z, as on macOS; Show jobs: Ctrl-` and Ctrl-J).
+pub fn vscode() List[Binding]
+    [
+        bind("Go to the start of the file", "ctrl+home"),
+        bind("Go to the end of the file", "ctrl+end"),
+        bind("Select all", "ctrl+a"),
+        bind("Copy", "ctrl+c"),
+        bind("Cut", "ctrl+x"),
+        bind("Paste", "ctrl+v"),
+        bind("Complete", "ctrl+space"),
+        bind("Go to definition", "f12"),
+        bind("Find references", "shift+f12"),
+        bind("Show info", "ctrl+i"),
+        bind("Rename", "f2"),
+        bind("Format", "alt+shift+f"),
+        bind("Toggle comment", "ctrl+/"),
+        bind("Duplicate line", "alt+shift+down"),
+        bind("Move line up", "alt+up"),
+        bind("Move line down", "alt+down"),
+        bind("Add next occurrence", "ctrl+d"),
+        bind("Select all occurrences", "ctrl+shift+l"),
+        bind("Add caret above", "ctrl+alt+up"),
+        bind("Add caret below", "ctrl+alt+down"),
+        bind("Fold or unfold block", "ctrl+shift+["),
+        bind("Unfold all", "ctrl+shift+]"),
+        bind("Zen mode", "f11"),
+        bind("Split view", "ctrl+\\"),
+        bind("Go to line", "ctrl+g"),
+        bind("Undo", "ctrl+z"),
+        bind("Redo", "ctrl+y"),
+        bind("Redo", "ctrl+shift+z"),
+        bind("Find", "ctrl+f"),
+        bind("Find regex", "alt+r"),
+        bind("Find next", "f3"),
+        bind("Find previous", "shift+f3"),
+        bind("Match case", "alt+c"),
+        bind("Whole word", "alt+w"),
+        bind("Replace", "ctrl+h"),
+        bind("Save", "ctrl+s"),
+        bind("Save as", "ctrl+shift+s"),
+        bind("Save all", "ctrl+alt+s"),
+        bind("Check", "ctrl+k"),
+        bind("Apply fix", "ctrl+."),
+        bind("Fix all", "ctrl+shift+."),
+        bind("Explain diagnostic", "ctrl+alt+h"),
+        bind("Outline", "ctrl+shift+o"),
+        bind("Go to symbol", "ctrl+t"),
+        bind("Run file", "f5"),
+        bind("Stop the running job", "shift+f5"),
+        bind("Run again", "ctrl+shift+f5"),
+        bind("Show jobs", "ctrl+`"),
+        bind("Show jobs", "ctrl+j"),
+        bind("Test file", "f6"),
+        bind("Run with trace", "ctrl+alt+x"),
+        bind("Probe line", "ctrl+shift+r"),
+        bind("Watch variable", "ctrl+shift+w"),
+        bind("Trap values", "shift+f7"),
+        bind("Next probe or trace hit", "f9"),
+        bind("Failure paths", "ctrl+alt+e"),
+        bind("Problems", "ctrl+shift+m"),
+        bind("Program card", "ctrl+shift+i"),
+        bind("Test coverage", "ctrl+shift+c"),
+        bind("Semantic diff", "ctrl+shift+d"),
+        bind("Verify change", "ctrl+shift+v"),
+        bind("File tree", "ctrl+b"),
+        bind("Reveal in tree", "ctrl+shift+e"),
+        bind("Tests on save", "ctrl+shift+u"),
+        bind("Test tree", "ctrl+shift+j"),
+        bind("Test under the cursor", "shift+f6"),
+        bind("Replay failed test", "ctrl+shift+y"),
+        bind("Shrink failure", "ctrl+alt+z"),
+        bind("Check contracts", "ctrl+shift+x"),
+        bind("Task panel", "ctrl+alt+p"),
+        bind("Affected tests", "ctrl+alt+a"),
+        bind("Task verify", "f7"),
+        bind("Copy for agent", "alt+shift+c"),
+        bind("Apply agent edit", "alt+shift+v"),
+        bind("Replace in files", "ctrl+shift+h"),
+        bind("Search the project", "ctrl+shift+f"),
+        bind("Ask", "ctrl+shift+a"),
+        bind("Call hierarchy", "alt+shift+h"),
+        bind("Next search result", "f4"),
+        bind("Open file", "ctrl+p"),
+        bind("New file", "ctrl+n"),
+        bind("Next tab", "ctrl+tab"),
+        bind("Previous tab", "ctrl+shift+tab"),
+        bind("Close tab", "ctrl+w"),
+        bind("Reopen closed tab", "ctrl+shift+t"),
+        bind("Larger font", "ctrl+="),
+        bind("Smaller font", "ctrl+-"),
+        bind("Default font size", "ctrl+0"),
+        bind("Settings", "ctrl+,"),
+        bind("New project", "ctrl+shift+n"),
+        bind("Signature help", "ctrl+shift+space"),
+        bind("Inlay hints", "alt+i"),
+        bind("Quit", "ctrl+q"),
+        bind("Go back", "alt+left"),
+        bind("Go forward", "alt+right"),
+        bind("Toggle bookmark", "ctrl+alt+k"),
+        bind("Next bookmark", "ctrl+alt+l"),
+        bind("Previous bookmark", "ctrl+alt+j"),
+        bind("Go to matching bracket", "ctrl+shift+\\"),
+        bind("Select line", "ctrl+l"),
+        bind("Delete line", "ctrl+shift+k"),
+        bind("Indent lines", "ctrl+]"),
+        bind("Outdent lines", "ctrl+["),
+        bind("Expand selection", "alt+shift+right"),
+        bind("Shrink selection", "alt+shift+left"),
+        bind("Box select up", "ctrl+alt+shift+up"),
+        bind("Box select down", "ctrl+alt+shift+down"),
+        bind("Toggle word wrap", "alt+z"),
+        bind("Review changes", "ctrl+alt+r"),
+        bind("Next change", "alt+f5"),
+        bind("Previous change", "alt+shift+f5"),
+    ]
+
+## The preset names, in the order the Settings list cycles through them.
+pub fn names() List[str]
+    ["classic", "vscode"]
+
+## The preset called `name`; `none` for an unknown name.
+pub fn preset(name str) List[Binding]?
+    if name == "classic"
+        return classic()
+    if name == "vscode"
+        return vscode()
+    none
+
+## The keys that open the command palette in a preset (the workspace
+## handles them itself; no binding of the preset uses them).
+pub fn palette_keys(name str) List[str]
+    if name == "vscode"
+        return ["ctrl+shift+p", "f1"]
+    ["ctrl+shift+p"]
+
+# ---- Specs --------------------------------------------------------------
+
+fn modifier(m str) str?
+    match m
+        "ctrl" | "control" | "cmd" | "command" => "ctrl"
+        "alt" | "option" | "opt" => "alt"
+        "shift" => "shift"
+        _ => none
+
+fn key_alias(k str) str
+    match k
+        "esc" => "escape"
+        "return" => "enter"
+        "plus" => "+"
+        "minus" => "-"
+        "del" => "delete"
+        "ins" => "insert"
+        "pgup" => "pageup"
+        "pgdn" => "pagedown"
+        "spacebar" => "space"
+        "backtick" => "`"
+        _ => k
+
+## The key part of a spec in its one spelling, or `none`.
+fn key_name(k str) str?
+    n := key_alias(k)
+    if NAMED.contains(n)
+        return n
+    if n.len() == 1
+        return n
+    if n.len() >= 2 and n.starts_with("f")
+        num := n.slice(1, n.len()).to_int() else return none
+        if num >= 1 and num <= 24
+            return "f{num}"
+    none
+
+## The spec in its one spelling: modifiers in the order ctrl, alt, shift,
+## lower case, `+` between them (`-` is accepted too, so the README's
+## `Ctrl-Shift-P` reads), and the aliases `cmd`, `command`, `control`,
+## `option`, `opt`, `esc`, `return`, `plus`, `minus`, `del`, `ins`,
+## `pgup`, `pgdn`, `spacebar`, `backtick`. `none` when it is no key.
+pub fn normalize(spec str) str?
+    s := spec.trim().to_lower()
+    cs := s.chars()
+    n := cs.len()
+    if n == 0
+        return none
+    mut key := s
+    mut mods := ""
+    if n >= 2 and (cs[n - 1] == '+' or cs[n - 1] == '-') and (cs[n - 2] == '+' or cs[n - 2] == '-')
+        key = "{cs[n - 1]}"
+        mods = s.slice(0, n - 2)
+    elif n >= 2
+        mut last := -1
+        for i in 0..n
+            if cs[i] == '+' or cs[i] == '-'
+                last = i
+        if last == n - 1
+            return none
+        if last >= 0
+            key = s.slice(last + 1, n)
+            mods = s.slice(0, last)
+    mut ctrl := false
+    mut alt := false
+    mut shift := false
+    if mods != ""
+        for part in mods.replace("-", "+").split("+")
+            m := modifier(part.trim()) else return none
+            if m == "ctrl"
+                ctrl = true
+            elif m == "alt"
+                alt = true
+            else
+                shift = true
+    k := key_name(key.trim()) else return none
+    mut out := ""
+    if ctrl
+        out = "ctrl+"
+    if alt
+        out = "{out}alt+"
+    if shift
+        out = "{out}shift+"
+    "{out}{k}"
+
+fn key_shown(k str) str
+    match k
+        "up" => "Up"
+        "down" => "Down"
+        "left" => "Left"
+        "right" => "Right"
+        "home" => "Home"
+        "end" => "End"
+        "pageup" => "PageUp"
+        "pagedown" => "PageDown"
+        "tab" => "Tab"
+        "enter" => "Enter"
+        "escape" => "Escape"
+        "backspace" => "Backspace"
+        "delete" => "Delete"
+        "insert" => "Insert"
+        "space" => "Space"
+        _ => k.to_upper()
+
+## A spec as the README shows keys: `ctrl+shift+p` is `Ctrl-Shift-P`,
+## `alt+left` is `Alt-Left`, `f5` is `F5`. A spec that is no key is shown
+## as written.
+pub fn shown(spec str) str
+    s := normalize(spec) else return spec
+    mut out := ""
+    mut rest := s
+    if r1 := rest.strip_prefix("ctrl+")
+        out = "Ctrl-"
+        rest = r1
+    if r2 := rest.strip_prefix("alt+")
+        out = "{out}Alt-"
+        rest = r2
+    if r3 := rest.strip_prefix("shift+")
+        out = "{out}Shift-"
+        rest = r3
+    "{out}{key_shown(rest)}"
+
+# ---- Resolving ----------------------------------------------------------
+
+## The key map the editor dispatches with: each normalized spec to its
+## command, the preset's bindings first, then the user's (`bind.` lines),
+## a user binding replacing the preset's command on the same key. Bindings
+## whose key is no key are left out.
+pub fn resolve(preset List[Binding], user List[Binding]) Map[str, str]
+    mut out := Map[str, str]()
+    for b in preset
+        spec := normalize(b.key) else continue
+        out[spec] = b.command
+    for b in user
+        uspec := normalize(b.key) else continue
+        out[uspec] = b.command
+    out
+
+## The keys (normalized) that two different commands of `bindings` claim,
+## each once, in the order they are first claimed twice.
+pub fn conflicts(bindings List[Binding]) List[str]
+    mut owner := Map[str, str]()
+    mut out := List[str]()
+    for b in bindings
+        spec := normalize(b.key) else continue
+        if prev := owner.get(spec)
+            if prev != b.command and not out.contains(spec)
+                out.push(spec)
+        else
+            owner[spec] = b.command
+    out
+
+## The key of `command` in a resolved map, as the README shows it (for the
+## palette and menus); "" when no key runs it. With several keys, the one
+## the map holds first.
+pub fn key_for(command str, resolved Map[str, str]) str
+    for spec, cmd in resolved
+        if cmd == command
+            return shown(spec)
+    ""
+
+## Every key of `command` in `bindings`, shown, in order.
+fn keys_of(command str, bindings List[Binding]) List[str]
+    mut out := List[str]()
+    for b in bindings
+        if b.command == command
+            out.push(shown(b.key))
+    out
+
+## The README key table for a preset: a header, then one line per row.
+## For `classic` the rows' own keys are shown, so the table is today's;
+## for another preset a command's keys come from the preset ("palette"
+## when it has none), and a row that is no command keeps its keys (the
+## palette row shows the preset's palette keys). Empty for an unknown
+## preset.
+pub fn table(preset_name str, rows List[Row]) List[str]
+    bs := preset(preset_name) else return List[str]()
+    mut out := ["| Key | Does |", "|---|---|"]
+    for r in rows
+        mut keys := r.keys
+        if preset_name != "classic"
+            if r.name != ""
+                got := keys_of(r.name, bs)
+                keys = if got.len() == 0 then "palette" else got.join(", ")
+            elif (normalize(r.keys) else "") == "ctrl+shift+p"
+                mut ps := List[str]()
+                for p in palette_keys(preset_name)
+                    ps.push(shown(p))
+                keys = ps.join(", ")
+        out.push("| {keys} | {r.does} |")
+    out
+
+# ---- Tests --------------------------------------------------------------
+
+fn command_names(bs List[Binding]) List[str]
+    mut out := List[str]()
+    for b in bs
+        if not out.contains(b.command)
+            out.push(b.command)
+    out
+
+@test fn presets_have_no_conflicts_and_spare_the_palette_keys()
+    assert_eq(names(), ["classic", "vscode"])
+    for name in names()
+        bs := preset(name) else unreachable("listed")
+        assert_eq(conflicts(bs), List[str]())
+        for b in bs
+            spec := normalize(b.key) else unreachable("every key is a key")
+            assert(not palette_keys(name).contains(spec), "{name}: {b.key}")
+    assert(preset("emacs") == none)
+    assert_eq(classic().len(), 101)
+
+@test fn every_classic_command_is_in_vscode_or_listed_palette_only()
+    vs := command_names(vscode())
+    for name in command_names(classic())
+        assert(vs.contains(name) or PALETTE_ONLY_IN_VSCODE.contains(name), name)
+    for name in PALETTE_ONLY_IN_VSCODE
+        assert(not vs.contains(name), name)
+    known := command_names(classic())
+    for name in vs
+        assert(known.contains(name) or PALETTE_COMMANDS.contains(name), name)
+
+@test fn vscode_keys_are_the_well_known_ones()
+    m := resolve(vscode(), List[Binding]())
+    assert_eq(m["ctrl+d"], "Add next occurrence")
+    assert_eq(m["ctrl+shift+k"], "Delete line")
+    assert_eq(m["ctrl+h"], "Replace")
+    assert_eq(m["ctrl+shift+t"], "Reopen closed tab")
+    assert_eq(m["ctrl+shift+l"], "Select all occurrences")
+    assert_eq(m["shift+f5"], "Stop the running job")
+    assert_eq(m["ctrl+`"], "Show jobs")
+    assert_eq(m["alt+shift+f5"], "Previous change")
+    assert(m.get("f8") == none)
+
+@test fn normalize_orders_lowers_and_reads_aliases()
+    assert_eq(normalize("Shift+Ctrl+P") else "", "ctrl+shift+p")
+    assert_eq(normalize("cmd+option+esc") else "", "ctrl+alt+escape")
+    assert_eq(normalize("ctrl+plus") else "", "ctrl++")
+    assert_eq(normalize("ctrl++") else "", "ctrl++")
+    assert_eq(normalize("Ctrl--") else "", "ctrl+-")
+    assert_eq(normalize("return") else "", "enter")
+    assert_eq(normalize("F5") else "", "f5")
+    assert_eq(normalize("shift+alt+f5") else "", "alt+shift+f5")
+    assert_eq(normalize(" Ctrl-Shift-[ ") else "", "ctrl+shift+[")
+    assert(normalize("") == none)
+    assert(normalize("hyper+a") == none)
+    assert(normalize("ctrl+") == none)
+    assert(normalize("ctrl+f99") == none)
+    assert(normalize("ctrl+banana") == none)
+
+@test fn shown_matches_the_readme_and_round_trips()
+    assert_eq(shown("ctrl+shift+p"), "Ctrl-Shift-P")
+    assert_eq(shown("alt+left"), "Alt-Left")
+    assert_eq(shown("f5"), "F5")
+    assert_eq(shown("ctrl+\\"), "Ctrl-\\")
+    assert_eq(shown("shift+alt+f5"), "Alt-Shift-F5")
+    assert_eq(shown("ctrl+-"), "Ctrl--")
+    assert_eq(shown("ctrl+space"), "Ctrl-Space")
+    assert_eq(shown("not a key"), "not a key")
+    mut all_keys := classic()
+    all_keys.extend(vscode())
+    for b in all_keys
+        spec := normalize(b.key) else unreachable("a key")
+        assert_eq(normalize(shown(b.key)) else "", spec)
+        assert_eq(normalize(spec) else "", spec)
+
+@test fn user_bindings_win_and_conflicts_are_found()
+    user := [bind("Next theme", "ctrl+h"), bind("Quit", "Ctrl+Alt+Q")]
+    m := resolve(vscode(), user)
+    assert_eq(m["ctrl+h"], "Next theme")
+    assert_eq(m["ctrl+alt+q"], "Quit")
+    assert_eq(key_for("Quit", m), "Ctrl-Q")
+    assert_eq(key_for("Next theme", m), "Ctrl-H")
+    assert_eq(key_for("Replace", m), "")
+    assert_eq(key_for("Redo", m), "Ctrl-Y")
+    clash := [bind("A", "ctrl+x"), bind("B", "Ctrl+X"), bind("A", "ctrl+x"), bind("C", "ctrl+x")]
+    assert_eq(conflicts(clash), ["ctrl+x"])
+    assert_eq(conflicts([bind("A", "f1"), bind("A", "F1")]), List[str]())
+
+@test fn table_shows_each_presets_keys()
+    rows := [
+        Row(keys: "Arrows", name: "", does: "Move"),
+        Row(keys: "Ctrl-D", name: "Duplicate line", does: "Duplicate"),
+        Row(keys: "palette", name: "Delete line", does: "Delete"),
+        Row(keys: "Ctrl-Shift-T", name: "Next theme", does: "Theme"),
+        Row(keys: "Ctrl-Shift-P", name: "", does: "Palette"),
+        Row(keys: "Ctrl-Y", name: "Redo", does: "Redo"),
+    ]
+    c := table("classic", rows)
+    assert_eq(c[0], "| Key | Does |")
+    assert_eq(c[1], "|---|---|")
+    assert_eq(c[3], "| Ctrl-D | Duplicate |")
+    assert_eq(c[4], "| palette | Delete |")
+    v := table("vscode", rows)
+    assert_eq(v.len(), 8)
+    assert_eq(v[2], "| Arrows | Move |")
+    assert_eq(v[3], "| Alt-Shift-Down | Duplicate |")
+    assert_eq(v[4], "| Ctrl-Shift-K | Delete |")
+    assert_eq(v[5], "| palette | Theme |")
+    assert_eq(v[6], "| Ctrl-Shift-P, F1 | Palette |")
+    assert_eq(v[7], "| Ctrl-Y, Ctrl-Shift-Z | Redo |")
+    assert_eq(table("emacs", rows), List[str]())
