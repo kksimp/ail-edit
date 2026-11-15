@@ -449,7 +449,7 @@ fn at(path str, line int) Place
     assert_eq(b.lines_in("a"), [3, 10])
 
 @test fn brackets_match_both_ways()
-    lines := ["f(a[1], {b})", "    x)", "y("]
+    lines := ["f(a[1], \{b})", "    x)", "y("]
     assert_eq(matching_bracket(lines, 0, 1), Place(path: "", line: 0, col: 11))
     assert_eq(matching_bracket(lines, 0, 12), Place(path: "", line: 0, col: 1))
     assert_eq(matching_bracket(lines, 0, 3), Place(path: "", line: 0, col: 5))
