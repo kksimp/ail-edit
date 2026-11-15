@@ -31,6 +31,8 @@ use features.agent
 use features.ask
 use features.jobs as jb
 use features.pointer
+use features.find
+use features.nav
 
 # Colors, 0xRRGGBB.
 BG := 0x1e1e1e
@@ -240,6 +242,8 @@ struct Editor
     layer sem.State
     ## The bottom pane's rows the person dragged it to (parity P7), 0 for automatic.
     pane_h int
+    ## The find bar's toggles, history and selection (features/find, parity P9).
+    findbar FindBar
 
 fn Editor.new(path str, text str, cols int, rows int) Editor
     mut lines := text.split("\n")
@@ -296,6 +300,7 @@ fn Editor.new(path str, text str, cols int, rows int) Editor
         anchor_col: 0,
         clip: "",
         pane_h: 0,
+        findbar: FindBar.new(),
     )
 
 ## The buffer as file text: lines joined with `\n`, ending with one.
@@ -2356,16 +2361,13 @@ fn Editor.open_prompt(mut self, p Prompt)
     self.input = ""
     if p == FindText
         self.query = ""
+        self.find_open()
     self.show_prompt()
 
 fn Editor.show_prompt(mut self)
     self.message = match self.prompt
         NoPrompt => ""
-        FindText =>
-            if self.message.ends_with("(not found)")
-                "{find_label(self.regex_find)}{self.query}_   (not found)"
-            else
-                "{find_label(self.regex_find)}{self.query}_   (Enter/F3 next, Alt-R regex, Ctrl-R replace, Esc)"
+        FindText => self.find_prompt_text()
         ReplaceText => "replace `{self.query}` with: {self.input}_   (Enter one, Ctrl-Enter all, Esc)"
         LineNumber => "go to line: {self.input}_"
         RenameTo =>
@@ -2446,45 +2448,46 @@ fn drop_last(s str) str
     s.slice(0, (s.len() - 1).max(0))
 
 ## Replaces the match at the cursor, if the cursor is on one, then finds
-## the next.
+## the next. A regex query expands `$1` in the replacement (features/find).
 fn Editor.replace_one(mut self)
-    q := self.query.chars()
-    cs := self.cur()
-    if self.col + q.len() <= cs.len() and cs[self.col..self.col + q.len()] == q
-        self.replace(self.line, self.col, self.line, self.col + q.len(), self.input)
-        self.prompt = ReplaceText
+    m := self.find_matcher() else
+        self.find(false)
+        self.show_prompt()
+        return
+    for hit in m.search(self.lines, FIND_LIMIT)
+        if hit.line == self.line and hit.col == self.col
+            found := self.lines[hit.line].slice(hit.col, hit.col + hit.len)
+            self.replace(hit.line, hit.col, hit.line, hit.col + hit.len, m.replacement(found, self.input, false))
+            self.prompt = ReplaceText
+            break
     self.find(false)
     self.show_prompt()
 
-## Replaces every match of `query` with `input`, as one undo step.
+## Replaces every match of `query` with `input` (within the find bar's
+## selection, if any), as one undo step; a regex query expands `$1`.
 fn Editor.replace_all(mut self)
-    q := self.query.chars()
-    if q.len() == 0
+    if self.query == ""
         return
-    mut count := 0
-    mut out := List[str]()
-    for l in self.lines
-        cs := l.chars()
-        mut parts := List[str]()
-        mut i := 0
-        mut last := 0
-        while i + q.len() <= cs.len()
-            if cs[i..i + q.len()] == q
-                parts.push(cs[last..i].join(""))
-                parts.push(self.input)
-                i += q.len()
-                last = i
-                count += 1
-            else
-                i += 1
-        parts.push(cs[last..].join(""))
-        out.push(parts.join(""))
-    if count > 0
+    m := self.find_matcher() else err
+        self.prompt = NoPrompt
+        self.message = "bad regex: {err.message}"
+        return
+    ms := m.search(self.lines, FIND_LIMIT)
+    mut out := self.lines
+    mut i := 0
+    while i < ms.len()
+        l := ms[i].line
+        mut mine := List[find.Match]()
+        while i < ms.len() and ms[i].line == l
+            mine.push(ms[i])
+            i += 1
+        out[l] = replace_matches(out[l], mine, m, self.input)
+    if ms.len() > 0
         self.snapshot()
         self.lines = out
         self.set_col(self.col.min(self.cur().len()))
     self.prompt = NoPrompt
-    self.message = "replaced {count}"
+    self.message = "replaced {ms.len()}"
 
 ## Replaces `q` by `by` on the lines `at` (0-based) as one undo step.
 fn Editor.replace_on(mut self, q str, by str, at List[int])
@@ -2509,30 +2512,12 @@ fn find_in(cs List[char], q List[char], start int) int?
     none
 
 ## Moves the cursor to the next match of `query`: at the cursor, or after it
-## when `next`, wrapping around the end of the buffer.
+## when `next`, wrapping around the end of the buffer (`Editor.find_go`).
 fn Editor.find(mut self, next bool)
-    q := self.query.chars()
-    if q.len() == 0
-        self.message = "find: "
-        return
-    mut start := self.col
     if next
-        start += 1
-    n := self.lines.len()
-    for k in 0..n + 1
-        l := (self.line + k) % n
-        mut from := 0
-        if k == 0
-            from = start
-        cs := self.lines[l].chars()
-        if from > cs.len()
-            continue
-        if c := match_from(cs, q, from, self.regex_find)
-            self.line = l
-            self.set_col(c)
-            self.message = "{find_label(self.regex_find)}{self.query}"
-            return
-    self.message = "{find_label(self.regex_find)}{self.query} (not found)"
+        self.find_go(1)
+    else
+        self.find_go(0)
 
 ## Where `q` first matches in `cs` from column `from`: its characters, or
 ## with `rx` the regex `q` (std.regex, leftmost, ADR 0490), or none.
@@ -3406,7 +3391,7 @@ DIAG_JSON := "\{\"api\":1,\"severity\":\"error\",\"rule\":\"expr.name.1\",\"file
     ed.apply(ToggleRegex)
     assert_eq(ed.regex_find, true)
     assert_eq([ed.line, ed.col], [0, 11])
-    assert(ed.message.starts_with("find (regex): "))
+    assert(ed.message.starts_with("find [.*]: "))
     ed.apply(Escape)
     assert_eq(ed.prompt, NoPrompt)
 
@@ -4580,6 +4565,8 @@ fn Editor.on_event(mut self, ev ui.Event)
     match ev
         Key(code, ctrl, alt, shift) =>
             k := code.name()
+            if self.findbar_event(k, ctrl, alt, shift)
+                return
             if cmd := extra_key(k, ctrl, alt, shift)
                 self.run_extra(cmd)
             elif cmd := key_command(k, ctrl, alt, shift)
@@ -5402,6 +5389,53 @@ fn key_rows() List[KeyRow]
             "",
             "Double-click selects a word, triple-click a line, a drag after either extends by words or lines; Cmd- or Ctrl-click goes to the definition; drag the scrollbar thumb, click above or below it to page; click or drag the minimap; drag the tree's edge or the status bar's top edge to resize (saved as `treew`, `paneh`); resting on the text shows the diagnostic or the info for the name there; right-click menus on the text, tabs and tree; middle-click closes a tab; click the status position (Go to line) or counts (Problems); click the gutter to fold, run the test that starts there (marked T) or show the line's diagnostic; Shift-wheel or a sideways wheel scrolls sideways, Ctrl-wheel zooms",
         ),
+        key_row(
+            "Alt-C",
+            "Match case",
+            "alt+c",
+            "Find bar: match case exactly, shown as `[Aa]`; off, the query is case sensitive only when it has a capital (smart case)",
+        ),
+        key_row("Alt-W", "Whole word", "alt+w", "Find bar: whole words only, shown as `[W]`"),
+        key_row(
+            "Shift-F3",
+            "Find previous",
+            "shift+f3",
+            "The previous match (Shift-Enter in the find bar). The bar shows `3 of 17`, Up and Down walk its history, and opening it over a selection of several lines searches only there",
+        ),
+        key_row(
+            "Alt-Left",
+            "Go back",
+            "alt+left",
+            "Back to where the last jump left (definition, references, outline, search hit, go to line, a far click, a tab switch, a bookmark), opening the file if needed",
+        ),
+        key_row("Alt-Right", "Go forward", "alt+right", "Forward again after Go back"),
+        key_row("palette", "Reopen closed tab", "", "Opens the last closed tab again, at its caret"),
+        key_row(
+            "Ctrl-Alt-K",
+            "Toggle bookmark",
+            "ctrl+alt+k",
+            "Sets or clears a bookmark on the line, marked `*` in the gutter",
+        ),
+        key_row(
+            "Ctrl-Alt-L",
+            "Next bookmark",
+            "ctrl+alt+l",
+            "The next bookmarked line of the file, wrapping",
+        ),
+        key_row(
+            "Ctrl-Alt-J",
+            "Previous bookmark",
+            "ctrl+alt+j",
+            "The previous bookmarked line of the file, wrapping",
+        ),
+        key_row("palette", "Bookmarks", "", "Lists every bookmark in the pane; Enter jumps"),
+        key_row(
+            "Ctrl-Shift-\\",
+            "Go to matching bracket",
+            "ctrl+shift+\\",
+            "Jumps to the bracket matching the one at or before the caret, skipping strings and comments",
+        ),
+        key_row("palette", "Go to last edit", "", "The place of the last edit; again goes to the one before"),
     ]
 
 ## The README's key table (`--keys`).
@@ -5649,6 +5683,9 @@ fn Workspace.run_command(mut self, name str)
         "Show jobs" => self.show_jobs()
         "Select word" => self.eds[self.active].run(Depth("word"))
         "Select line" => self.eds[self.active].run(Depth("line"))
+        "Reopen closed tab" => self.reopen_tab()
+        "Bookmarks" => self.show_bookmarks()
+        "Go to last edit" => self.go_last_edit()
         _ => self.message = "no command `{name}`"
 
 ## The "New file" palette row: the file picker, with a hint.
@@ -5737,6 +5774,9 @@ struct Workspace
     jobs jb.Jobs
     ## The tree width and pane height the person dragged them to (parity P7).
     ptr pointer.Sizes
+    ## Back and forward, last-used tabs, closed tabs, bookmarks and edit
+    ## places (features/nav, parity P9).
+    nav_state NavState
 
 fn Workspace.new(ed Editor) Workspace
     Workspace(
@@ -5789,6 +5829,7 @@ fn Workspace.new(ed Editor) Workspace
         askbar: ask.Bar.new(),
         jobs: jb.Jobs.new(),
         ptr: pointer.Sizes(treew: 0, paneh: 0),
+        nav_state: NavState.new(),
     )
 
 ## The file name a tab shows: the path after its last `/`.
@@ -5834,6 +5875,8 @@ fn Workspace.close_tab(mut self)
     self.eds[self.active].apply(Quit)
     if not self.eds[self.active].quit
         return
+    closing := self.eds[self.active]
+    self.nav_state.recent.closed(closing.path, closing.line, closing.col)
     mut rest := List[Editor]()
     for i in 0..self.eds.len()
         if i != self.active
@@ -5865,12 +5908,17 @@ fn Workspace.quit_all(mut self)
     self.quit = true
 
 fn Workspace.on_event(mut self, ev ui.Event)
+    before := self.nav_snap()
+    self.nav_state.depth += 1
+    mut sent := ev
     if self.binds.len() > 0
         if spec := event_spec(ev)
             if orig := workspace.translate(self.binds, spec)
-                self.dispatch(key_event(orig))
-                return
-    self.dispatch(ev)
+                sent = key_event(orig)
+    if not self.nav_event(sent)
+        self.dispatch(sent)
+    self.nav_state.depth -= 1
+    self.nav_after(before, sent)
 
 ## The spec (`ctrl+shift+t` form) of a key event; none for other events.
 fn event_spec(ev ui.Event) str?
@@ -5920,10 +5968,9 @@ fn Workspace.dispatch(mut self, ev ui.Event)
             if self.job_key(k.name(), ctrl, alt, shift)
                 return
             if wk := workspace_key(k.name(), ctrl, alt, shift)
-                n := self.eds.len()
                 match wk
-                    NextTab => self.active = (self.active + 1) % n
-                    PreviousTab => self.active = (self.active + n - 1) % n
+                    NextTab => self.cycle_tab(1)
+                    PreviousTab => self.cycle_tab(-1)
                     CloseTab => self.close_tab()
                     QuitAll => self.quit_all()
                     OpenFile => self.start_picking()
@@ -6395,7 +6442,7 @@ fn Workspace.search_event(mut self, ev ui.Event)
                 self.preview_replace()
             elif k == "enter"
                 self.searching = false
-                self.show_hits(self.search_project(self.search, 1000))
+                self.show_project_search()
             elif k == "backspace" and self.repl_step == 2
                 self.repl_with = drop_last(self.repl_with)
             elif k == "backspace"
@@ -6493,6 +6540,7 @@ fn Workspace.next_hit(mut self)
         return
     if not self.browsing
         self.hit_sel = (self.hit_sel + 1) % self.hits.len()
+        self.skip_headers()
     self.jump_to_hit()
     self.browsing = false
 
@@ -6507,6 +6555,8 @@ fn Workspace.render_search(self, mut s Screen)
             head = " replace `{self.search}` with: "
             entry = self.repl_with
         s.put(0, 0, "{head}{entry} ".pad_right(self.cols, ' '), STATUS_FG, SELECT_BG)
+        if self.repl_step < 2
+            s.put(0, head.chars().len() + entry.chars().len() + 2, "(QUERY  in:*.ail,docs/**,!build picks the files)", GUTTER_FG, SELECT_BG)
         s.text[0] = "{head}{entry}"
         s.cursor_row = 0
         s.cursor_col = head.chars().len() + entry.chars().len()
@@ -7148,19 +7198,29 @@ fn Workspace.start_replace(mut self)
     self.start_search()
     self.repl_step = 1
 
-## The preview: one row per changed line, `PATH:L:C: old -> new`.
+## The preview: one row per changed line, `PATH:L:C: old -> new`. The
+## query takes `in:GLOBS` and the find bar's toggles (features/find).
 fn Workspace.preview_replace(mut self)
-    found := self.search_project(self.search, 1000)
+    self.message = ""
+    q := search_parts(self.search).0
+    m := find.prepare(q, self.search_opts(q)) else err
+        self.repl_step = 0
+        self.message = "bad regex: {err.message}"
+        return
+    found := self.project_hits(m, search_parts(self.search).1, 1000)
     if found.len() == 0
         self.repl_step = 0
         self.message = "no match for `{self.search}`"
         return
     mut preview := List[Hit]()
+    mut seen := Set[str]()
     for h in found
-        old := h.text.split(": ")[1..].join(": ")
+        if not seen.add("{h.path}:{h.line}")
+            continue
+        after := replace_matches(h.text, m.in_line(h.line, h.text), m, self.repl_with)
         preview.push(Hit(
-            loc: h.loc,
-            text: "[x] {h.loc.path}:{h.loc.line}:{h.loc.col}: {old} -> {old.replace(self.search, self.repl_with)}",
+            loc: Loc(path: h.path, line: h.line + 1, col: h.col + 1),
+            text: "[x] {h.path}:{h.line + 1}:{h.col + 1}: {h.text.trim()} -> {after.trim()}",
         ))
     self.repl_skip = Set[int]()
     self.show_list("", preview)
@@ -7198,6 +7258,8 @@ fn Workspace.mark_rows(mut self, all bool)
 ## undoes each tab.
 fn Workspace.apply_replace(mut self)
     back := self.eds[self.active].path
+    q := search_parts(self.search).0
+    m := find.prepare(q, self.search_opts(q)) else return
     mut done := Set[str]()
     for i in 0..self.hits.len()
         p := self.hits[i].loc.path
@@ -7215,7 +7277,7 @@ fn Workspace.apply_replace(mut self)
         if at < 0
             self.open(p)
             at = self.active
-        self.eds[at].replace_on(self.search, self.repl_with, at_lines)
+        self.eds[at].replace_matching(m, self.repl_with, at_lines)
     self.open(back)
     self.browsing = false
     self.repl_step = 0
@@ -8042,6 +8104,7 @@ fn Workspace.render(self) Screen
         s.cursor_col = inner.cursor_col + x0
     self.agent_marks(mut s)
     self.render_jobs(mut s)
+    self.bookmark_marks(mut s)
     if self.tree_open
         self.render_tree(mut s)
     self.render_search(mut s)
@@ -9375,6 +9438,777 @@ fn key_ev_escape() app.Event
     mut k := app.key("escape")
     k.id = "edit"
     k
+# ---- Find and navigation (parity P9) -----------------------------------------
+
+## The most matches the find bar counts and Replace all changes.
+FIND_LIMIT := 100000
+## A caret move of more lines than this, or to another file, is a jump
+## that Go back returns to.
+NAV_JUMP_LINES := 8
+## The keys `Workspace.nav_event` takes before the workspace and the tab.
+NAV_KEYS := "alt+left alt+right ctrl+alt+k ctrl+alt+l ctrl+alt+j ctrl+shift+\\ ctrl+shift+|"
+
+## The find bar's state (features/find): match case (off is smart case),
+## whole word, the query history and what was typed before browsing it,
+## the selection the bar opened over, and the count or problem it shows.
+struct FindBar
+    history find.History
+    case_on bool
+    word bool
+    typed str
+    within find.Span?
+    status str
+
+fn FindBar.new() FindBar
+    FindBar(
+        history: find.History.empty(),
+        case_on: false,
+        word: false,
+        typed: "",
+        within: none,
+        status: "",
+    )
+
+## The options the query runs with: the toggles, smart case, and the
+## selection while the bar (or its replace step) is open.
+fn Editor.find_opts(self) find.Options
+    mut inside := self.findbar.within
+    if self.prompt == NoPrompt
+        inside = none
+    find.Options(
+        case: self.findbar.case_on or find.smart_case(self.query),
+        word: self.findbar.word,
+        is_regex: self.regex_find,
+        within: inside,
+    )
+
+## The query compiled once with the bar's options; fails on a bad regex.
+fn Editor.find_matcher(self) find.Matcher ! regex.RegexError
+    find.prepare(self.query, self.find_opts())
+
+## Every match of the query in the buffer (none for a bad regex).
+fn Editor.find_matches(self) List[find.Match]
+    m := self.find_matcher() else return List[find.Match]()
+    m.search(self.lines, FIND_LIMIT)
+
+## The bar's label with a mark per toggle that is on: `find [Aa] [W] [.*]: `,
+## and `find in selection: ` while it searches a selection.
+fn Editor.find_head(self) str
+    mut marks := ""
+    if self.findbar.case_on
+        marks = "{marks} [Aa]"
+    if self.findbar.word
+        marks = "{marks} [W]"
+    if self.regex_find
+        marks = "{marks} [.*]"
+    if self.prompt != NoPrompt and self.findbar.within != none
+        return "find in selection{marks}: "
+    "find{marks}: "
+
+## The open find bar: label, query, then `3 of 17`, `(not found)` or the
+## regex problem, then the keys.
+fn Editor.find_prompt_text(self) str
+    head := "{self.find_head()}{self.query}_   "
+    st := self.findbar.status
+    if st.starts_with("(")
+        return "{head}{st}"
+    "{head}{st}   (Enter/F3 next, Shift-Enter back, Up/Down history, Alt-C case, Alt-W word, Alt-R regex, Ctrl-R replace, Esc)"
+
+## Ctrl-F: a selection over more than one line limits the search to it;
+## history browsing starts again from the newest query.
+fn Editor.find_open(mut self)
+    self.findbar.within = none
+    self.findbar.status = ""
+    self.findbar.typed = ""
+    self.findbar.history.at = self.findbar.history.items.len()
+    if r := self.selection()
+        if r.end_line > r.line
+            self.findbar.within = find.Span(
+                start_line: r.line,
+                start_col: r.col,
+                end_line: r.end_line,
+                end_col: r.end_col,
+            )
+
+## Moves to a match of the query: at or after the caret (`step` 0, while
+## typing), the next (1) or the previous (-1), wrapping round the buffer.
+## The bar shows `3 of 17` (find.count_label), `(not found)`, or the
+## regex's problem instead of failing. Stepping keeps the query in the
+## history.
+fn Editor.find_go(mut self, step int)
+    head := self.find_head()
+    self.findbar.status = ""
+    if self.query == ""
+        self.message = "find: "
+        return
+    bad := find.problem(self.query, self.find_opts())
+    if bad != ""
+        self.findbar.status = "(bad regex: {bad})"
+        self.message = "{head}{self.query} {self.findbar.status}"
+        return
+    if step != 0
+        self.findbar.history.push(self.query)
+    ms := self.find_matches()
+    if ms.len() == 0
+        self.findbar.status = "(not found)"
+        self.message = "{head}{self.query} (not found)"
+        return
+    mut at := find.next(ms, self.line, self.col - 1, true)
+    if step != 0
+        at = find.next(ms, self.line, self.col, step > 0)
+    self.selecting = false
+    self.line = ms[at].line
+    self.set_col(ms[at].col)
+    self.findbar.status = find.count_label(ms, self.line, self.col)
+    self.message = "{head}{self.query}   {self.findbar.status}"
+    self.scroll()
+
+## Find bar keys read before `key_command`: Alt-C and Alt-W toggle match
+## case and whole word; Shift-F3, and Shift-Enter in the bar, find the
+## previous match; Up and Down in the bar walk the history; Escape keeps
+## the query in it. True if the key was used here.
+fn Editor.findbar_event(mut self, k str, ctrl bool, alt bool, shift bool) bool
+    in_bar := self.prompt == FindText
+    if alt and not ctrl and not shift and (k == "c" or k == "C" or k == "w" or k == "W")
+        if k == "c" or k == "C"
+            self.findbar.case_on = not self.findbar.case_on
+        else
+            self.findbar.word = not self.findbar.word
+        if in_bar
+            self.find_go(0)
+            self.show_prompt()
+        else
+            self.message = "find: match case {on_off(self.findbar.case_on)}, whole word {on_off(self.findbar.word)}"
+        return true
+    if ctrl or alt
+        return false
+    if shift and (k == "f3" or in_bar and k == "enter")
+        self.find_go(-1)
+        if in_bar
+            self.show_prompt()
+        return true
+    if not in_bar or shift
+        return false
+    if k == "escape"
+        self.findbar.history.push(self.query)
+        return false
+    if k == "up" or k == "down"
+        if self.findbar.history.at >= self.findbar.history.items.len()
+            self.findbar.typed = self.query
+        mut q := self.query
+        if k == "up"
+            if older := self.findbar.history.older()
+                q = older
+        else
+            q = self.findbar.typed
+            if newer := self.findbar.history.newer()
+                q = newer
+        self.query = q
+        self.find_go(0)
+        self.show_prompt()
+        return true
+    false
+
+## `text` with its matches `ms` (one line's, left to right) replaced by
+## `by` as `m` replaces them: `$1` for a regex, as typed otherwise.
+fn replace_matches(text str, ms List[find.Match], m find.Matcher, by str) str
+    mut out := text
+    mut k := ms.len() - 1
+    while k >= 0
+        h := ms[k]
+        found := out.slice(h.col, h.col + h.len)
+        out = "{out.slice(0, h.col)}{m.replacement(found, by, false)}{out.slice(h.col + h.len, out.len())}"
+        k -= 1
+    out
+
+## Replace in files: the matches of `m` on the lines `at` (0-based)
+## replaced by `by`, as one undo step.
+fn Editor.replace_matching(mut self, m find.Matcher, by str, at List[int])
+    mut out := self.lines
+    mut changed := false
+    for l in at
+        if l < out.len()
+            ms := m.in_line(l, out[l])
+            if ms.len() > 0
+                out[l] = replace_matches(out[l], ms, m, by)
+                changed = true
+    if changed
+        self.snapshot()
+        self.lines = out
+        self.set_col(self.col.min(self.cur().len()))
+
+## A project search typed as `QUERY  in:GLOBS`: the query, and the files
+## it reads (find.Scope: commas or spaces between globs, `!` excludes; no
+## `in:` means every text file).
+fn search_parts(text str) (str, find.Scope)
+    i := text.rfind(" in:") else return (text, find.Scope.parse(""))
+    (text.slice(0, i).trim_end(), find.Scope.parse(text.slice(i + 4, text.len())))
+
+## A project search's options: the active tab's find bar toggles.
+fn Workspace.search_opts(self, q str) find.Options
+    fb := self.eds[self.active].findbar
+    find.Options(
+        case: fb.case_on or find.smart_case(q),
+        word: fb.word,
+        is_regex: self.eds[self.active].regex_find,
+        within: none,
+    )
+
+## Every match of `m` in the text files under the working directory that
+## `sc` accepts: open tabs as they are in the editor, other files from
+## disk, binaries (find.is_binary) skipped; at most `limit`.
+fn Workspace.project_hits(self, m find.Matcher, sc find.Scope, limit int) List[find.Hit]
+    mut out := List[find.Hit]()
+    for f in list_files(".", 8, 5000)
+        if not sc.accepts(f)
+            continue
+        mut text := ""
+        mut open := false
+        for ed in self.eds
+            if ed.path == f or ed.path == "./{f}"
+                text = ed.text()
+                open = true
+        if not open
+            data := fs.read_bytes(f) else continue
+            if find.is_binary(data[0..data.len().min(1024)].text())
+                continue
+            text = data.text()
+        ls := text.lines()
+        for l in 0..ls.len()
+            for hit in m.in_line(l, ls[l])
+                if out.len() >= limit
+                    return out
+                out.push(find.Hit(path: f, line: l, col: hit.col, len: hit.len, text: ls[l]))
+    out
+
+## The result rows of `find.group`: a file header `path (n)`, which Enter
+## and F4 pass over (line 0), then a row per match.
+fn group_hits(found List[find.Hit]) List[Hit]
+    mut out := List[Hit]()
+    for r in find.group(found)
+        if r.header
+            out.push(Hit(loc: Loc(path: r.path, line: 0, col: 0), text: r.text))
+        else
+            out.push(Hit(loc: Loc(path: r.path, line: r.line + 1, col: r.col + 1), text: r.text))
+    out
+
+## Enter in the Ctrl-Shift-F prompt: searches, shows the rows grouped by
+## file and selects the first match.
+fn Workspace.show_project_search(mut self)
+    self.message = ""
+    q, sc := search_parts(self.search)
+    if q == ""
+        return
+    m := find.prepare(q, self.search_opts(q)) else err
+        self.message = "bad regex: {err.message}"
+        return
+    found := self.project_hits(m, sc, 1000)
+    if found.len() == 0
+        self.message = "no match for `{self.search}`"
+        return
+    mut more := ""
+    if found.len() >= 1000
+        more = " (first 1000)"
+    self.show_list("search `{self.search}`: {find.summary(found)}{more}", group_hits(found))
+    self.hit_sel = 1
+    self.fill_hits()
+
+## Moves the selected row past file headers (rows without a place).
+fn Workspace.skip_headers(mut self)
+    for _ in 0..self.hits.len()
+        if self.hits[self.hit_sel].loc.line != 0
+            return
+        self.hit_sel = (self.hit_sel + 1) % self.hits.len()
+
+## Where the caret was before an event, to tell jumps and edits apart.
+struct NavSnap
+    at nav.Place
+    count int
+    text str
+    dirty bool
+
+## The workspace's places (features/nav): back and forward, tabs by last
+## use and closed tabs, bookmarks, edit places; the Ctrl-Tab walk under
+## way (its first tab and steps, and whether this event was one); whether
+## a back or forward move is under way; how deep `on_event` is nested.
+struct NavState
+    history nav.History
+    recent nav.Recent
+    marks nav.Bookmarks
+    edits nav.LastEdit
+    cycle_from str
+    cycle_step int
+    cycled bool
+    moving bool
+    depth int
+
+fn NavState.new() NavState
+    NavState(
+        history: nav.History.empty(),
+        recent: nav.Recent.empty(),
+        marks: nav.Bookmarks.empty(),
+        edits: nav.LastEdit.empty(),
+        cycle_from: "",
+        cycle_step: 0,
+        cycled: false,
+        moving: false,
+        depth: 0,
+    )
+
+fn Workspace.nav_here(self) nav.Place
+    ed := self.eds[self.active]
+    nav.Place(path: ed.path, line: ed.line, col: ed.col)
+
+fn Workspace.nav_snap(self) NavSnap
+    if self.eds.len() == 0 or self.active >= self.eds.len()
+        return NavSnap(at: nav.Place(path: "", line: 0, col: 0), count: 0, text: "", dirty: false)
+    ed := self.eds[self.active]
+    NavSnap(at: self.nav_here(), count: ed.lines.len(), text: ed.lines[ed.line], dirty: ed.dirty)
+
+## Keys that move by a step (arrows, Home, End, pages), the wheel, and a
+## drag: their moves are not jumps.
+fn step_move(ev ui.Event) bool
+    match ev
+        Key(k, ctrl, alt, _) =>
+            if ctrl or alt
+                return false
+            n := k.name()
+            n == "up" or n == "down" or n == "left" or n == "right" or n == "pageup" or n == "pagedown" or n == "home" or n == "end"
+        Mouse(_, _, _, kind) => kind != Down
+        Scroll(_) => true
+        Resize(_, _) | Close => false
+
+## After each outermost event: an edit in the active tab (its line count,
+## its caret line or its dirty flag changed) moves the places below it
+## (History.shift and the same for bookmarks and edit places) and notes
+## the edit place; a move to another file or more than 8 lines away that
+## was not an edit, a step key or Go back records the place left; the tab
+## in use goes first in the last-used order, except during a Ctrl-Tab walk.
+fn Workspace.nav_after(mut self, before NavSnap, ev ui.Event)
+    if self.nav_state.depth > 0 or self.eds.len() == 0 or self.active >= self.eds.len()
+        return
+    now := self.nav_here()
+    a := self.active
+    mut edited := false
+    if now.path == before.at.path
+        delta := self.eds[a].lines.len() - before.count
+        changed_line := before.at.line < self.eds[a].lines.len() and self.eds[a].lines[before.at.line] != before.text
+        edited = delta != 0 or changed_line or self.eds[a].dirty and not before.dirty
+        if delta != 0
+            at_line := before.at.line.min(now.line)
+            self.nav_state.history.shift(now.path, at_line, delta)
+            self.nav_state.marks.shift(now.path, at_line, delta)
+            self.nav_state.edits.shift(now.path, at_line, delta)
+        if edited
+            self.nav_state.edits.note(now)
+    far := now.path != before.at.path or (now.line - before.at.line).abs() > NAV_JUMP_LINES
+    if self.nav_state.moving
+        self.nav_state.moving = false
+    elif far and not edited and not step_move(ev) and before.at.path != ""
+        self.nav_state.history.visit(before.at)
+    if self.nav_state.cycled
+        self.nav_state.cycled = false
+    else
+        self.nav_state.cycle_step = 0
+        self.nav_state.recent.touch(now.path)
+
+## The keys of NAV_KEYS, when no list, prompt or bar has the keys. True if
+## `ev` was one of them.
+fn Workspace.nav_event(mut self, ev ui.Event) bool
+    if self.picking or self.searching or self.askbar.open or self.welcome or self.eds.len() == 0
+        return false
+    if self.eds[self.active].prompt != Prompt.NoPrompt
+        return false
+    spec := event_spec(ev) else return false
+    if not NAV_KEYS.split(" ").contains(spec)
+        return false
+    self.message = ""
+    match spec
+        "alt+left" => self.go_back(false)
+        "alt+right" => self.go_back(true)
+        "ctrl+alt+k" => self.toggle_bookmark()
+        "ctrl+alt+l" => self.next_bookmark(true)
+        "ctrl+alt+j" => self.next_bookmark(false)
+        _ => self.go_to_bracket()
+    true
+
+## Goes to `p`, opening its file in a tab when it is not the active one.
+fn Workspace.go_place(mut self, p nav.Place)
+    if p.path != self.eds[self.active].path
+        self.open(p.path)
+    if self.eds[self.active].path == p.path
+        self.eds[self.active].jump_to(Loc(path: p.path, line: p.line + 1, col: p.col + 1))
+
+## Alt-Left and Alt-Right: back to the place the last jump left, or
+## forward again.
+fn Workspace.go_back(mut self, forward bool)
+    here := self.nav_here()
+    if forward
+        ahead := self.nav_state.history.forward(here) else
+            self.message = "nothing to go forward to"
+            return
+        self.go_place(ahead)
+    else
+        behind := self.nav_state.history.back(here) else
+            self.message = "nothing to go back to"
+            return
+        self.go_place(behind)
+    self.nav_state.moving = true
+
+## The open tabs' paths by last use, starting with `first`; tabs never
+## used follow in strip order.
+fn Workspace.tab_order(self, first str) List[str]
+    mut open_paths := List[str]()
+    for ed in self.eds
+        if not open_paths.contains(ed.path)
+            open_paths.push(ed.path)
+    mut out := [first]
+    for p in self.nav_state.recent.order()
+        if open_paths.contains(p) and not out.contains(p)
+            out.push(p)
+    for p in open_paths
+        if not out.contains(p)
+            out.push(p)
+    out
+
+## Ctrl-Tab (`step` 1) and Ctrl-Shift-Tab (-1): presses in a row walk the
+## tabs in last-used order from the tab the walk started on (nav.Recent);
+## tabs that share a path fall back to strip order.
+fn Workspace.cycle_tab(mut self, step int)
+    n := self.eds.len()
+    if self.nav_state.cycle_step == 0
+        self.nav_state.cycle_from = self.eds[self.active].path
+    self.nav_state.cycle_step += step
+    self.nav_state.cycled = true
+    order := self.tab_order(self.nav_state.cycle_from)
+    if order.len() != n
+        self.active = (self.active + step + n) % n
+        return
+    target := order[(self.nav_state.cycle_step % n + n) % n]
+    for i in 0..n
+        if self.eds[i].path == target
+            self.active = i
+
+## "Reopen closed tab": the last closed tab, at its caret.
+fn Workspace.reopen_tab(mut self)
+    p := self.nav_state.recent.reopen() else
+        self.message = "no closed tab to reopen"
+        return
+    self.go_place(p)
+
+## Ctrl-Alt-K: sets or clears the bookmark on the caret's line.
+fn Workspace.toggle_bookmark(mut self)
+    ed := self.eds[self.active]
+    if self.nav_state.marks.toggle(ed.path, ed.line)
+        self.message = "bookmark on line {ed.line + 1}"
+    else
+        self.message = "bookmark cleared on line {ed.line + 1}"
+
+## Ctrl-Alt-L and Ctrl-Alt-J: the next or previous bookmarked line of the
+## file, wrapping.
+fn Workspace.next_bookmark(mut self, forward bool)
+    ed := self.eds[self.active]
+    l := self.nav_state.marks.next(ed.path, ed.line, forward) else
+        self.message = "no bookmarks in this file: Ctrl-Alt-K sets one"
+        return
+    self.eds[self.active].jump_to(Loc(path: ed.path, line: l + 1, col: 1))
+
+## "Bookmarks": every bookmark in the pane, `path:LINE: text` (the text
+## when the file is open); Enter jumps.
+fn Workspace.show_bookmarks(mut self)
+    marks := self.nav_state.marks.marks
+    if marks.len() == 0
+        self.message = "no bookmarks: Ctrl-Alt-K sets one"
+        return
+    labels := self.nav_state.marks.rows()
+    mut out := List[Hit]()
+    for i in 0..marks.len()
+        p := marks[i]
+        mut text := labels[i]
+        for ed in self.eds
+            if ed.path == p.path and p.line < ed.lines.len()
+                text = "{labels[i]}: {ed.lines[p.line].trim()}"
+        out.push(Hit(loc: Loc(path: p.path, line: p.line + 1, col: 1), text: text))
+    self.show_list("bookmarks: {marks.len()}", out)
+
+## A `*` in the gutter's first column on bookmarked lines, where the line
+## number leaves that column free.
+fn Workspace.bookmark_marks(self, mut s Screen)
+    ed := self.eds[self.active]
+    gw := ed.gutter_width()
+    x0 := self.left()
+    for l in self.nav_state.marks.lines_in(ed.path)
+        r := l - ed.top
+        if r >= 0 and r < ed.text_rows() and r + 1 < self.rows and "{l + 1}".len() < gw - 1
+            bg := if l == ed.line then LINE_BG else BG
+            s.put(r + 1, x0, "*", WARN_FG, bg)
+
+## Ctrl-Shift-\\: the bracket matching the one at or before the caret
+## (nav.matching_bracket: strings and comments skipped).
+fn Workspace.go_to_bracket(mut self)
+    ed := self.eds[self.active]
+    p := nav.matching_bracket(ed.lines, ed.line, ed.col) else
+        self.message = "no matching bracket at the caret"
+        return
+    self.eds[self.active].jump_to(Loc(path: ed.path, line: p.line + 1, col: p.col + 1))
+
+## "Go to last edit": the newest edit place, then older ones (nav.LastEdit).
+fn Workspace.go_last_edit(mut self)
+    p := self.nav_state.edits.previous() else
+        self.message = "no edits yet"
+        return
+    self.go_place(p)
+
+# Tests (parity P9).
+
+fn forty_lines() str
+    mut t := ""
+    for i in 0..40
+        t = "{t}line {i}\n"
+    t
+
+## Ctrl-G, the number, Enter.
+fn go_line(mut ws Workspace, n int)
+    ws.on_event(key_event("ctrl+g"))
+    for c in "{n}".chars()
+        ws.on_event(press("{c}"))
+    ws.on_event(press("enter"))
+
+## Runs a palette row by its exact name: Ctrl-Shift-P, the name, Enter.
+fn run_in_palette(mut ws Workspace, name str)
+    ws.on_event(key_event("ctrl+shift+p"))
+    for c in name.chars()
+        ws.on_event(press("{c}"))
+    found := ws.commands()
+    for i in 0..found.len()
+        if found[i].name == name
+            ws.list.selected = i
+    ws.on_event(press("enter"))
+
+@test fn find_bar_counts_toggles_and_finds_back()
+    mut ws := Workspace.new(typed("cat Cat concat\ncat", []))
+    ws.on_event(key_event("ctrl+f"))
+    for c in ["c", "a", "t"]
+        ws.on_event(press(c))
+    assert_eq([ws.eds[0].line, ws.eds[0].col], [0, 0])
+    assert(ws.eds[0].message.starts_with("find: cat_   1 of 4"))
+    ws.on_event(key_event("alt+w"))
+    assert(ws.eds[0].message.starts_with("find [W]: cat_   1 of 3"))
+    ws.on_event(key_event("alt+c"))
+    assert(ws.eds[0].message.starts_with("find [Aa] [W]: cat_   1 of 2"))
+    ws.on_event(key_event("shift+enter"))
+    assert_eq([ws.eds[0].line, ws.eds[0].col], [1, 0])
+    assert(ws.eds[0].message.contains("2 of 2"))
+    ws.on_event(press("enter"))
+    assert_eq(ws.eds[0].line, 0)
+    ws.on_event(key_event("shift+f3"))
+    assert_eq(ws.eds[0].line, 1)
+    ws.on_event(press("escape"))
+    ws.on_event(key_event("shift+f3"))
+    assert_eq(ws.eds[0].line, 0)
+
+@test fn find_bar_smart_case_bad_regex_and_history()
+    mut ws := Workspace.new(typed("Foo foo\nfoo", []))
+    ws.on_event(key_event("ctrl+f"))
+    ws.on_event(press("F"))
+    assert(ws.eds[0].message.contains("1 of 1"))
+    ws.on_event(press("escape"))
+    ws.on_event(key_event("ctrl+f"))
+    ws.on_event(key_event("alt+r"))
+    ws.on_event(press("("))
+    assert(ws.eds[0].message.contains("(bad regex: "))
+    assert_eq(ws.eds[0].prompt, FindText)
+    ws.on_event(press("escape"))
+    ws.on_event(key_event("ctrl+f"))
+    ws.on_event(press("up"))
+    assert_eq(ws.eds[0].query, "(")
+    ws.on_event(press("up"))
+    assert_eq(ws.eds[0].query, "F")
+    ws.on_event(press("down"))
+    ws.on_event(press("down"))
+    assert_eq(ws.eds[0].query, "")
+    ws.on_event(press("escape"))
+    # Shift-Enter outside the bar is still a new line.
+    ws.on_event(key_event("shift+enter"))
+    assert_eq(ws.eds[0].lines.len(), 3)
+
+@test fn find_in_selection_and_regex_replace_all()
+    mut ws := Workspace.new(typed("a=b\nc=d\ne=f", []))
+    ws.on_event(key_event("shift+down"))
+    ws.on_event(key_event("shift+down"))
+    ws.on_event(key_event("ctrl+f"))
+    ws.on_event(key_event("alt+r"))
+    for c in "(\\w)=(\\w)".chars()
+        ws.on_event(press("{c}"))
+    assert(ws.eds[0].message.starts_with("find in selection [.*]: "))
+    assert(ws.eds[0].message.contains("1 of 2"))
+    ws.on_event(key_event("ctrl+r"))
+    for c in "$2=$1".chars()
+        ws.on_event(press("{c}"))
+    ws.on_event(key_event("ctrl+enter"))
+    assert_eq(ws.eds[0].lines, ["b=a", "d=c", "e=f"])
+    assert_eq(ws.eds[0].message, "replaced 2")
+
+@test fn project_search_scope_rows_and_replacements()
+    q, sc := search_parts("foo  in:*.ail,docs/**,!build")
+    assert_eq(q, "foo")
+    assert_eq(sc.include, ["*.ail", "docs/**"])
+    assert_eq(sc.exclude, ["build"])
+    assert_eq(search_parts("bar").0, "bar")
+    rows := group_hits([
+        find.Hit(path: "a.txt", line: 2, col: 4, len: 3, text: "    foo"),
+        find.Hit(path: "a.txt", line: 5, col: 0, len: 3, text: "foo"),
+    ])
+    assert_eq(rows.len(), 3)
+    assert_eq(rows[0].text, "a.txt (2)")
+    assert_eq(rows[0].loc.line, 0)
+    assert_eq(rows[1].loc, Loc(path: "a.txt", line: 3, col: 5))
+    m := find.prepare("o+", find.Options(case: false, word: false, is_regex: true, within: none))?
+    assert_eq(replace_matches("foo boo", m.in_line(0, "foo boo"), m, "0"), "f0 b0")
+
+@test fn f4_and_enter_pass_over_file_headers()
+    mut ws := Workspace.new(typed("a\nb\nc", []))
+    ws.show_list("search", group_hits([
+        find.Hit(path: "t.ail", line: 1, col: 0, len: 1, text: "b"),
+        find.Hit(path: "t.ail", line: 2, col: 0, len: 1, text: "c"),
+    ]))
+    ws.hit_sel = 1
+    ws.on_event(press("enter"))
+    assert_eq(ws.eds[0].line, 1)
+    ws.on_event(press("f4"))
+    assert_eq(ws.eds[0].line, 2)
+    ws.on_event(press("f4"))
+    assert_eq(ws.eds[0].line, 1)
+
+@needs(fs) @test fn project_search_reads_text_files_in_scope_and_skips_binaries()
+    d := "edit-p9-search.tmp"
+    fs.make_dir(d)?
+    fs.write_text("{d}/a.txt", "zqzq one\nnone\n  zqzq two\n")?
+    fs.write_text("{d}/b.md", "zqzq\n")?
+    fs.write_bytes("{d}/c.bin", b"zqzq\x00\x01")?
+    mut ws := Workspace.new(typed("x", []))
+    ws.search = "zqzq in:{d}/**,!*.md"
+    ws.show_project_search()
+    assert(ws.browsing)
+    assert_eq(ws.hits_title, "search `zqzq in:{d}/**,!*.md`: 2 results in 1 file")
+    assert_eq(ws.hits.len(), 3)
+    assert_eq(ws.hits[0].text, "{d}/a.txt (2)")
+    assert_eq(ws.hits[2].loc, Loc(path: "{d}/a.txt", line: 3, col: 3))
+    assert_eq(ws.hit_sel, 1)
+    for f in ["a.txt", "b.md", "c.bin", ""]
+        fs.remove("{d}/{f}")?
+
+@test fn go_back_and_forward_follow_jumps_and_edits()
+    mut ws := Workspace.new(typed(forty_lines(), []))
+    go_line(mut ws, 30)
+    assert_eq(ws.eds[0].line, 29)
+    ws.on_event(key_event("alt+left"))
+    assert_eq(ws.eds[0].line, 0)
+    ws.on_event(key_event("alt+right"))
+    assert_eq(ws.eds[0].line, 29)
+    go_line(mut ws, 1)
+    # A new line above moves the place Go back returns to.
+    ws.on_event(press("enter"))
+    assert_eq(ws.eds[0].lines.len(), 41)
+    ws.on_event(key_event("alt+left"))
+    assert_eq(ws.eds[0].line, 30)
+    ws.on_event(key_event("alt+right"))
+    assert_eq(ws.eds[0].line, 1)
+    ws.on_event(key_event("alt+right"))
+    assert_eq(ws.message, "nothing to go forward to")
+    # Arrow keys are not jumps.
+    for _ in 0..12
+        ws.on_event(press("down"))
+    assert_eq(ws.nav_state.history.behind.len(), 2)
+
+@test fn go_back_returns_across_tabs()
+    mut ws := Workspace.new(Editor.new("a.ail", "a\nb\n", 40, 10))
+    ws.eds.push(Editor.new("b.ail", "b\n", 40, 10))
+    ws.eds[0].line = 1
+    ws.on_event(key_event("ctrl+tab"))
+    assert_eq(ws.active, 1)
+    ws.on_event(key_event("alt+left"))
+    assert_eq(ws.active, 0)
+    assert_eq(ws.eds[0].line, 1)
+
+@test fn ctrl_tab_walks_tabs_by_last_use()
+    mut ws := Workspace.new(Editor.new("a.ail", "a\n", 40, 10))
+    ws.eds.push(Editor.new("b.ail", "b\n", 40, 10))
+    ws.eds.push(Editor.new("c.ail", "c\n", 40, 10))
+    ws.active = 2
+    ws.on_event(press("escape"))
+    ws.active = 0
+    ws.on_event(press("escape"))
+    ws.on_event(key_event("ctrl+tab"))
+    assert_eq(ws.eds[ws.active].path, "c.ail")
+    ws.on_event(key_event("ctrl+tab"))
+    assert_eq(ws.eds[ws.active].path, "b.ail")
+    ws.on_event(key_event("ctrl+shift+tab"))
+    assert_eq(ws.eds[ws.active].path, "c.ail")
+    ws.on_event(press("escape"))
+    ws.on_event(key_event("ctrl+tab"))
+    assert_eq(ws.eds[ws.active].path, "a.ail")
+
+# Reopening reads the file and indexes it with `ail api`.
+@needs(fs, proc) @test fn reopen_closed_tab_restores_its_caret()
+    p := "edit-p9-reopen.txt"
+    fs.write_text(p, "x\ny\n")?
+    mut ws := Workspace.new(Editor.new("a.ail", "a\n", 40, 10))
+    ws.eds.push(Editor.new(p, "x\ny\n", 40, 10))
+    ws.active = 1
+    ws.eds[1].line = 1
+    ws.on_event(key_event("ctrl+w"))
+    assert_eq(ws.eds.len(), 1)
+    run_in_palette(mut ws, "Reopen closed tab")
+    assert_eq(ws.eds.len(), 2)
+    assert_eq(ws.eds[ws.active].path, p)
+    assert_eq(ws.eds[ws.active].line, 1)
+    run_in_palette(mut ws, "Reopen closed tab")
+    assert_eq(ws.message, "no closed tab to reopen")
+    fs.remove(p)?
+
+@test fn bookmarks_toggle_jump_list_and_mark_the_gutter()
+    mut ws := Workspace.new(typed(forty_lines(), []))
+    ws.eds[0].line = 3
+    ws.on_event(key_event("ctrl+alt+k"))
+    ws.eds[0].line = 10
+    ws.on_event(key_event("ctrl+alt+k"))
+    assert_eq(ws.nav_state.marks.lines_in("t.ail"), [3, 10])
+    ws.eds[0].line = 0
+    ws.on_event(key_event("ctrl+alt+l"))
+    assert_eq(ws.eds[0].line, 3)
+    ws.on_event(key_event("ctrl+alt+l"))
+    assert_eq(ws.eds[0].line, 10)
+    ws.on_event(key_event("ctrl+alt+j"))
+    assert_eq(ws.eds[0].line, 3)
+    s := ws.render()
+    top := ws.eds[0].top
+    assert(s.text[1 + 3 - top].starts_with("*"))
+    assert(not s.text[2 + 3 - top].starts_with("*"))
+    run_in_palette(mut ws, "Bookmarks")
+    assert(ws.browsing)
+    assert_eq(ws.hits.len(), 2)
+    assert_eq(ws.hits[0].text, "t.ail:4: line 3")
+    ws.on_event(press("escape"))
+    ws.on_event(key_event("ctrl+alt+k"))
+    assert_eq(ws.nav_state.marks.lines_in("t.ail"), [10])
+
+@test fn matching_bracket_and_last_edit()
+    mut ws := Workspace.new(typed("f(a,\n  b)\n{forty_lines()}", []))
+    ws.eds[0].col = 1
+    ws.on_event(key_event("ctrl+shift+\\"))
+    assert_eq([ws.eds[0].line, ws.eds[0].col], [1, 3])
+    ws.on_event(key_event("ctrl+shift+\\"))
+    assert_eq([ws.eds[0].line, ws.eds[0].col], [0, 1])
+    ws.eds[0].line = 30
+    ws.eds[0].col = 0
+    ws.on_event(press("x"))
+    go_line(mut ws, 1)
+    assert_eq(ws.eds[0].line, 0)
+    run_in_palette(mut ws, "Go to last edit")
+    assert_eq([ws.eds[0].line, ws.eds[0].col], [30, 1])
+    ws.on_event(key_event("alt+left"))
+    assert_eq(ws.eds[0].line, 0)
 
 # ---- Window front end (std.app, S1) --------------------------------------
 
