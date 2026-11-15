@@ -1,0 +1,933 @@
+## One line-diff model (decision D8 of docs/parity-plan-2026-11.md). The
+## agent review panel (P4), the git change gutter and hunk revert (P11), fix
+## previews and Apply agent edit all draw from it: a Myers line diff into
+## hunks, unified and side-by-side rows, keep or revert of one hunk in any
+## order, the gutter kinds per line, the changed span inside a line, and
+## checkpoints of the files before an agent turn. Pure: lines in, values out.
+## Lines are 0-based and every range is a start and a count (half-open).
+
+## One change: old lines `old_start..old_start + old_count` became new lines
+## `new_start..new_start + new_count`. A pure insertion has `old_count` 0
+## (`old_start` is the old line it goes before); a pure deletion has
+## `new_count` 0 (`new_start` is the new line that follows the gap).
+pub struct Hunk
+    pub old_start int
+    pub old_count int
+    pub new_start int
+    pub new_count int
+    pub removed List[str]
+    pub added List[str]
+
+## Half the largest edit distance the exact diff takes on (5,000 edits).
+## Past it the diff is one hunk over the differing middle.
+MAX_HALF := 2500
+
+## Gutter kinds, per line of the new text.
+pub GUTTER_SAME := 0
+pub GUTTER_ADDED := 1
+pub GUTTER_CHANGED := 2
+pub GUTTER_DELETED := 3
+
+# ---- Myers line diff --------------------------------------------------------
+
+## Both texts with each distinct line replaced by a small int, so the diff
+## compares ints.
+struct Coded
+    a List[int]
+    b List[int]
+
+fn id_of(mut ids Map[str, int], l str) int
+    if k := ids.get(l)
+        return k
+    n := ids.len()
+    ids[l] = n
+    n
+
+fn code(old List[str], new List[str]) Coded
+    mut ids := Map[str, int]()
+    mut a := List[int]()
+    mut b := List[int]()
+    for l in old
+        a.push(id_of(mut ids, l))
+    for l in new
+        b.push(id_of(mut ids, l))
+    Coded(a: a, b: b)
+
+## Where `bisect` splits a box: a point on a shortest edit path. `found` is
+## false when the box has no common line; `over` when the edit distance
+## passed the cap.
+struct Split
+    x int
+    y int
+    found bool
+    over bool
+
+## The middle of a shortest edit path from `a[a0..a0 + n]` to
+## `b[b0..b0 + m]`: Myers' forward and reverse searches until they overlap,
+## as diff-match-patch's `diff_bisect` (Apache 2.0) does it. Gives up when
+## the search passes `cap` steps.
+fn bisect(c Coded, a0 int, n int, b0 int, m int, cap int) Split
+    max_d := (n + m + 1) / 2
+    off := max_d
+    size := 2 * max_d + 2
+    mut v1 := [-1 for _ in 0..size]
+    v1[off + 1] = 0
+    mut v2 := [-1 for _ in 0..size]
+    v2[off + 1] = 0
+    delta := n - m
+    front := delta % 2 != 0
+    mut k1start := 0
+    mut k1end := 0
+    mut k2start := 0
+    mut k2end := 0
+    for d in 0..max_d
+        if d > cap
+            return Split(x: 0, y: 0, found: false, over: true)
+        hi1 := d - k1end
+        mut k1 := -d + k1start
+        while k1 <= hi1
+            o1 := off + k1
+            mut x1 := 0
+            if k1 == -d or (k1 != d and v1[o1 - 1] < v1[o1 + 1])
+                x1 = v1[o1 + 1]
+            else
+                x1 = v1[o1 - 1] + 1
+            mut y1 := x1 - k1
+            while x1 < n and y1 < m and c.a[a0 + x1] == c.b[b0 + y1]
+                x1 += 1
+                y1 += 1
+            v1[o1] = x1
+            if x1 > n
+                k1end += 2
+            elif y1 > m
+                k1start += 2
+            elif front
+                o2 := off + delta - k1
+                if o2 >= 0 and o2 < size and v2[o2] != -1 and x1 >= n - v2[o2]
+                    return Split(x: x1, y: y1, found: true, over: false)
+            k1 += 2
+        hi2 := d - k2end
+        mut k2 := -d + k2start
+        while k2 <= hi2
+            o3 := off + k2
+            mut x2 := 0
+            if k2 == -d or (k2 != d and v2[o3 - 1] < v2[o3 + 1])
+                x2 = v2[o3 + 1]
+            else
+                x2 = v2[o3 - 1] + 1
+            mut y2 := x2 - k2
+            while x2 < n and y2 < m and c.a[a0 + n - 1 - x2] == c.b[b0 + m - 1 - y2]
+                x2 += 1
+                y2 += 1
+            v2[o3] = x2
+            if x2 > n
+                k2end += 2
+            elif y2 > m
+                k2start += 2
+            elif not front
+                o4 := off + delta - k2
+                if o4 >= 0 and o4 < size and v1[o4] != -1
+                    fx := v1[o4]
+                    if fx >= n - x2
+                        return Split(x: fx, y: fx - (o4 - off), found: true, over: false)
+            k2 += 2
+    Split(x: 0, y: 0, found: false, over: false)
+
+fn mark(mut flags List[bool], from int, count int)
+    for i in from..from + count
+        flags[i] = true
+
+## Marks the removed old lines and inserted new lines of a shortest path
+## from `a[a0..a0 + n0]` to `b[b0..b0 + m0]`. The common head and tail are
+## trimmed first, which also makes every split shrink the box. False when
+## the distance passed `cap`; then nothing is marked.
+fn align(
+    c Coded,
+    a0 int,
+    n0 int,
+    b0 int,
+    m0 int,
+    cap int,
+    mut rem List[bool],
+    mut ins List[bool],
+) bool
+    mut lo := 0
+    while lo < n0 and lo < m0 and c.a[a0 + lo] == c.b[b0 + lo]
+        lo += 1
+    mut n := n0 - lo
+    mut m := m0 - lo
+    while n > 0 and m > 0 and c.a[a0 + lo + n - 1] == c.b[b0 + lo + m - 1]
+        n -= 1
+        m -= 1
+    sa := a0 + lo
+    sb := b0 + lo
+    if n == 0 or m == 0
+        mark(mut rem, sa, n)
+        mark(mut ins, sb, m)
+        return true
+    s := bisect(c, sa, n, sb, m, cap)
+    if s.over
+        return false
+    if not s.found
+        mark(mut rem, sa, n)
+        mark(mut ins, sb, m)
+        return true
+    if not align(c, sa, s.x, sb, s.y, cap, mut rem, mut ins)
+        mark(mut rem, sa, s.x)
+        mark(mut ins, sb, s.y)
+    if not align(c, sa + s.x, n - s.x, sb + s.y, m - s.y, cap, mut rem, mut ins)
+        mark(mut rem, sa + s.x, n - s.x)
+        mark(mut ins, sb + s.y, m - s.y)
+    true
+
+## The hunks of an alignment: each run of removed and inserted lines
+## between kept ones.
+fn hunks_of(old List[str], new List[str], rem List[bool], ins List[bool]) List[Hunk]
+    mut out := List[Hunk]()
+    mut i := 0
+    mut j := 0
+    while i < old.len() or j < new.len()
+        if i < old.len() and j < new.len() and not rem[i] and not ins[j]
+            i += 1
+            j += 1
+            continue
+        si := i
+        sj := j
+        while i < old.len() and rem[i]
+            i += 1
+        while j < new.len() and ins[j]
+            j += 1
+        if i == si and j == sj
+            # Unpaired kept lines cannot happen; take the rest as one change.
+            i = old.len()
+            j = new.len()
+        out.push(Hunk(
+            old_start: si,
+            old_count: i - si,
+            new_start: sj,
+            new_count: j - sj,
+            removed: old[si..i],
+            added: new[sj..j],
+        ))
+    out
+
+## One hunk over what lies between the common head and the common tail.
+fn middle_hunk(old List[str], new List[str]) List[Hunk]
+    mut lo := 0
+    while lo < old.len() and lo < new.len() and old[lo] == new[lo]
+        lo += 1
+    mut oh := old.len()
+    mut nh := new.len()
+    while oh > lo and nh > lo and old[oh - 1] == new[nh - 1]
+        oh -= 1
+        nh -= 1
+    mut out := List[Hunk]()
+    if oh == lo and nh == lo
+        return out
+    out.push(Hunk(
+        old_start: lo,
+        old_count: oh - lo,
+        new_start: lo,
+        new_count: nh - lo,
+        removed: old[lo..oh],
+        added: new[lo..nh],
+    ))
+    out
+
+## The hunks that turn `old` into `new`, in order: a Myers shortest line
+## diff after trimming the common head and tail. When the texts differ by
+## more than 5,000 lines of edits, one hunk over the differing middle.
+pub fn diff(old List[str], new List[str]) List[Hunk]
+    c := code(old, new)
+    mut rem := [false for _ in 0..old.len()]
+    mut ins := [false for _ in 0..new.len()]
+    if not align(c, 0, old.len(), 0, new.len(), MAX_HALF, mut rem, mut ins)
+        return middle_hunk(old, new)
+    hunks_of(old, new, rem, ins)
+
+## How many lines the hunks add and remove, as (added, removed).
+pub fn counts(hunks List[Hunk]) (int, int)
+    mut added := 0
+    mut removed := 0
+    for h in hunks
+        added += h.new_count
+        removed += h.old_count
+    (added, removed)
+
+# ---- Context and unified rows -----------------------------------------------
+
+## A display hunk: hunks close enough to share their context, and the old
+## and new ranges with that context around them.
+pub struct Block
+    pub old_start int
+    pub old_count int
+    pub new_start int
+    pub new_count int
+    pub hunks List[Hunk]
+
+fn block_of(group List[Hunk], ctx int, old_len int) Block
+    f := group[0]
+    l := group[group.len() - 1]
+    lead := ctx.min(f.old_start)
+    tail := ctx.min(old_len - l.old_start - l.old_count)
+    Block(
+        old_start: f.old_start - lead,
+        old_count: l.old_start + l.old_count + tail - (f.old_start - lead),
+        new_start: f.new_start - lead,
+        new_count: l.new_start + l.new_count + tail - (f.new_start - lead),
+        hunks: group,
+    )
+
+## The hunks with `n` lines of context each side, merged where their
+## contexts touch or overlap. `old_len` is the old text's line count, so the
+## context stops at its end.
+pub fn with_context(hunks List[Hunk], n int, old_len int) List[Block]
+    ctx := n.max(0)
+    mut out := List[Block]()
+    mut group := List[Hunk]()
+    for h in hunks
+        if group.len() > 0
+            p := group[group.len() - 1]
+            if h.old_start - (p.old_start + p.old_count) > 2 * ctx
+                out.push(block_of(group, ctx, old_len))
+                group = List[Hunk]()
+        group.push(h)
+    if group.len() > 0
+        out.push(block_of(group, ctx, old_len))
+    out
+
+## A range as a `@@` header shows it, 1-based: `3` for one line, `3,2` for
+## more, and `2,0` (the line before) for none.
+fn range_text(start int, count int) str
+    if count == 0
+        return "{start},0"
+    if count == 1
+        return "{start + 1}"
+    "{start + 1},{count}"
+
+## The `@@ -a,b +c,d @@` header of a block, as `git diff` writes it.
+pub fn header(b Block) str
+    "@@ -{range_text(b.old_start, b.old_count)} +{range_text(b.new_start, b.new_count)} @@"
+
+## A block as unified diff rows: the header, then each line marked ` `
+## (context), `-` (removed) or `+` (added). `old` is the old text.
+pub fn unified(b Block, old List[str]) List[str]
+    mut rows := [header(b)]
+    mut i := b.old_start
+    for h in b.hunks
+        while i < h.old_start
+            rows.push(" {old[i]}")
+            i += 1
+        for l in h.removed
+            rows.push("-{l}")
+        for l in h.added
+            rows.push("+{l}")
+        i = h.old_start + h.old_count
+    while i < b.old_start + b.old_count
+        rows.push(" {old[i]}")
+        i += 1
+    rows
+
+# ---- Keep and revert ----------------------------------------------------------
+
+## The text after one hunk is kept or reverted, and how far the lines after
+## the hunk moved in that text.
+pub struct Applied
+    pub lines List[str]
+    pub shift int
+
+## `new` with hunk `h` reverted: its old lines put back. The new lines after
+## it move by `shift`; `after_revert` moves the other hunks to match.
+pub fn revert(new List[str], h Hunk) Applied
+    mut out := new[..h.new_start]
+    out.extend(h.removed)
+    out.extend(new[h.new_start + h.new_count..])
+    Applied(lines: out, shift: h.old_count - h.new_count)
+
+## `old` with hunk `h` applied: the base takes the change. The old lines
+## after it move by `shift`; `after_keep` moves the other hunks to match.
+pub fn keep(old List[str], h Hunk) Applied
+    mut out := old[..h.old_start]
+    out.extend(h.added)
+    out.extend(old[h.old_start + h.old_count..])
+    Applied(lines: out, shift: h.new_count - h.old_count)
+
+## The hunks still to review after hunk `i` was reverted in the new text:
+## hunk `i` is gone and the later hunks' new lines moved.
+pub fn after_revert(hunks List[Hunk], i int) List[Hunk]
+    shift := hunks[i].old_count - hunks[i].new_count
+    mut out := List[Hunk]()
+    for k in 0..hunks.len()
+        if k == i
+            continue
+        mut h := hunks[k]
+        if k > i
+            h.new_start += shift
+        out.push(h)
+    out
+
+## The hunks still to review after hunk `i` was kept into the base: hunk
+## `i` is gone and the later hunks' old lines moved.
+pub fn after_keep(hunks List[Hunk], i int) List[Hunk]
+    shift := hunks[i].new_count - hunks[i].old_count
+    mut out := List[Hunk]()
+    for k in 0..hunks.len()
+        if k == i
+            continue
+        mut h := hunks[k]
+        if k > i
+            h.old_start += shift
+        out.push(h)
+    out
+
+## `old` with every hunk applied (gives the new text). Hunks in order, as
+## `diff` returns them.
+pub fn apply_all(old List[str], hunks List[Hunk]) List[str]
+    mut out := old
+    mut k := hunks.len() - 1
+    while k >= 0
+        out = keep(out, hunks[k]).lines
+        k -= 1
+    out
+
+## `new` with every hunk reverted (gives the old text).
+pub fn revert_all(new List[str], hunks List[Hunk]) List[str]
+    mut out := new
+    mut k := hunks.len() - 1
+    while k >= 0
+        out = revert(out, hunks[k]).lines
+        k -= 1
+    out
+
+# ---- Gutter and line spans ------------------------------------------------------
+
+## The change gutter: per line of the new text (`line_count` lines),
+## GUTTER_SAME, GUTTER_ADDED, GUTTER_CHANGED, or GUTTER_DELETED where lines
+## were deleted just above it (a deletion at the end marks the last line).
+pub fn gutter(hunks List[Hunk], line_count int) List[int]
+    mut out := [GUTTER_SAME for _ in 0..line_count]
+    for h in hunks
+        if h.new_count == 0
+            if line_count > 0
+                at := h.new_start.min(line_count - 1)
+                if out[at] == GUTTER_SAME
+                    out[at] = GUTTER_DELETED
+        else
+            kind := if h.old_count == 0 then GUTTER_ADDED else GUTTER_CHANGED
+            for j in h.new_start..(h.new_start + h.new_count).min(line_count)
+                out[j] = kind
+    out
+
+## The changed characters of a changed line pair: columns
+## `old_start..old_end` of the old line became `new_start..new_end` of the
+## new one (columns count `chars()`).
+pub struct Span
+    pub old_start int
+    pub old_end int
+    pub new_start int
+    pub new_end int
+
+## The span that differs between two lines, after the common prefix and
+## suffix, for a word-level highlight. Equal lines give an empty span at
+## their end.
+pub fn intra(old_line str, new_line str) Span
+    a := old_line.chars()
+    b := new_line.chars()
+    mut p := 0
+    while p < a.len() and p < b.len() and a[p] == b[p]
+        p += 1
+    mut ea := a.len()
+    mut eb := b.len()
+    while ea > p and eb > p and a[ea - 1] == b[eb - 1]
+        ea -= 1
+        eb -= 1
+    Span(old_start: p, old_end: ea, new_start: p, new_end: eb)
+
+# ---- Side-by-side and inline rows ------------------------------------------------
+
+## What a diff row shows.
+pub enum RowKind
+    Same
+    Changed
+    Added
+    Removed
+    Gap
+
+## One row of a diff view. `left` and `right` are the old and new line
+## numbers (0-based), -1 on a side with no line (its text is ""). A Gap row
+## stands for unchanged lines left out: `left` and `right` are the first of
+## them and both texts read `... N unchanged lines`.
+pub struct Pair
+    pub left int
+    pub right int
+    pub left_text str
+    pub right_text str
+    pub kind RowKind
+
+fn gap_row(i int, j int, count int) Pair
+    t := "... {count} unchanged lines"
+    Pair(left: i, right: j, left_text: t, right_text: t, kind: RowKind.Gap)
+
+fn same_row(old List[str], i int, j int) Pair
+    Pair(left: i, right: j, left_text: old[i], right_text: old[i], kind: RowKind.Same)
+
+fn removed_row(i int, text str) Pair
+    Pair(left: i, right: -1, left_text: text, right_text: "", kind: RowKind.Removed)
+
+fn added_row(j int, text str) Pair
+    Pair(left: -1, right: j, left_text: "", right_text: text, kind: RowKind.Added)
+
+## The rows of one hunk. Side by side pairs the removed and added lines in
+## order as Changed and pads the longer side with blank cells; inline lists
+## the removed lines, then the added ones.
+fn hunk_rows(mut rows List[Pair], h Hunk, side bool)
+    if side
+        both := h.old_count.min(h.new_count)
+        for k in 0..both
+            rows.push(Pair(
+                left: h.old_start + k,
+                right: h.new_start + k,
+                left_text: h.removed[k],
+                right_text: h.added[k],
+                kind: RowKind.Changed,
+            ))
+        for k in both..h.old_count
+            rows.push(removed_row(h.old_start + k, h.removed[k]))
+        for k in both..h.new_count
+            rows.push(added_row(h.new_start + k, h.added[k]))
+        return
+    for k in 0..h.old_count
+        rows.push(removed_row(h.old_start + k, h.removed[k]))
+    for k in 0..h.new_count
+        rows.push(added_row(h.new_start + k, h.added[k]))
+
+fn view_rows(old List[str], hunks List[Hunk], context int, side bool) List[Pair]
+    mut rows := List[Pair]()
+    mut i := 0
+    mut j := 0
+    for b in with_context(hunks, context, old.len())
+        if b.old_start > i
+            rows.push(gap_row(i, j, b.old_start - i))
+        i = b.old_start
+        j = b.new_start
+        for h in b.hunks
+            while i < h.old_start
+                rows.push(same_row(old, i, j))
+                i += 1
+                j += 1
+            hunk_rows(mut rows, h, side)
+            i = h.old_start + h.old_count
+            j = h.new_start + h.new_count
+        while i < b.old_start + b.old_count
+            rows.push(same_row(old, i, j))
+            i += 1
+            j += 1
+    if i < old.len()
+        rows.push(gap_row(i, j, old.len() - i))
+    rows
+
+## Side-by-side rows for the hunks of `old` to `new`, with `context`
+## unchanged lines around each change and a Gap row for the rest. A changed
+## block pairs its lines as Changed and pads the shorter side with blank
+## cells (Removed or Added rows). No hunks gives one Gap row (none for an
+## empty text).
+pub fn side_by_side(old List[str], new List[str], hunks List[Hunk], context int) List[Pair]
+    _ := new
+    view_rows(old, hunks, context, true)
+
+## Inline rows, as `side_by_side` but one column: each change is its
+## Removed rows, then its Added rows.
+pub fn inline(old List[str], new List[str], hunks List[Hunk], context int) List[Pair]
+    _ := new
+    view_rows(old, hunks, context, false)
+
+# ---- Checkpoints --------------------------------------------------------------
+
+## A file as it was when a checkpoint first held it. `existed` is false for
+## a file that did not exist yet (an agent may create it).
+pub struct Held
+    pub path str
+    pub lines List[str]
+    pub existed bool
+
+## The files before an agent turn, named by `label`.
+pub struct Checkpoint
+    pub label str
+    pub files List[Held]
+
+## A file as it is now, for `Checkpoint.changes`.
+pub struct Current
+    pub path str
+    pub lines List[str]
+
+## How a turn touched a file.
+pub enum FileKind
+    Modified
+    Created
+    Deleted
+
+## What a turn did to one file: the text before and after, its hunks and
+## how many lines they add and remove.
+pub struct FileChange
+    pub path str
+    pub kind FileKind
+    pub before List[str]
+    pub after List[str]
+    pub hunks List[Hunk]
+    pub added int
+    pub removed int
+
+## The change set since a checkpoint: the files that differ, in the order
+## they were held (files created without a hold last), and the paths
+## created and deleted.
+pub struct Changes
+    pub files List[FileChange]
+    pub created List[str]
+    pub deleted List[str]
+
+## What to set a file back to: write `lines`, or remove the file when it
+## did not exist at the checkpoint.
+pub struct Restore
+    pub path str
+    pub lines List[str]
+    pub remove bool
+
+## An empty checkpoint named `label`.
+pub fn Checkpoint.new(label str) Checkpoint
+    Checkpoint(label: label, files: List[Held]())
+
+## Whether the checkpoint holds `path`.
+pub fn Checkpoint.holds(self, path str) bool
+    for h in self.files
+        if h.path == path
+            return true
+    false
+
+## Holds `path` as `lines`, taken before the turn changes it. Only the first
+## hold of a path counts, so holding before every write keeps the text from
+## the start of the turn.
+pub fn Checkpoint.hold(mut self, path str, lines List[str])
+    if self.holds(path)
+        return
+    self.files.push(Held(path: path, lines: lines, existed: true))
+
+## Holds `path` as a file that does not exist yet.
+pub fn Checkpoint.hold_absent(mut self, path str)
+    if self.holds(path)
+        return
+    self.files.push(Held(path: path, lines: List[str](), existed: false))
+
+fn find_current(current List[Current], path str) Current?
+    for c in current
+        if c.path == path
+            return c
+    none
+
+fn file_change(path str, kind FileKind, before List[str], after List[str]) FileChange
+    hs := diff(before, after)
+    n := counts(hs)
+    FileChange(
+        path: path,
+        kind: kind,
+        before: before,
+        after: after,
+        hunks: hs,
+        added: n.0,
+        removed: n.1,
+    )
+
+## The changes from the checkpoint to `current`, the files as they are now
+## (pass the held files that still exist and any new files the turn made).
+## A held file missing from `current` was deleted; a file in `current` that
+## the checkpoint did not hold, or held as absent, was created.
+pub fn Checkpoint.changes(self, current List[Current]) Changes
+    mut files := List[FileChange]()
+    mut created := List[str]()
+    mut deleted := List[str]()
+    for h in self.files
+        now := find_current(current, h.path) else
+            if h.existed
+                deleted.push(h.path)
+                files.push(file_change(h.path, FileKind.Deleted, h.lines, List[str]()))
+            continue
+        if not h.existed
+            created.push(h.path)
+            files.push(file_change(h.path, FileKind.Created, List[str](), now.lines))
+        elif now.lines != h.lines
+            files.push(file_change(h.path, FileKind.Modified, h.lines, now.lines))
+    for c in current
+        if not self.holds(c.path)
+            created.push(c.path)
+            files.push(file_change(c.path, FileKind.Created, List[str](), c.lines))
+    Changes(files: files, created: created, deleted: deleted)
+
+## What each held file must be set back to, to return to the checkpoint. A
+## file created without a hold is in `changes(...).created`; remove it too.
+pub fn Checkpoint.restore_plan(self) List[Restore]
+    mut out := List[Restore]()
+    for h in self.files
+        out.push(Restore(path: h.path, lines: h.lines, remove: not h.existed))
+    out
+
+## The checkpoints of a session, oldest first: one per agent turn, so any
+## turn can be undone back to an earlier one.
+pub struct Stack
+    pub items List[Checkpoint]
+
+## A stack with no checkpoints.
+pub fn Stack.new() Stack
+    Stack(items: List[Checkpoint]())
+
+## Starts a turn: `cp` becomes the newest checkpoint.
+pub fn Stack.push(mut self, cp Checkpoint)
+    self.items.push(cp)
+
+## Holds `path` in the newest checkpoint (see `Checkpoint.hold`).
+pub fn Stack.hold(mut self, path str, lines List[str])
+    if self.items.is_empty()
+        return
+    last := self.items.len() - 1
+    mut top := self.items[last]
+    top.hold(path, lines)
+    self.items[last] = top
+
+## Holds `path` as not existing yet in the newest checkpoint.
+pub fn Stack.hold_absent(mut self, path str)
+    if self.items.is_empty()
+        return
+    last := self.items.len() - 1
+    mut top := self.items[last]
+    top.hold_absent(path)
+    self.items[last] = top
+
+## The checkpoint labels, oldest first.
+pub fn Stack.labels(self) List[str]
+    mut out := List[str]()
+    for cp in self.items
+        out.push(cp.label)
+    out
+
+## What to restore to undo turns `i` and later: for each path, the text the
+## earliest of those checkpoints held.
+pub fn Stack.plan_to(self, i int) List[Restore]
+    mut seen := Set[str]()
+    mut out := List[Restore]()
+    for k in i.max(0)..self.items.len()
+        for r in self.items[k].restore_plan()
+            if seen.add(r.path)
+                out.push(r)
+    out
+
+## Undoes turns `i` and later: their checkpoints are dropped and the plan
+## that restores the files is returned.
+pub fn Stack.undo_to(mut self, i int) List[Restore]
+    plan := self.plan_to(i)
+    if i >= 0 and i < self.items.len()
+        self.items = self.items[..i]
+    plan
+
+## A change set in a few words: `3 files, +41 -7`.
+pub fn summary(ch Changes) str
+    mut added := 0
+    mut removed := 0
+    for f in ch.files
+        added += f.added
+        removed += f.removed
+    noun := if ch.files.len() == 1 then "file" else "files"
+    "{ch.files.len()} {noun}, +{added} -{removed}"
+
+# ---- Tests --------------------------------------------------------------------
+
+## Each hunk as [old_start, old_count, new_start, new_count].
+fn ranges(hs List[Hunk]) List[List[int]]
+    mut out := List[List[int]]()
+    for h in hs
+        out.push([h.old_start, h.old_count, h.new_start, h.new_count])
+    out
+
+## A span as [old_start, old_end, new_start, new_end].
+fn spans(s Span) List[int]
+    [s.old_start, s.old_end, s.new_start, s.new_end]
+
+fn pair(l int, r int, lt str, rt str, k RowKind) Pair
+    Pair(left: l, right: r, left_text: lt, right_text: rt, kind: k)
+
+@test fn empty_and_identical_inputs_have_no_hunks()
+    assert_eq(diff(List[str](), List[str]()).len(), 0)
+    assert_eq(diff(["a", "b"], ["a", "b"]).len(), 0)
+    assert_eq(ranges(diff(List[str](), ["a", "b"])), [[0, 0, 0, 2]])
+    assert_eq(ranges(diff(["a", "b"], List[str]())), [[0, 2, 0, 0]])
+    assert_eq(counts(diff(["a"], ["b", "c"])), (2, 1))
+
+@test fn inserts_deletes_and_replaces()
+    old := ["a", "b", "c"]
+    assert_eq(ranges(diff(old, ["n", "a", "b", "c"])), [[0, 0, 0, 1]])
+    assert_eq(ranges(diff(old, ["a", "n", "b", "c"])), [[1, 0, 1, 1]])
+    assert_eq(ranges(diff(old, ["a", "b", "c", "n"])), [[3, 0, 3, 1]])
+    assert_eq(ranges(diff(old, ["a", "c"])), [[1, 1, 1, 0]])
+    hs := diff(old, ["a", "X", "c"])
+    assert_eq(ranges(hs), [[1, 1, 1, 1]])
+    assert_eq(hs[0].removed, ["b"])
+    assert_eq(hs[0].added, ["X"])
+
+@test fn two_hunks_and_apply_all()
+    old := ["a", "b", "c", "d", "e"]
+    new := ["a", "X", "Y", "c", "d", "e", "Z"]
+    hs := diff(old, new)
+    assert_eq(ranges(hs), [[1, 1, 1, 2], [5, 0, 6, 1]])
+    assert_eq(apply_all(old, hs), new)
+    assert_eq(revert_all(new, hs), old)
+    mixed := diff(["1", "2", "3", "4", "5", "6"], ["1", "3", "4", "x", "5", "6", "7"])
+    assert_eq(ranges(mixed), [[1, 1, 1, 0], [4, 0, 3, 1], [6, 0, 6, 1]])
+
+@test fn revert_and_keep_in_any_order()
+    old := ["a", "b", "c", "d", "e"]
+    new := ["a", "X", "Y", "c", "d", "e", "Z"]
+    hs := diff(old, new)
+    # Revert the first, then the second.
+    r1 := revert(new, hs[0])
+    assert_eq(r1.shift, -1)
+    assert_eq(r1.lines, ["a", "b", "c", "d", "e", "Z"])
+    rest := after_revert(hs, 0)
+    assert_eq(ranges(rest), [[5, 0, 5, 1]])
+    assert_eq(revert(r1.lines, rest[0]).lines, old)
+    # Revert the second, then the first.
+    r2 := revert(new, hs[1])
+    assert_eq(r2.lines, ["a", "X", "Y", "c", "d", "e"])
+    assert_eq(revert(r2.lines, after_revert(hs, 1)[0]).lines, old)
+    # Keep the first into the base, then the second.
+    k1 := keep(old, hs[0])
+    assert_eq(k1.shift, 1)
+    assert_eq(k1.lines, ["a", "X", "Y", "c", "d", "e"])
+    left := after_keep(hs, 0)
+    assert_eq(ranges(left), [[6, 0, 6, 1]])
+    assert_eq(keep(k1.lines, left[0]).lines, new)
+    # Keep the second, then the first.
+    k2 := keep(old, hs[1])
+    assert_eq(keep(k2.lines, after_keep(hs, 1)[0]).lines, new)
+    # Keep one and revert the other: base and buffer meet.
+    base := keep(old, hs[0]).lines
+    buf := revert(new, hs[1]).lines
+    assert_eq(base, buf)
+
+@test fn context_blocks_and_unified_rows()
+    old := ["a", "b", "c", "d", "e", "f", "g"]
+    new := ["a", "X", "Y", "c", "d", "e", "f"]
+    hs := diff(old, new)
+    assert_eq(ranges(hs), [[1, 1, 1, 2], [6, 1, 7, 0]])
+    bs := with_context(hs, 1, old.len())
+    assert_eq(bs.len(), 2)
+    assert_eq(unified(bs[0], old), ["@@ -1,3 +1,4 @@", " a", "-b", "+X", "+Y", " c"])
+    assert_eq(unified(bs[1], old), ["@@ -6,2 +7 @@", " f", "-g"])
+    merged := with_context(hs, 3, old.len())
+    assert_eq(merged.len(), 1)
+    assert_eq(merged[0].old_start, 0)
+    assert_eq(merged[0].old_count, 7)
+    assert_eq(header(with_context(diff(["a"], ["a", "b"]), 0, 1)[0]), "@@ -1,0 +2 @@")
+
+@test fn gutter_marks_added_changed_and_deleted()
+    old := ["a", "b", "c", "d", "e", "f", "g"]
+    new := ["a", "X", "Y", "c", "d", "e", "f"]
+    assert_eq(gutter(diff(old, new), new.len()), [0, 2, 2, 0, 0, 0, 3])
+    assert_eq(gutter(diff(["a", "b"], ["a", "n", "b"]), 3), [0, 1, 0])
+    assert_eq(gutter(diff(["a", "b", "c"], ["a", "c"]), 2), [0, 3])
+    assert_eq(gutter(List[Hunk](), 2), [GUTTER_SAME, GUTTER_SAME])
+
+@test fn intra_finds_the_changed_span()
+    assert_eq(spans(intra("let x = 1", "let x = 22")), [8, 9, 8, 10])
+    assert_eq(spans(intra("abc", "abc")), [3, 3, 3, 3])
+    assert_eq(spans(intra("ab", "aab")), [1, 1, 1, 2])
+    assert_eq(spans(intra("", "x")), [0, 0, 0, 1])
+
+@test fn side_by_side_pads_changed_blocks()
+    old := ["a", "b", "c", "d", "e", "f", "g"]
+    new := ["a", "X", "Y", "c", "d", "e", "f"]
+    rows := side_by_side(old, new, diff(old, new), 1)
+    assert_eq(rows.len(), 7)
+    assert_eq(rows[0], pair(0, 0, "a", "a", RowKind.Same))
+    assert_eq(rows[1], pair(1, 1, "b", "X", RowKind.Changed))
+    assert_eq(rows[2], pair(-1, 2, "", "Y", RowKind.Added))
+    assert_eq(rows[3].kind, RowKind.Same)
+    assert_eq(rows[3].right, 3)
+    assert_eq(rows[4].kind, RowKind.Gap)
+    assert_eq(rows[4].left_text, "... 2 unchanged lines")
+    assert_eq(rows[5], pair(5, 6, "f", "f", RowKind.Same))
+    assert_eq(rows[6], pair(6, -1, "g", "", RowKind.Removed))
+    flat := inline(old, new, diff(old, new), 1)
+    assert_eq(flat.len(), 8)
+    assert_eq(flat[1].kind, RowKind.Removed)
+    assert_eq(flat[2].kind, RowKind.Added)
+    assert_eq(flat[3].kind, RowKind.Added)
+    assert_eq(flat[3].right_text, "Y")
+    none_changed := side_by_side(["a", "b"], ["a", "b"], List[Hunk](), 2)
+    assert_eq(none_changed.len(), 1)
+    assert_eq(none_changed[0].kind, RowKind.Gap)
+
+@test fn checkpoint_over_three_files()
+    mut cp := Checkpoint.new("turn 1")
+    cp.hold("a.ail", ["x", "y"])
+    cp.hold("a.ail", ["ignored"])
+    cp.hold("b.ail", ["p"])
+    cp.hold_absent("c.ail")
+    now := [
+        Current(path: "a.ail", lines: ["x", "Y", "z"]),
+        Current(path: "c.ail", lines: ["n1", "n2"]),
+    ]
+    ch := cp.changes(now)
+    assert_eq(ch.files.len(), 3)
+    assert_eq(ch.files[0].kind, FileKind.Modified)
+    assert_eq(ranges(ch.files[0].hunks), [[1, 1, 1, 2]])
+    assert_eq(ch.files[0].added, 2)
+    assert_eq(ch.files[0].removed, 1)
+    assert_eq(ch.files[1].kind, FileKind.Deleted)
+    assert_eq(ch.files[2].kind, FileKind.Created)
+    assert_eq(ch.created, ["c.ail"])
+    assert_eq(ch.deleted, ["b.ail"])
+    assert_eq(summary(ch), "3 files, +4 -2")
+    plan := cp.restore_plan()
+    assert_eq(plan.len(), 3)
+    assert_eq(plan[0], Restore(path: "a.ail", lines: ["x", "y"], remove: false))
+    assert_eq(plan[1], Restore(path: "b.ail", lines: ["p"], remove: false))
+    assert(plan[2].remove)
+    unheld := cp.changes([
+        Current(path: "a.ail", lines: ["x", "y"]),
+        Current(path: "b.ail", lines: ["p"]),
+        Current(path: "d.ail", lines: ["new"]),
+    ])
+    assert_eq(unheld.created, ["d.ail"])
+    assert_eq(summary(unheld), "1 file, +1 -0")
+
+@test fn stack_undoes_back_to_any_turn()
+    mut s := Stack.new()
+    s.hold("a", ["ignored"])
+    s.push(Checkpoint.new("turn 1"))
+    s.hold("a", ["1"])
+    s.push(Checkpoint.new("turn 2"))
+    s.hold("a", ["2"])
+    s.hold("b", ["b1"])
+    s.hold_absent("c")
+    assert_eq(s.labels(), ["turn 1", "turn 2"])
+    one := s.plan_to(1)
+    assert_eq(one.len(), 3)
+    assert_eq(one[0].lines, ["2"])
+    plan := s.undo_to(0)
+    assert_eq(plan[0], Restore(path: "a", lines: ["1"], remove: false))
+    assert_eq(plan[1].path, "b")
+    assert(plan[2].remove)
+    assert_eq(s.items.len(), 0)
+
+@test fn huge_edits_fall_back_to_one_hunk()
+    mut old := ["head"]
+    mut new := ["head"]
+    for i in 0..3000
+        old.push("a{i}")
+        old.push("same")
+        new.push("b{i}")
+        new.push("same")
+    old.push("tail")
+    new.push("tail")
+    hs := diff(old, new)
+    assert_eq(ranges(hs), [[1, 5999, 1, 5999]])
+    assert_eq(apply_all(old, hs), new)
+    small := diff(old[..21], new[..21])
+    assert_eq(small.len(), 10)
