@@ -51,7 +51,7 @@ Priority: **P0** blocks daily use, **P1** expected of any modern editor,
 
 | # | Gap | Pri | Lane |
 |---|---|---|---|
-| B1 | Every `ail` and `git` call blocks the window (20 `proc.run` sites, no timeout, no cancel). A program that loops freezes the editor | P0 | X1 |
+| B1 | Every `ail` and `git` call blocks the window (18 `proc.run` sites, no timeout, no cancel). A program that loops freezes the editor | P0 | X1 |
 | B2 | Run output arrives when the program ends; no standard input, no stop, no rerun | P0 | X1, X8 |
 | B3 | Checking happens on Ctrl-K, on save, or while the problems list is open. Not as you type by default | P0 | P6 (after X1) |
 | B4 | Completion opens on Ctrl-Space and after `.` only; no popup while typing a name, no snippets (`fn`, `match`, `@test`), no `use` added on accept | P1 | P6 |
@@ -124,7 +124,7 @@ index, and can't see unsaved buffers).
 **D9. Jobs before comfort.** X1 (background jobs on `proc.start` and the
 inbox) lands first after the 0.1.0 update. Live checking, streamed output,
 the agent panel and notifications all sit on it. Rejected: per-feature
-threads (twenty call sites, twenty patterns).
+threads (eighteen call sites, eighteen patterns).
 
 **D10. Pure modules first.** Every new feature is split into a pure module
 (lines in, rows or lines out, `@test`s, no `edit.ail` change) and a wiring
