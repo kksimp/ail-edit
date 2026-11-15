@@ -1,0 +1,390 @@
+## Word wrap (parity plan W4): long lines cut into visual rows for a text
+## area `width` columns wide, and the mapping between buffer positions and
+## visual positions. Pure functions; positions are 0-based and columns
+## count characters (`line.chars()`). AIL source has no tabs (lex.block.1),
+## so every character takes one column.
+##
+## A line's rows are given by the columns they start at, the first always
+## 0. A row breaks after whitespace; a word longer than the row breaks
+## after punctuation, else at the width. Whitespace at a break stays on the
+## row before it (past the width, where it is not drawn), so the next row
+## starts with a word. Continuation rows can hang: drawn indented to the
+## line's own indentation plus 4, as editors do.
+
+## A position in the buffer.
+pub struct Pos
+    pub line int
+    pub col int
+
+## A position on screen: the visual row and the column within it.
+pub struct VPos
+    pub row int
+    pub col int
+
+## What one visual row shows: columns `col` to `end_col` (not included) of
+## buffer line `line`, drawn after `hang` columns of indentation.
+pub struct RowSpan
+    pub line int
+    pub col int
+    pub end_col int
+    pub hang int
+
+## A caret after a move by visual rows, and the visual column it keeps.
+pub struct Moved
+    pub line int
+    pub col int
+    pub goal int
+
+## The wrapped layout of a whole buffer.
+pub struct Layout
+    pub width int
+    ## Whether continuation rows hang (see `hang`).
+    pub indent bool
+    ## Per buffer line: the columns its visual rows start at.
+    pub starts List[List[int]]
+    ## Per buffer line: its length in characters.
+    pub lens List[int]
+    ## Per buffer line: the indentation its continuation rows are drawn with.
+    pub hangs List[int]
+    ## Per buffer line: the visual row it starts on.
+    pub first List[int]
+    ## The number of visual rows.
+    pub total int
+
+HANG := 4
+
+## Spaces at the start of a line.
+pub fn indent_of(s str) int
+    mut n := 0
+    for c in s.chars()
+        if c != ' '
+            break
+        n += 1
+    n
+
+## The indentation drawn before a continuation row of `line`: its own
+## indentation plus 4, or 0 when `indent` is off or that would take more
+## than half the width.
+pub fn hang(line str, width int, indent bool) int
+    if not indent
+        return 0
+    h := indent_of(line) + HANG
+    if h * 2 > width
+        return 0
+    h
+
+fn is_punct(c char) bool
+    not c.is_alnum() and c != '_' and not c.is_space()
+
+## The columns the visual rows of `line` start at, for rows `width`
+## columns wide (at least 1); `[0]` for a line that fits, an empty line
+## included. With `indent`, continuation rows are narrower by their hang.
+pub fn rows(line str, width int, indent bool) List[int]
+    w := width.max(1)
+    cs := line.chars()
+    n := cs.len()
+    lead := indent_of(line)
+    h := hang(line, w, indent)
+    mut out := [0]
+    mut pos := 0
+    mut avail := w
+    while n - pos > avail
+        limit := pos + avail
+        mut b := 0
+        if cs[limit].is_space() and limit > lead
+            b = limit
+        else
+            mut k := limit
+            while k > pos and b == 0
+                if cs[k - 1].is_space() and k > lead
+                    b = k
+                k -= 1
+            k = limit
+            while k > pos and b == 0
+                if is_punct(cs[k - 1])
+                    b = k
+                k -= 1
+            if b == 0
+                b = limit
+        if b > lead
+            while b < n and cs[b].is_space()
+                b += 1
+        if b >= n
+            break
+        out.push(b)
+        pos = b
+        avail = (w - h).max(1)
+    out
+
+## Lays out `lines` for rows `width` columns wide, continuation rows hanging.
+pub fn Layout.build(lines List[str], width int) Layout
+    Layout.build_with(lines, width, true)
+
+## Lays out `lines`, with hanging continuation rows only when `indent`.
+pub fn Layout.build_with(lines List[str], width int, indent bool) Layout
+    mut lay := Layout(
+        width: width.max(1),
+        indent: indent,
+        starts: [],
+        lens: [],
+        hangs: [],
+        first: [],
+        total: 0,
+    )
+    lay.rebuild(lines)
+    lay
+
+fn Layout.rebuild(mut self, lines List[str])
+    self.starts = List[List[int]]()
+    self.lens = List[int]()
+    self.hangs = List[int]()
+    for s in lines
+        self.starts.push(rows(s, self.width, self.indent))
+        self.lens.push(s.len())
+        self.hangs.push(hang(s, self.width, self.indent))
+    if lines.len() == 0
+        self.starts.push([0])
+        self.lens.push(0)
+        self.hangs.push(0)
+    self.renumber(0)
+
+## Recounts the first row of every line from line `from`.
+fn Layout.renumber(mut self, from int)
+    mut acc := 0
+    if from > 0
+        acc = self.first[from - 1] + self.starts[from - 1].len()
+    self.first = self.first[..from]
+    for i in from..self.starts.len()
+        self.first.push(acc)
+        acc += self.starts[i].len()
+    self.total = acc
+
+## Lays the buffer out again for a new width.
+pub fn Layout.resize(mut self, lines List[str], width int)
+    self.width = width.max(1)
+    self.rebuild(lines)
+
+## Brings the layout up to date after an edit. `lines` is the new buffer;
+## `from_line` to `to_line` (inclusive, `to_line` = `from_line` - 1 when
+## lines were only deleted) are its changed lines. The lines before and
+## after them are unchanged, and the lines added or removed are worked out
+## from the change in line count. Out-of-range input lays everything out
+## again.
+pub fn Layout.update(mut self, lines List[str], from_line int, to_line int)
+    old_n := self.starts.len()
+    old_to := to_line - (lines.len() - old_n)
+    if from_line < 0 or from_line > old_n or to_line >= lines.len() or to_line < from_line - 1
+        self.rebuild(lines)
+        return
+    if old_to < from_line - 1 or old_to >= old_n or lines.len() == 0
+        self.rebuild(lines)
+        return
+    mut st := self.starts[..from_line]
+    mut ln := self.lens[..from_line]
+    mut hg := self.hangs[..from_line]
+    for i in from_line..to_line + 1
+        st.push(rows(lines[i], self.width, self.indent))
+        ln.push(lines[i].len())
+        hg.push(hang(lines[i], self.width, self.indent))
+    st.extend(self.starts[old_to + 1..])
+    ln.extend(self.lens[old_to + 1..])
+    hg.extend(self.hangs[old_to + 1..])
+    self.starts = st
+    self.lens = ln
+    self.hangs = hg
+    self.renumber(from_line)
+
+## The number of visual rows.
+pub fn Layout.visual_rows(self) int
+    self.total
+
+## The buffer line shown on visual row `vrow` (clamped to the layout).
+pub fn Layout.line_of(self, vrow int) int
+    mut lo := 0
+    mut hi := self.first.len() - 1
+    while lo < hi
+        m := (lo + hi + 1) / 2
+        if self.first[m] <= vrow
+            lo = m
+        else
+            hi = m - 1
+    lo
+
+## Where (line, col) is drawn. A column at a break is on the row that the
+## break starts; the end of a line is on its last row. Continuation rows
+## count their hang. Out-of-range input is clamped.
+pub fn Layout.to_visual(self, line int, col int) VPos
+    l := line.max(0).min(self.starts.len() - 1)
+    st := self.starts[l]
+    c := col.max(0).min(self.lens[l])
+    mut k := 0
+    while k + 1 < st.len() and st[k + 1] <= c
+        k += 1
+    mut vc := c - st[k]
+    if k > 0
+        vc += self.hangs[l]
+    VPos(row: self.first[l] + k, col: vc)
+
+## The buffer position drawn at visual row `vrow`, column `vcol`. A column
+## in the hang goes to the row's first character, one past the row's text
+## to its last character (or the end of the line on its last row).
+pub fn Layout.to_buffer(self, vrow int, vcol int) Pos
+    r := self.row_range(vrow)
+    mut end := r.end_col
+    if r.end_col < self.lens[r.line]
+        end -= 1
+    Pos(line: r.line, col: (r.col + (vcol - r.hang).max(0)).min(end))
+
+## The line, columns and hang that visual row `vrow` (clamped) shows.
+pub fn Layout.row_range(self, vrow int) RowSpan
+    v := vrow.max(0).min(self.total - 1)
+    l := self.line_of(v)
+    k := v - self.first[l]
+    st := self.starts[l]
+    mut end := self.lens[l]
+    if k + 1 < st.len()
+        end = st[k + 1]
+    mut h := 0
+    if k > 0
+        h = self.hangs[l]
+    RowSpan(line: l, col: st[k], end_col: end, hang: h)
+
+## Moves a caret one visual row up (`d` = -1) or down (`d` = 1), keeping
+## the visual column `goal` (-1: take the caret's own). On the first or
+## last row the caret stays where it is.
+pub fn Layout.move_row(self, line int, col int, goal int, d int) Moved
+    v := self.to_visual(line, col)
+    g := if goal < 0 then v.col else goal
+    r := v.row + d
+    if r < 0 or r >= self.total
+        return Moved(line: line, col: col, goal: g)
+    p := self.to_buffer(r, g)
+    Moved(line: p.line, col: p.col, goal: g)
+
+# ---- Tests -------------------------------------------------------------------------
+
+@test fn hang_is_indent_plus_four_within_half_the_width()
+    assert_eq(hang("  x", 20, true), 6)
+    assert_eq(hang("  x", 20, false), 0)
+    assert_eq(hang("x", 8, true), 4)
+    assert_eq(hang("x", 7, true), 0)
+    assert_eq(hang("        x", 20, true), 0)
+    assert_eq(indent_of("   a "), 3)
+
+@test fn rows_of_short_and_edge_lines()
+    assert_eq(rows("", 4, false), [0])
+    assert_eq(rows("", 0, true), [0])
+    assert_eq(rows("abcd", 4, false), [0])
+    assert_eq(rows("abcde", 4, false), [0, 4])
+    assert_eq(rows("abc", 0, false), [0, 1, 2])
+    assert_eq(rows("abcd    ", 4, false), [0])
+
+@test fn rows_break_after_whitespace()
+    assert_eq(rows("aaaa bbbb", 4, false), [0, 5])
+    assert_eq(rows("ab cd ef", 5, false), [0, 6])
+    assert_eq(rows("one two three", 9, false), [0, 8])
+    assert_eq(rows("a b c d e", 3, false), [0, 4, 8])
+    assert_eq(rows("ab  cd", 3, false), [0, 4])
+
+@test fn rows_break_a_long_word_after_punctuation_or_at_the_width()
+    assert_eq(rows("abcdefghij", 4, false), [0, 4, 8])
+    assert_eq(rows("foo.bar.baz", 5, false), [0, 4, 8])
+    assert_eq(rows("x verylongword", 6, false), [0, 2, 8])
+    assert_eq(rows("f(a,b)", 4, false), [0, 4])
+
+@test fn rows_hang_continuations()
+    line := "  aaaa bbbb cccc dddd"
+    assert_eq(rows(line, 12, false), [0, 12])
+    assert_eq(rows(line, 12, true), [0, 12, 17])
+    assert_eq(rows("        abcdefgh", 4, false), [0, 4, 8, 12])
+
+@test fn rows_count_characters_not_bytes()
+    assert_eq(rows("\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}", 4, false), [0, 4])
+    assert_eq(rows("    x", 4, false), [0, 4])
+
+fn sample() Layout
+    Layout.build_with(["", "abcd", "aaaa bbbb", "abcdefghij"], 4, false)
+
+@test fn build_counts_rows()
+    lay := sample()
+    assert_eq(lay.visual_rows(), 7)
+    assert_eq(lay.first, [0, 1, 2, 4])
+    assert_eq(lay.starts[2], [0, 5])
+    assert_eq(Layout.build(List[str](), 10).visual_rows(), 1)
+    hung := Layout.build(["  aaaa bbbb cccc dddd"], 12)
+    assert_eq(hung.visual_rows(), 3)
+    assert_eq(hung.hangs, [6])
+
+@test fn to_visual_maps_positions_to_rows()
+    lay := sample()
+    assert_eq(lay.to_visual(0, 0), VPos(row: 0, col: 0))
+    assert_eq(lay.to_visual(1, 4), VPos(row: 1, col: 4))
+    assert_eq(lay.to_visual(2, 4), VPos(row: 2, col: 4))
+    assert_eq(lay.to_visual(2, 5), VPos(row: 3, col: 0))
+    assert_eq(lay.to_visual(2, 6), VPos(row: 3, col: 1))
+    assert_eq(lay.to_visual(3, 10), VPos(row: 6, col: 2))
+    assert_eq(lay.to_visual(9, 99), VPos(row: 6, col: 2))
+    hung := Layout.build(["  aaaa bbbb cccc dddd"], 12)
+    assert_eq(hung.to_visual(0, 13), VPos(row: 1, col: 7))
+
+@test fn to_buffer_maps_rows_to_positions()
+    lay := sample()
+    assert_eq(lay.to_buffer(3, 1), Pos(line: 2, col: 6))
+    assert_eq(lay.to_buffer(2, 9), Pos(line: 2, col: 4))
+    assert_eq(lay.to_buffer(3, 9), Pos(line: 2, col: 9))
+    assert_eq(lay.to_buffer(6, 9), Pos(line: 3, col: 10))
+    assert_eq(lay.to_buffer(99, 0), Pos(line: 3, col: 8))
+    assert_eq(lay.to_buffer(0, 5), Pos(line: 0, col: 0))
+    hung := Layout.build(["  aaaa bbbb cccc dddd"], 12)
+    assert_eq(hung.to_buffer(1, 2), Pos(line: 0, col: 12))
+    assert_eq(hung.to_buffer(1, 7), Pos(line: 0, col: 13))
+    for line in 0..4
+        for col in 0..lay.lens[line] + 1
+            v := lay.to_visual(line, col)
+            assert_eq(lay.to_buffer(v.row, v.col), Pos(line: line, col: col))
+
+@test fn row_range_gives_the_span_of_a_row()
+    lay := sample()
+    assert_eq(lay.row_range(0), RowSpan(line: 0, col: 0, end_col: 0, hang: 0))
+    assert_eq(lay.row_range(2), RowSpan(line: 2, col: 0, end_col: 5, hang: 0))
+    assert_eq(lay.row_range(5), RowSpan(line: 3, col: 4, end_col: 8, hang: 0))
+    assert_eq(lay.row_range(-3), lay.row_range(0))
+    hung := Layout.build(["  aaaa bbbb cccc dddd"], 12)
+    assert_eq(hung.row_range(2), RowSpan(line: 0, col: 17, end_col: 21, hang: 6))
+    assert_eq(lay.line_of(4), 3)
+    assert_eq(lay.line_of(1), 1)
+
+@test fn move_row_keeps_the_goal_column()
+    lay := sample()
+    up := lay.move_row(3, 9, -1, -1)
+    assert_eq(up, Moved(line: 3, col: 5, goal: 1))
+    up2 := lay.move_row(up.line, up.col, up.goal, -1)
+    assert_eq(up2, Moved(line: 3, col: 1, goal: 1))
+    up3 := lay.move_row(up2.line, up2.col, up2.goal, -1)
+    assert_eq(up3, Moved(line: 2, col: 6, goal: 1))
+    down := lay.move_row(1, 3, -1, 1)
+    assert_eq(down, Moved(line: 2, col: 3, goal: 3))
+    far := lay.move_row(0, 0, 3, 1)
+    assert_eq(far, Moved(line: 1, col: 3, goal: 3))
+    assert_eq(lay.move_row(0, 0, -1, -1), Moved(line: 0, col: 0, goal: 0))
+    assert_eq(lay.move_row(3, 10, -1, 1), Moved(line: 3, col: 10, goal: 2))
+
+@test fn update_matches_a_fresh_build()
+    mut lay := Layout.build_with(["abcd", "x"], 4, false)
+    added := ["abcd", "abcdefgh", "x"]
+    lay.update(added, 1, 1)
+    assert_eq(lay, Layout.build_with(added, 4, false))
+    assert_eq(lay.visual_rows(), 4)
+    changed := ["abcd", "ab", "x"]
+    lay.update(changed, 1, 1)
+    assert_eq(lay, Layout.build_with(changed, 4, false))
+    removed := ["abcd", "x"]
+    lay.update(removed, 1, 0)
+    assert_eq(lay, Layout.build_with(removed, 4, false))
+    joined := ["abcdx yz"]
+    lay.update(joined, 0, 0)
+    assert_eq(lay, Layout.build_with(joined, 4, false))
+    lay.update(removed, 7, 9)
+    assert_eq(lay, Layout.build_with(removed, 4, false))
+    lay.resize(removed, 2)
+    assert_eq(lay, Layout.build_with(removed, 2, false))
