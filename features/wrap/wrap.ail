@@ -160,8 +160,8 @@ fn Layout.renumber(mut self, from int)
     self.total = acc
 
 ## Lays the buffer out again for a new width.
-pub fn Layout.resize(mut self, lines List[str], width int)
-    self.width = width.max(1)
+pub fn Layout.resize(mut self, lines List[str], new_width int)
+    self.width = new_width.max(1)
     self.rebuild(lines)
 
 ## Brings the layout up to date after an edit. `lines` is the new buffer;
