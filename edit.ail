@@ -4139,6 +4139,21 @@ TYPE_JSON := "\{\"api\":1,\"file\":\"t.ail\",\"line\":10,\"col\":11,\"text\":\"a
     assert_eq(rows[5].loc.line, 1)
     assert_eq(rows[0].loc.line, 0)
 
+@test fn ctrl_q_twice_quits_with_unsaved_tabs()
+    mut ws := Workspace.new(typed("", keys("x")))
+    ws.on_event(key_event("ctrl+q"))
+    assert(not ws.quit)
+    assert(ws.message.contains("unsaved"))
+    ws.on_event(key_event("ctrl+q"))
+    assert(ws.quit)
+
+@test fn another_key_between_disarms_ctrl_q()
+    mut ws := Workspace.new(typed("", keys("x")))
+    ws.on_event(key_event("ctrl+q"))
+    ws.on_event(key_event("right"))
+    ws.on_event(key_event("ctrl+q"))
+    assert(not ws.quit)
+
 @test fn quitting_asks_once_for_unsaved_tabs()
     mut ws := Workspace.new(typed("", keys("x")))
     ws.on_event(Close)
@@ -5760,6 +5775,14 @@ fn Workspace.close_tab(mut self)
         return
     self.active = self.active.min(self.eds.len() - 1)
 
+## Ctrl-Q (or its rebinding): it must not disarm its own second press.
+fn is_quit_key(ev ui.Event) bool
+    match ev
+        Key(k, ctrl, alt, shift) =>
+            wk := workspace_key(k.name(), ctrl, alt, shift) else return false
+            wk == QuitAll
+        Close | Resize(_, _) | Mouse(_, _, _, _) | Scroll(_) => false
+
 ## Ctrl-Q: quit, asking first if any tab has unsaved changes.
 fn Workspace.quit_all(mut self)
     mut unsaved := 0
@@ -5820,7 +5843,7 @@ fn Workspace.dispatch(mut self, ev ui.Event)
     resize := match ev
         Resize(_, _) => true
         Key(_, _, _, _) | Close | Mouse(_, _, _, _) | Scroll(_) => false
-    if ev != Close and not resize
+    if ev != Close and not resize and not is_quit_key(ev)
         self.quit_armed = false
         self.message = ""
     match ev
