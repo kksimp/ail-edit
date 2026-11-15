@@ -30,6 +30,7 @@ use features.taskpanel as tp
 use features.agent
 use features.ask
 use features.jobs as jb
+use features.pointer
 
 # Colors, 0xRRGGBB.
 BG := 0x1e1e1e
@@ -237,6 +238,8 @@ struct Editor
     zen bool
     ## The semantic layer (Ctrl-Shift-L): kind colors, code lens, inlay hints, pending fix preview.
     layer sem.State
+    ## The bottom pane's rows the person dragged it to (parity P7), 0 for automatic.
+    pane_h int
 
 fn Editor.new(path str, text str, cols int, rows int) Editor
     mut lines := text.split("\n")
@@ -292,6 +295,7 @@ fn Editor.new(path str, text str, cols int, rows int) Editor
         anchor_line: 0,
         anchor_col: 0,
         clip: "",
+        pane_h: 0,
     )
 
 ## The buffer as file text: lines joined with `\n`, ending with one.
@@ -805,16 +809,20 @@ fn Editor.index(mut self)
 
 ## The word under (or just before) the cursor: its start and end columns.
 fn Editor.word_at(self) Range?
-    cs := self.cur()
-    mut a := self.col
+    self.word_around(self.line, self.col)
+
+## The word under (or just before) column `c` of line `l`.
+fn Editor.word_around(self, l int, c int) Range?
+    cs := self.lines[l].chars()
+    mut a := c.min(cs.len())
     while a > 0 and is_word(cs[a - 1])
         a -= 1
-    mut b := self.col
+    mut b := c.min(cs.len())
     while b < cs.len() and is_word(cs[b])
         b += 1
     if a == b
         return none
-    Range(line: self.line, col: a, end_line: self.line, end_col: b)
+    Range(line: l, col: a, end_line: l, end_col: b)
 
 fn Editor.symbol(self, id str) Symbol?
     for sym in self.symbols
@@ -1237,6 +1245,8 @@ fn Editor.text_rows(self) int
 fn Editor.pane_rows(self) int
     if self.rows < 10 or self.zen
         return 0
+    if self.pane_h > 0
+        return pointer.pane_height(self.pane_h, self.rows)
     if self.pane == Outline or self.pane == Text
         return (self.rows / 3).max(4)
     4
@@ -2153,6 +2163,10 @@ fn Editor.depth(mut self, act str)
     elif act == "zen"
         self.zen = not self.zen
         self.message = "zen mode {on_off(self.zen)}"
+    elif act == "word"
+        self.select_word()
+    elif act == "line"
+        self.select_line()
 
 # ---- Commands -----------------------------------------------------------
 
@@ -4593,7 +4607,9 @@ fn Editor.with_system_clipboard(mut self, cmd Command)
 fn Editor.position_at(self, c int, r int) Range?
     if r < 0 or r >= self.text_rows() or self.lines.len() == 0
         return none
-    l := (self.top + r).min(self.lines.len() - 1)
+    mut l := self.row_line(r)
+    if l < 0
+        l = self.lines.len() - 1
     n := self.lines[l].chars().len()
     at := (self.left + c - self.gutter_width()).max(0).min(n)
     Range(line: l, col: at, end_line: l, end_col: at)
@@ -5368,6 +5384,24 @@ fn key_rows() List[KeyRow]
             "",
             "List the jobs: state, command, file, seconds; Enter shows that job's output in the pane",
         ),
+        key_row(
+            "palette",
+            "Select word",
+            "",
+            "Select the word under the caret (a double-click does it)",
+        ),
+        key_row(
+            "palette",
+            "Select line",
+            "",
+            "Select the caret's line, to the start of the next (a triple-click does it)",
+        ),
+        key_row(
+            "Mouse (window)",
+            "",
+            "",
+            "Double-click selects a word, triple-click a line, a drag after either extends by words or lines; Cmd- or Ctrl-click goes to the definition; drag the scrollbar thumb, click above or below it to page; click or drag the minimap; drag the tree's edge or the status bar's top edge to resize (saved as `treew`, `paneh`); resting on the text shows the diagnostic or the info for the name there; right-click menus on the text, tabs and tree; middle-click closes a tab; click the status position (Go to line) or counts (Problems); click the gutter to fold, run the test that starts there (marked T) or show the line's diagnostic; Shift-wheel or a sideways wheel scrolls sideways, Ctrl-wheel zooms",
+        ),
     ]
 
 ## The README's key table (`--keys`).
@@ -5613,6 +5647,8 @@ fn Workspace.run_command(mut self, name str)
         "Stop the running job" => self.stop_job()
         "Run again" => self.run_again()
         "Show jobs" => self.show_jobs()
+        "Select word" => self.eds[self.active].run(Depth("word"))
+        "Select line" => self.eds[self.active].run(Depth("line"))
         _ => self.message = "no command `{name}`"
 
 ## The "New file" palette row: the file picker, with a hint.
@@ -5699,6 +5735,8 @@ struct Workspace
     askbar ask.Bar
     ## Background jobs: F5, F6, Shift-F5 and tests on save (features/jobs, X1).
     jobs jb.Jobs
+    ## The tree width and pane height the person dragged them to (parity P7).
+    ptr pointer.Sizes
 
 fn Workspace.new(ed Editor) Workspace
     Workspace(
@@ -5750,6 +5788,7 @@ fn Workspace.new(ed Editor) Workspace
         watch: agent.new_state(),
         askbar: ask.Bar.new(),
         jobs: jb.Jobs.new(),
+        ptr: pointer.Sizes(treew: 0, paneh: 0),
     )
 
 ## The file name a tab shows: the path after its last `/`.
@@ -5785,6 +5824,7 @@ fn Workspace.open(mut self, path str)
         text = got
     mut ed := Editor.new(path, text, (self.cols - self.left()).max(10), (self.rows - 1).max(1))
     ed.index()
+    ed.pane_h = self.ptr.paneh
     self.eds.push(ed)
     self.active = self.eds.len() - 1
 
@@ -6138,7 +6178,7 @@ struct TreeRow
 fn Workspace.left(self) int
     if not self.tree_open or self.eds[self.active].zen
         return 0
-    TREE_W + 1
+    self.tree_w() + 1
 
 ## The entries of `dir` as rows: `.ail` files first, then directories, then
 ## other files, each group by name; hidden and build directories skipped.
@@ -6237,11 +6277,12 @@ fn Workspace.tree_key(mut self, k str) bool
 
 ## Draws the tree down the left side, the selection kept in view.
 fn Workspace.render_tree(self, mut s Screen)
+    tw := self.tree_w()
     n := self.rows - 1
     top := (self.tree_sel - n + 1).max(0)
     for r in 1..self.rows
-        s.put(r, 0, " ".repeat(TREE_W), FG, PANE_BG)
-        s.put(r, TREE_W, " ", FG, BG)
+        s.put(r, 0, " ".repeat(tw), FG, PANE_BG)
+        s.put(r, tw, " ", FG, BG)
         i := top + r - 1
         mut text := ""
         if i < self.tree.len()
@@ -6258,14 +6299,14 @@ fn Workspace.render_tree(self, mut s Screen)
                 fg = GUTTER_FG
             indent := "  ".repeat(t.depth)
             cs := "{indent}{t.name}".chars()
-            text = cs[..cs.len().min(TREE_W - 1)].join("")
+            text = cs[..cs.len().min(tw - 1)].join("")
             if self.gitmarks
                 m := workspace.mark(self.git, t.path, t.dir)
                 if m != ""
                     fg = WARN_FG
-                    text = "{text.slice(0, text.len().min(TREE_W - 4)).pad_right(TREE_W - 4, ' ')} {m}"
-            s.put(r, 0, " {text}".pad_right(TREE_W, ' '), fg, bg)
-        shown := " {text}".pad_right(TREE_W + 1, ' ')
+                    text = "{text.slice(0, text.len().min(tw - 4)).pad_right(tw - 4, ' ')} {m}"
+            s.put(r, 0, " {text}".pad_right(tw, ' '), fg, bg)
+        shown := " {text}".pad_right(tw + 1, ' ')
         s.text[r] = "{shown}{s.text[r]}"
     if self.tree_focus
         s.cursor_row = 1 + self.tree_sel - top
@@ -7867,6 +7908,7 @@ fn Workspace.load_prefs(mut self)
     self.prefs = fs.read_text(path) else ""
     self.binds = workspace.binds(self.prefs)
     self.gitmarks = self.value_of("gitmarks") == "on"
+    self.load_sizes()
 
 ## The marks `git status` gives the tree's files; empty when marks are off
 ## or this isn't a git checkout.
@@ -8551,6 +8593,788 @@ fn Workspace.render_jobs(self, mut s Screen)
         assert(false)
     fs.remove(d) else err
         assert(false)
+# ---- Pointer (parity P7) ---------------------------------------------------
+
+## Double-click and the palette's Select word: the word under the caret.
+fn Editor.select_word(mut self)
+    w := self.word_at() else return
+    self.extra = []
+    self.selecting = true
+    self.anchor_line = w.line
+    self.anchor_col = w.col
+    self.line = w.end_line
+    self.set_col(w.end_col)
+
+## Triple-click and the palette's Select line: the caret's line, up to the
+## start of the next one.
+fn Editor.select_line(mut self)
+    s := pointer.line_sel(self.lines.len(), self.line, self.lines[self.line].chars().len())
+    self.extra = []
+    self.selecting = true
+    self.anchor_line = s.line
+    self.anchor_col = s.col
+    self.line = s.end_line
+    self.set_col(s.end_col)
+
+## A selection from a word or line drag (`pointer.extend`).
+fn Editor.select_ends(mut self, e pointer.Ends)
+    self.extra = []
+    self.selecting = true
+    self.anchor_line = e.anchor_line
+    self.anchor_col = e.anchor_col
+    self.line = e.line
+    self.set_col(e.col)
+    self.scroll()
+
+## The buffer line on text row `r` of the view, folds skipped; -1 past the end.
+fn Editor.row_line(self, r int) int
+    if r < 0
+        return -1
+    if self.folded.len() == 0
+        if self.top + r < self.lines.len()
+            return self.top + r
+        return -1
+    ht := fold.hidden(self.lines, self.folded)
+    fold.nth(ht, fold.rank(ht, self.top) + r)
+
+## The diagnostic whose span covers (`l`, `c`), 0-based.
+fn Editor.diag_at(self, l int, c int) Diag?
+    for d in self.diags
+        if pointer.in_span(l, c, d.line, d.col, d.end_line, d.end_col)
+            return d
+    none
+
+## The first diagnostic that starts on line `l`, 0-based.
+fn Editor.diag_on_line(self, l int) Diag?
+    for d in self.diags
+        if d.line - 1 == l
+            return d
+    none
+
+## A diagnostic's message and help in the pane, as F1 shows its explanation.
+fn Editor.show_diag(mut self, d Diag)
+    self.pane_text = pointer.diag_rows(d.severity, d.rule, d.message, d.help)
+    self.pane = Text
+    self.message = "Esc closes"
+
+## Ctrl-I's info for the name at (`l`, `c`), keeping the caret, the
+## selection and the view where they were.
+fn Editor.info_at(mut self, l int, c int)
+    at_line := self.line
+    at_col := self.col
+    at_goal := self.goal
+    at_top := self.top
+    at_left := self.left
+    was_selecting := self.selecting
+    self.line = l
+    self.col = c
+    self.run(Hover)
+    self.line = at_line
+    self.col = at_col
+    self.goal = at_goal
+    self.top = at_top
+    self.left = at_left
+    self.selecting = was_selecting
+
+## A pane as a number, to keep in `pointer.Gesture`, and back.
+fn pane_number(p Pane) int
+    match p
+        Diags => 0
+        Text => 1
+        Outline => 2
+
+fn pane_of(n int) Pane
+    if n == 1
+        return Pane.Text
+    if n == 2
+        return Pane.Outline
+    Pane.Diags
+
+## The tree's columns: the dragged width when set, else `TREE_W`.
+fn Workspace.tree_w(self) int
+    pointer.tree_width(self.ptr.treew, TREE_W, self.cols)
+
+## Sets the tree width and the pane height (cells, 0 automatic) and gives
+## every tab its share.
+fn Workspace.set_sizes(mut self, treew int, paneh int)
+    self.ptr = pointer.Sizes(treew: treew, paneh: paneh)
+    for mut ed in self.eds
+        ed.pane_h = paneh
+    self.resize_tabs()
+
+## The saved sizes (`treew`, `paneh` in the settings file).
+fn Workspace.load_sizes(mut self)
+    got := pointer.sizes_of(
+        (setting(self.prefs, "treew") else ""),
+        (setting(self.prefs, "paneh") else ""),
+    )
+    self.set_sizes(got.treew, got.paneh)
+
+## Saves the sizes after a splitter drag.
+fn Workspace.save_sizes(mut self)
+    self.set_pref("treew", "{self.ptr.treew}")
+    self.set_pref("paneh", "{self.ptr.paneh}")
+
+## The palette row called `name`, when the palette has it.
+fn command_named(name str) KeyRow?
+    for r in key_rows()
+        if r.name == name
+            return r
+    none
+
+## Runs the palette command `name`: its key, else `run_command`; nothing
+## when there is no such command.
+fn Workspace.run_named(mut self, name str)
+    r := command_named(name) else return
+    if r.spec == ""
+        self.run_command(r.name)
+    else
+        self.on_event(key_event(r.spec))
+
+## Closes the tabs other than `at`, or only those right of it; a tab with
+## unsaved changes stays and says so, as Ctrl-W does.
+fn Workspace.close_others(mut self, at int, right bool)
+    if at < 0 or at >= self.eds.len()
+        return
+    keep := self.eds[at].path
+    mut i := self.eds.len() - 1
+    while i >= 0
+        if i != at and (i > at or not right)
+            self.active = i
+            self.close_tab()
+        i -= 1
+    for k in 0..self.eds.len()
+        if self.eds[k].path == keep
+            self.active = k
+
+## The tree row under grid row `r`, as `click_tree` finds it, or -1.
+fn Workspace.tree_row_at(self, r int) int
+    top := (self.tree_sel - (self.rows - 1) + 1).max(0)
+    i := top + r - 1
+    if i >= 0 and i < self.tree.len()
+        return i
+    -1
+
+## What `pointer.place` needs from the window and the active tab.
+fn Shell.layout(self) pointer.Layout
+    e := self.ws.eds[self.ws.active]
+    pointer.Layout(
+        m: self.m,
+        left: self.ws.left(),
+        gutter: e.gutter_width(),
+        status_row: 1 + e.text_rows(),
+        pane_rows: e.pane_rows(),
+        minimap: self.ws.minimap,
+    )
+
+## A key for the pointer (a menu item, a status segment, Cmd-click): as a
+## typed key, with a changed clipboard sent to the host.
+fn Shell.press_spec(mut self, spec str)
+    before := self.ws.eds[self.ws.active].clip
+    self.ws.on_event(key_event(spec))
+    after := self.ws.eds[self.ws.active].clip
+    if after != before
+        self.sent.push(app.clipboard(after))
+
+## The active tab's selection as a `pointer.Sel`; the caret when empty.
+fn Shell.selected_sel(self) pointer.Sel
+    e := self.ws.eds[self.ws.active]
+    r := e.selection() else
+        return pointer.Sel(line: e.line, col: e.col, end_line: e.line, end_col: e.col)
+    pointer.Sel(line: r.line, col: r.col, end_line: r.end_line, end_col: r.end_col)
+
+## A press on the tab strip: left selects or closes (or starts a drag),
+## right opens the tab's menu, the middle button closes the tab.
+fn Shell.tab_down(mut self, ev app.Event)
+    hit := win.tab_hit(self.tabs(), win.chrome_size(self.m), ev.x)
+    if hit.index < 0
+        return
+    if ev.text == "left"
+        self.ws.active = hit.index
+        if hit.close
+            self.ws.close_tab()
+        else
+            self.tab_drag = hit.index
+            self.tab_drop = hit.index
+    elif ev.text == "right"
+        self.pt.menu_tab = hit.index
+        reveal := command_named("Reveal in tree") != none
+        self.menu = app.Popup(id: "tab", x: ev.x, y: ev.y, items: pointer.tab_menu(reveal))
+    else
+        self.ws.active = hit.index
+        self.ws.close_tab()
+
+## A left press on the text: Cmd- or Ctrl-click goes to the definition, a
+## double-click selects the word and a triple-click the line (a drag then
+## extends by words or lines), else the caret goes there and a drag selects.
+fn Shell.text_down(mut self, ev app.Event, cell win.Cell)
+    self.ws.on_event(Mouse(col: cell.col, row: cell.row, button: Left, kind: Down))
+    if ev.ctrl or ev.meta
+        self.press_spec("f12")
+        return
+    if ev.clicks == 2
+        self.ws.eds[self.ws.active].run(Depth("word"))
+        self.pt.anchor = self.selected_sel()
+        self.pt.drag = pointer.Drag.ByWords
+    elif ev.clicks >= 3
+        self.ws.eds[self.ws.active].run(Depth("line"))
+        self.pt.anchor = self.selected_sel()
+        self.pt.drag = pointer.Drag.ByLines
+    else
+        self.held = true
+
+## A left press on the gutter: fold or unfold, show the line's diagnostic,
+## run the test that starts there (Shift-F6), or select the line.
+fn Shell.gutter_click(mut self, cell win.Cell)
+    e := self.ws.eds[self.ws.active]
+    l := e.row_line(cell.row - 1)
+    if l < 0
+        return
+    self.ws.on_event(Mouse(col: cell.col, row: cell.row, button: Left, kind: Down))
+    d := e.diag_on_line(l)
+    act := pointer.gutter_act(
+        e.folded.contains(l),
+        d != none,
+        pointer.starts_test(e.lines, l),
+        scope.opens(e.lines, l),
+    )
+    match act
+        ToggleFold => self.ws.eds[self.ws.active].run(Depth("fold"))
+        ShowDiag =>
+            if found := d
+                self.ws.eds[self.ws.active].show_diag(found)
+        RunTest => self.press_spec("shift+f6")
+        SelectLine =>
+            self.ws.eds[self.ws.active].run(Depth("line"))
+            self.pt.anchor = self.selected_sel()
+            self.pt.drag = pointer.Drag.ByLines
+
+## The scrollbar's track (also the minimap's): its top and height in points.
+fn Shell.track_y0(self) float
+    win.row_y(self.m, 1)
+
+fn Shell.track_h(self) float
+    e := self.ws.eds[self.ws.active]
+    (win.row_y(self.m, 1 + e.text_rows()) - self.track_y0()).max(1.0)
+
+## A press on the scrollbar: grab the thumb, or page above or below it.
+fn Shell.bar_down(mut self, y float)
+    e := self.ws.eds[self.ws.active]
+    t := pointer.thumb(self.track_y0(), self.track_h(), e.top, e.lines.len(), e.text_rows())
+    match pointer.bar_press(y, t)
+        Grab(off) =>
+            self.pt.grab = off
+            self.pt.drag = pointer.Drag.ThumbDrag
+        PageAbove => self.ws.on_event(Scroll(lines: -e.text_rows()))
+        PageBelow => self.ws.on_event(Scroll(lines: e.text_rows()))
+
+## The minimap scrolls the line at `y` into the middle of the view.
+fn Shell.map_to(mut self, y float)
+    e := self.ws.eds[self.ws.active]
+    at := pointer.map_top(y, self.track_y0(), self.track_h(), e.lines.len(), e.text_rows())
+    self.ws.eds[self.ws.active].top = at
+
+## A move during a pointer drag.
+fn Shell.pointer_drag(mut self, ev app.Event)
+    match self.pt.drag
+        NoDrag => return
+        ByWords | ByLines => self.select_drag(ev)
+        ThumbDrag =>
+            e := self.ws.eds[self.ws.active]
+            at := pointer.thumb_top(
+                ev.y,
+                self.pt.grab,
+                self.track_y0(),
+                self.track_h(),
+                e.lines.len(),
+                e.text_rows(),
+            )
+            self.ws.eds[self.ws.active].top = at
+        MapDrag => self.map_to(ev.y)
+        TreeDrag =>
+            w := pointer.tree_from_x(ev.x, self.m.x0, self.m.cw)
+            self.ws.set_sizes(pointer.tree_width(w, TREE_W, self.ws.cols), self.ws.ptr.paneh)
+        PaneDrag =>
+            cell := win.cell_at(self.m, ev.x, ev.y)
+            rows := self.ws.eds[self.ws.active].rows
+            h := pointer.pane_from_row(rows, cell.row)
+            self.ws.set_sizes(self.ws.ptr.treew, pointer.pane_height(h, rows))
+
+## A word or line drag: the clicked word or line and the one under the pointer.
+fn Shell.select_drag(mut self, ev app.Event)
+    cell := win.cell_at(self.m, ev.x, ev.y)
+    e := self.ws.eds[self.ws.active]
+    p := e.position_at(cell.col - self.ws.left(), cell.row - 1) else return
+    mut at := pointer.line_sel(e.lines.len(), p.line, e.lines[p.line].chars().len())
+    if self.pt.drag == pointer.Drag.ByWords
+        at = pointer.Sel(line: p.line, col: p.col, end_line: p.line, end_col: p.col)
+        if w := e.word_around(p.line, p.col)
+            at = pointer.Sel(line: w.line, col: w.col, end_line: w.end_line, end_col: w.end_col)
+    self.ws.eds[self.ws.active].select_ends(pointer.extend(self.pt.anchor, at))
+
+## The release that ends a pointer drag; a splitter's size is saved.
+fn Shell.pointer_up(mut self)
+    if self.pt.drag == pointer.Drag.TreeDrag or self.pt.drag == pointer.Drag.PaneDrag
+        self.ws.save_sizes()
+    self.pt.drag = pointer.Drag.NoDrag
+
+## The status text as the window draws it (trimmed, the tree's columns cut).
+fn Shell.status_text(self) str
+    s := self.ws.render()
+    srow := 1 + self.ws.eds[self.ws.active].text_rows()
+    if srow >= s.text.len()
+        return ""
+    cs := s.text[srow].chars()
+    if cs.len() <= self.ws.left()
+        return ""
+    cs[self.ws.left()..].join("").trim()
+
+## A click on the status bar: the position opens Go to line, the counts the
+## problems list.
+fn Shell.status_click(mut self, x float)
+    if self.ws.zen
+        return
+    at := pointer.status_at(x, win.chrome_size(self.m))
+    spec := pointer.segment_spec(pointer.status_segment(self.status_text(), at))
+    if spec != ""
+        self.press_spec(spec)
+
+## A right press: the menu for the place. On the text the caret moves to the
+## clicked cell first, unless the click is inside the selection.
+fn Shell.context_menu(mut self, ev app.Event, at pointer.Place)
+    cell := win.cell_at(self.m, ev.x, ev.y)
+    match at
+        OnText | OnGutter =>
+            e := self.ws.eds[self.ws.active]
+            mut on_diag := false
+            if p := e.position_at(cell.col - self.ws.left(), cell.row - 1)
+                on_diag = e.diag_at(p.line, p.col) != none
+                if sel_bg(e.selection(), p.line, p.col, BG) != SELECT_BG
+                    self.ws.on_event(Mouse(col: cell.col, row: cell.row, button: Left, kind: Down))
+            self.menu = app.Popup(id: "text", x: ev.x, y: ev.y, items: pointer.text_menu(on_diag))
+        OnTree =>
+            i := self.ws.tree_row_at(cell.row)
+            if i < 0
+                return
+            self.ws.tree_sel = i
+            self.ws.tree_focus = true
+            mut present := List[str]()
+            for name in pointer.TREE_COMMANDS
+                if command_named(name) != none
+                    present.push(name)
+            self.menu = app.Popup(id: "tree", x: ev.x, y: ev.y, items: pointer.tree_menu(present))
+        OnTabs | OnActivity | OnBar | OnMap | OnTreeEdge | OnPaneEdge | OnStatus | OnPane => return
+
+## The host's answer to a menu (`id` is the menu: text, tab or tree): a tab
+## action, Open on the tree, a key, or a palette command by name.
+fn Shell.menu_pick(mut self, id str, label str)
+    if label == ""
+        return
+    if id == "tab" and self.tab_action(label)
+        return
+    if id == "tree" and label == "Open"
+        self.ws.activate_tree_row()
+        return
+    spec := pointer.menu_spec(label)
+    if spec != ""
+        self.press_spec(spec)
+        return
+    self.ws.run_named(label)
+
+## A tab menu item on the tab it was opened on; false for another label.
+fn Shell.tab_action(mut self, label str) bool
+    at := self.pt.menu_tab
+    if at < 0 or at >= self.ws.eds.len()
+        return false
+    match label
+        "Close" =>
+            self.ws.active = at
+            self.ws.close_tab()
+        "Close others" => self.ws.close_others(at, false)
+        "Close to the right" => self.ws.close_others(at, true)
+        "Copy path" =>
+            path := self.ws.eds[at].path
+            self.ws.eds[self.ws.active].clip = path
+            self.sent.push(app.clipboard(path))
+            self.ws.message = "copied {path}"
+        "Reveal in tree" =>
+            self.ws.active = at
+            self.ws.run_named(label)
+        _ => return false
+    true
+
+## The wheel: Ctrl (or Cmd) zooms the font, a sideways wheel or Shift
+## scrolls sideways, else the lines scroll.
+fn Shell.on_wheel(mut self, ev app.Event)
+    if ev.ctrl or ev.meta
+        z := pointer.zoom_step(ev.dy)
+        if z != ""
+            self.ws.zoom(z)
+        return
+    w := pointer.wheel(ev.dx, ev.dy, ev.shift)
+    n_cols := win.wheel_lines(w.h, self.m.cw)
+    if n_cols != 0
+        self.side_scroll(n_cols)
+    n := win.wheel_lines(w.v, self.m.ch)
+    if n != 0
+        self.ws.on_event(Scroll(lines: n))
+
+## Scrolls the view `n` columns sideways while the visible lines are wider.
+fn Shell.side_scroll(mut self, n int)
+    e := self.ws.eds[self.ws.active]
+    mut longest := 0
+    for r in 0..e.text_rows()
+        l := e.row_line(r)
+        if l < 0
+            break
+        longest = longest.max(e.lines[l].chars().len())
+    view := (e.cols - e.gutter_width()).max(1)
+    self.ws.eds[self.ws.active].left = pointer.hscroll(e.left, n, longest, view)
+
+## A move: a new cell starts a new rest and hides a shown hover.
+fn Shell.pointer_move(mut self, ev app.Event)
+    cell := win.cell_at(self.m, ev.x, ev.y)
+    if self.pt.rest(cell.col, cell.row, time.now_ms())
+        self.hide_hover()
+
+## The pointer left the canvas: no rest, no hover.
+fn Shell.pointer_leave(mut self)
+    self.hide_hover()
+    self.pt.rest_col = -1
+    self.pt.rest_row = -1
+
+## A key: typing holds the hover off for a second, and hides a shown one.
+fn Shell.pointer_key(mut self)
+    self.pt.key_at = time.now_ms()
+    self.hide_hover()
+
+## On each blink tick: once the pointer has rested on the text, shows the
+## diagnostic there, else (AIL files only) Ctrl-I's info for the name there,
+## in the pane, remembering what the pane showed.
+fn Shell.hover_tick(mut self, now int)
+    if not pointer.hover_due(self.pt, now) or self.hover_x < 0.0
+        return
+    self.pt.fired = true
+    if self.held or self.pt.drag != pointer.Drag.NoDrag or self.menu != none
+        return
+    if self.ws.picking or self.ws.searching or self.ws.welcome or self.ws.askbar.open
+        return
+    if pointer.place(self.layout(), self.hover_x, self.hover_y) != pointer.Place.OnText
+        return
+    cell := win.cell_at(self.m, self.hover_x, self.hover_y)
+    a := self.ws.active
+    e := self.ws.eds[a]
+    if e.prompt != NoPrompt or e.completing or e.extra.len() > 0 or e.pane == Outline
+        return
+    p := e.position_at(cell.col - self.ws.left(), cell.row - 1) else return
+    if d := e.diag_at(p.line, p.col)
+        self.ws.eds[a].show_diag(d)
+    elif e.path.ends_with(".ail") and p.col < e.lines[p.line].chars().len()
+        if e.word_around(p.line, p.col) == none
+            return
+        self.ws.eds[a].info_at(p.line, p.col)
+    else
+        return
+    after := self.ws.eds[a]
+    if after.pane == e.pane and after.pane_text == e.pane_text
+        return
+    self.pt.shown = true
+    self.pt.tab = a
+    self.pt.prev_pane = pane_number(e.pane)
+    self.pt.prev_text = e.pane_text
+    self.pt.shown_text = after.pane_text
+
+## Takes a shown hover away, giving the pane back what it showed, unless
+## something else has replaced the hover since.
+fn Shell.hide_hover(mut self)
+    if not self.pt.shown
+        return
+    self.pt.shown = false
+    a := self.pt.tab
+    if a < 0 or a >= self.ws.eds.len()
+        return
+    if self.ws.eds[a].pane == Text and self.ws.eds[a].pane_text == self.pt.shown_text
+        self.ws.eds[a].pane = pane_of(self.pt.prev_pane)
+        self.ws.eds[a].pane_text = self.pt.prev_text
+
+## The window's gutter mark `T` on each visible line that starts a test (a
+## click there runs it), where the gutter has no other mark.
+fn Shell.test_marks(self) List[win.Run]
+    e := self.ws.eds[self.ws.active]
+    p := self.ws.pal
+    gw := e.gutter_width()
+    mut out := List[win.Run]()
+    for r in 0..e.text_rows()
+        l := e.row_line(r)
+        if l < 0
+            break
+        if r == 0 and e.top > 0
+            continue
+        if not pointer.starts_test(e.lines, l)
+            continue
+        if e.missed.contains(l)
+            or e.folded.contains(l)
+            or e.git_marks.contains(l)
+            or e.impact.contains(l)
+            continue
+        bg := if l == e.line then p.bg_of(LINE_BG) else p.bg_of(BG)
+        out.push(win.Run(
+            row: r + 1,
+            col: self.ws.left() + gw - 1,
+            text: "T",
+            fg: win.accent_for(p.bg_of(BG)),
+            bg: bg,
+        ))
+    out
+
+## A window event at grid cell (`c`, `r`) of the shell's layout, left button.
+fn cell_event(sh Shell, kind app.EventKind, c int, r int) app.Event
+    mut ev := app.event(kind)
+    ev.id = "edit"
+    ev.x = sh.m.x0 + c.to_float() * sh.m.cw + 1.0
+    ev.y = win.row_y(sh.m, r) + 2.0
+    ev.text = "left"
+    ev.clicks = 1
+    ev
+
+## A shell on an 800 by 500 point canvas: 93 columns, 21 rows, 40 points of
+## activity bar, cells 8 points wide.
+fn sized_shell(w Workspace) Shell
+    mut sh := Shell.new(w)
+    mut size := app.event(Resize)
+    size.id = "edit"
+    size.dx = 800.0
+    size.dy = 500.0
+    size.cell_w = 8.0
+    size.cell_h = 16.0
+    sh.update(size)
+    sh
+
+@test fn double_and_triple_clicks_select_words_and_lines()
+    ed := Editor.new("t.ail", "fn main()\n    print(hello_world)\n", 40, 10)
+    mut sh := sized_shell(Workspace.new(ed))
+    gw := sh.ws.eds[0].gutter_width()
+    mut two := cell_event(sh, Down, gw + 12, 2)
+    two.clicks = 2
+    sh.update(two)
+    sh.update(cell_event(sh, Up, gw + 12, 2))
+    assert_eq(sh.ws.eds[0].selected_text(), "hello_world")
+    mut three := cell_event(sh, Down, gw + 12, 2)
+    three.clicks = 3
+    sh.update(three)
+    sh.update(cell_event(sh, Up, gw + 12, 2))
+    assert_eq(sh.ws.eds[0].selected_text(), "    print(hello_world)")
+    mut on_main := cell_event(sh, Down, gw + 4, 1)
+    on_main.clicks = 2
+    sh.update(on_main)
+    assert_eq(sh.ws.eds[0].selected_text(), "main")
+    sh.update(cell_event(sh, Move, gw + 12, 2))
+    assert_eq(sh.ws.eds[0].selected_text(), "main()\n    print(hello_world")
+    sh.update(cell_event(sh, Up, gw + 12, 2))
+    assert_eq(sh.pt.drag, pointer.Drag.NoDrag)
+    sh.ws.eds[0].selecting = false
+    sh.ws.run_command("Select line")
+    assert_eq(sh.ws.eds[0].selected_text(), "    print(hello_world)")
+
+@needs(fs, proc) @test fn cmd_click_goes_to_the_definition()
+    mut sh := sized_shell(Workspace.new(indexed([])))
+    gw := sh.ws.eds[0].gutter_width()
+    mut click := cell_event(sh, Down, gw + 11, 10)
+    click.meta = true
+    sh.update(click)
+    sh.update(cell_event(sh, Up, gw + 11, 10))
+    assert_eq([sh.ws.eds[0].line, sh.ws.eds[0].col], [4, 3])
+    assert(not sh.held)
+
+@test fn the_scrollbar_thumb_drags_and_the_track_pages()
+    mut text := ""
+    for i in 0..200
+        text = "{text}line {i}\n"
+    mut sh := sized_shell(Workspace.new(Editor.new("t.ail", text, 40, 10)))
+    rows := sh.ws.eds[0].text_rows()
+    mut down := cell_event(sh, Down, 0, 1)
+    down.x = sh.m.w - 4.0
+    down.y = win.row_y(sh.m, 1) + 3.0
+    sh.update(down)
+    assert_eq(sh.pt.drag, pointer.Drag.ThumbDrag)
+    mut mv := down
+    mv.kind = Move
+    mv.y = win.row_y(sh.m, 1) + sh.track_h() * 0.4
+    sh.update(mv)
+    mid := sh.ws.eds[0].top
+    assert(mid > 50 and mid < 100, "top {mid}")
+    mv.y = win.row_y(sh.m, 1) + sh.track_h() * 0.6
+    sh.update(mv)
+    assert(sh.ws.eds[0].top > mid)
+    mut up := mv
+    up.kind = Up
+    sh.update(up)
+    assert_eq(sh.pt.drag, pointer.Drag.NoDrag)
+    sh.ws.eds[0].top = 0
+    mut page := down
+    page.y = win.row_y(sh.m, 1) + sh.track_h() - 2.0
+    sh.update(page)
+    assert_eq(sh.ws.eds[0].top, rows)
+    assert_eq(sh.pt.drag, pointer.Drag.NoDrag)
+
+@test fn the_tree_and_pane_edges_drag_to_resize()
+    mut sh := sized_shell(Workspace.new(Editor.new("t.ail", "fn main()\n", 40, 10)))
+    sh.ws.tree_open = true
+    sh.ws.resize_tabs()
+    assert_eq(sh.ws.left(), TREE_W + 1)
+    sh.update(cell_event(sh, Down, TREE_W, 3))
+    assert_eq(sh.pt.drag, pointer.Drag.TreeDrag)
+    sh.update(cell_event(sh, Move, 35, 3))
+    assert_eq(sh.ws.ptr.treew, 35)
+    assert_eq(sh.ws.left(), 36)
+    assert_eq(sh.ws.eds[0].cols, sh.ws.cols - 36)
+    sh.update(cell_event(sh, Up, 35, 3))
+    assert_eq(setting(sh.ws.prefs, "treew") else "", "35")
+    srow := 1 + sh.ws.eds[0].text_rows()
+    mut edge := cell_event(sh, Down, 60, srow)
+    edge.y = win.row_y(sh.m, srow) + 1.0
+    sh.update(edge)
+    assert_eq(sh.pt.drag, pointer.Drag.PaneDrag)
+    sh.update(cell_event(sh, Move, 60, 12))
+    assert_eq(sh.ws.eds[0].pane_rows(), sh.ws.eds[0].rows - 12)
+    assert_eq(1 + sh.ws.eds[0].text_rows(), 12)
+    sh.update(cell_event(sh, Up, 60, 12))
+    assert_eq(setting(sh.ws.prefs, "paneh") else "", "{sh.ws.eds[0].rows - 12}")
+
+## A warning on the `x` of line 2 of "fn main()\n    x := 1\n".
+fn warned_editor() Editor
+    mut ed := Editor.new("t.ail", "fn main()\n    x := 1\n", 40, 10)
+    ed.diags = [Diag(
+        severity: "warning",
+        rule: "r.1",
+        line: 2,
+        col: 5,
+        end_line: 2,
+        end_col: 6,
+        message: "unused x",
+        help: "",
+        fix_title: "",
+        fix: [],
+    )]
+    ed
+
+@test fn the_text_menu_offers_fixes_only_over_a_diagnostic()
+    mut sh := sized_shell(Workspace.new(warned_editor()))
+    gw := sh.ws.eds[0].gutter_width()
+    mut right := cell_event(sh, Down, gw + 4, 2)
+    right.text = "right"
+    sh.update(right)
+    pm := sh.menu else app.Popup(id: "", x: 0.0, y: 0.0, items: [])
+    assert_eq(pm.id, "text")
+    assert_eq(pm.items, pointer.text_menu(true))
+    assert_eq([sh.ws.eds[0].line, sh.ws.eds[0].col], [1, 4])
+    mut pick := app.event(Popup)
+    pick.id = "text"
+    pick.text = ""
+    sh.update(pick)
+    assert(sh.menu == none)
+    mut plain := cell_event(sh, Down, gw + 1, 1)
+    plain.text = "right"
+    sh.update(plain)
+    pm2 := sh.menu else app.Popup(id: "", x: 0.0, y: 0.0, items: [])
+    assert_eq(pm2.items, pointer.text_menu(false))
+    assert(not pm2.items.contains("Quick fix"))
+    assert_eq([sh.ws.eds[0].line, sh.ws.eds[0].col], [0, 1])
+    pick.text = "Command palette"
+    sh.update(pick)
+    assert(sh.ws.picking and sh.ws.commanding)
+
+@test fn the_tab_menu_closes_the_others_and_middle_click_closes()
+    mut ws := Workspace.new(Editor.new("a.ail", "a\n", 40, 10))
+    ws.eds.push(Editor.new("b.ail", "b\n", 40, 10))
+    ws.eds.push(Editor.new("c.ail", "c\n", 40, 10))
+    ws.eds.push(Editor.new("d.ail", "d\n", 40, 10))
+    mut sh := sized_shell(ws)
+    size := win.chrome_size(sh.m)
+    second := win.tab_x(sh.tabs(), size, 1) + 4.0
+    mut right := app.event(Down)
+    right.id = "edit"
+    right.x = second
+    right.y = 4.0
+    right.text = "right"
+    sh.update(right)
+    pm := sh.menu else app.Popup(id: "", x: 0.0, y: 0.0, items: [])
+    assert_eq(pm.id, "tab")
+    assert(pm.items.contains("Close others"))
+    mut pick := app.event(Popup)
+    pick.id = "tab"
+    pick.text = "Close to the right"
+    sh.update(pick)
+    assert_eq(sh.ws.eds.len(), 2)
+    assert_eq(sh.ws.eds[sh.ws.active].path, "b.ail")
+    mut middle := right
+    middle.x = win.tab_x(sh.tabs(), size, 0) + 4.0
+    middle.text = "other"
+    sh.update(middle)
+    assert_eq(sh.ws.eds.len(), 1)
+    assert_eq(sh.ws.eds[0].path, "b.ail")
+
+@test fn gutter_clicks_fold_and_show_diagnostics()
+    ed := Editor.new("t.ail", "fn main()\n    x := 1\n    y := 2\nfn b()\n    z\n", 40, 10)
+    mut sh := sized_shell(Workspace.new(ed))
+    sh.update(cell_event(sh, Down, 1, 1))
+    sh.update(cell_event(sh, Up, 1, 1))
+    assert(sh.ws.eds[0].folded.contains(0))
+    assert_eq(sh.ws.eds[0].row_line(1), 3)
+    sh.update(cell_event(sh, Down, 1, 1))
+    sh.update(cell_event(sh, Up, 1, 1))
+    assert(not sh.ws.eds[0].folded.contains(0))
+    mut warned := sized_shell(Workspace.new(warned_editor()))
+    warned.update(cell_event(warned, Down, 1, 2))
+    assert_eq(warned.ws.eds[0].pane, Pane.Text)
+    assert_eq(warned.ws.eds[0].pane_text[0], "warning[r.1] unused x")
+
+@test fn resting_on_a_diagnostic_shows_it_until_the_pointer_moves()
+    mut sh := sized_shell(Workspace.new(warned_editor()))
+    gw := sh.ws.eds[0].gutter_width()
+    sh.update(cell_event(sh, Move, gw + 4, 2))
+    sh.hover_tick(time.now_ms() + 2000)
+    assert_eq(sh.ws.eds[0].pane, Pane.Text)
+    assert_eq(sh.ws.eds[0].pane_text[0], "warning[r.1] unused x")
+    assert(sh.pt.fired)
+    sh.update(cell_event(sh, Move, gw + 7, 2))
+    assert_eq(sh.ws.eds[0].pane, Pane.Diags)
+    assert_eq(sh.ws.eds[0].pane_text.len(), 0)
+
+@test fn status_clicks_open_go_to_line_and_the_wheel_scrolls_and_zooms()
+    long := "x".repeat(200)
+    mut sh := sized_shell(Workspace.new(Editor.new("t.txt", "{long}\nb\n", 40, 10)))
+    srow := 1 + sh.ws.eds[0].text_rows()
+    at := sh.status_text().chars().index_of('L') else 0
+    mut click := cell_event(sh, Down, 0, srow)
+    click.x = pointer.STATUS_X + (at.to_float() + 0.5) * win.chrome_size(sh.m) * 0.56
+    click.y = win.row_y(sh.m, srow) + sh.m.ch / 2.0
+    sh.update(click)
+    assert_eq(sh.ws.eds[0].prompt, Prompt.LineNumber)
+    sh.update(key_ev_escape())
+    mut side := app.event(Scroll)
+    side.id = "edit"
+    side.dx = sh.m.cw * 5.0
+    sh.update(side)
+    assert_eq(sh.ws.eds[0].left, 5)
+    mut shifted := app.event(Scroll)
+    shifted.id = "edit"
+    shifted.dy = sh.m.cw * 2.0
+    shifted.shift = true
+    sh.update(shifted)
+    assert_eq(sh.ws.eds[0].left, 7)
+    mut zoom := app.event(Scroll)
+    zoom.id = "edit"
+    zoom.dy = -10.0
+    zoom.ctrl = true
+    sh.update(zoom)
+    assert_eq(sh.ws.font, 24)
+
+## Escape as the host sends it.
+fn key_ev_escape() app.Event
+    mut k := app.key("escape")
+    k.id = "edit"
+    k
 
 # ---- Window front end (std.app, S1) --------------------------------------
 
@@ -8577,6 +9401,8 @@ struct Shell
     ## this time (ms) after any key.
     caret_on bool
     solid_until int
+    ## Drags, context menus and the hover (features/pointer, parity P7).
+    pt pointer.Gesture
 
 fn Shell.new(w Workspace) Shell
     Shell(
@@ -8596,6 +9422,7 @@ fn Shell.new(w Workspace) Shell
         tab_drop: -1,
         caret_on: true,
         solid_until: 0,
+        pt: pointer.gesture(),
     )
 
 ## The code's font size in points: the workspace's cell height, scaled.
@@ -8659,10 +9486,11 @@ fn Shell.frame(self) win.Frame
         border: win.mix(p.fg_of(FG), p.bg_of(BG), 0.12),
         muted: win.mix(p.fg_of(FG), p.bg_of(BG), 0.55),
     )
-    runs := [
+    mut runs := [
         win.Run(row: sp.row, col: sp.col, text: sp.text, fg: p.fg_of(sp.fg), bg: p.bg_of(sp.bg))
         for sp in s.spans
     ]
+    runs.extend(self.test_marks())
     srow := 1 + e.text_rows()
     mut status := ""
     if srow < s.text.len()
@@ -8720,40 +9548,39 @@ fn Shell.press_key(mut self, spec win.KeySpec)
     if after != before
         self.sent.push(app.clipboard(after))
 
-## A click on the scrollbar: the buffer scrolls to that fraction.
-fn Shell.click_bar(mut self, y float)
-    y0 := win.row_y(self.m, 1)
-    span := (win.row_y(self.m, 1 + self.ws.eds[self.ws.active].text_rows()) - y0).max(1.0)
-    total := self.ws.eds[self.ws.active].lines.len()
-    at := (((y - y0) / span).max(0.0).min(1.0) * total.to_float()).to_int()
-    self.ws.eds[self.ws.active].top = at.min(total - 1).max(0)
-
-## A press on the canvas: the tab strip, the scrollbar, a right-click menu,
-## or a cell of the grid.
+## A press on the canvas, by the place under it (features/pointer): the tab
+## strip, the scrollbar or minimap, a splitter, the status bar, the gutter,
+## the text, or a right-click menu for that place.
 fn Shell.pointer_down(mut self, ev app.Event)
     cell := win.cell_at(self.m, ev.x, ev.y)
     if cell.row == 0
-        hit := win.tab_hit(self.tabs(), win.chrome_size(self.m), ev.x)
-        if hit.index >= 0 and ev.text == "left"
-            self.ws.active = hit.index
-            if hit.close
-                self.ws.close_tab()
-            else
-                self.tab_drag = hit.index
-                self.tab_drop = hit.index
+        self.tab_down(ev)
         return
     act := win.activity_hit(self.m, ev.x, ev.y)
     if act >= 0
         self.ws.on_event(key_event(win.ACTIVITY_KEYS[act]))
         return
-    if ev.x >= self.m.w - win.SCROLL_W
-        self.click_bar(ev.y)
-        return
+    self.hide_hover()
+    at := pointer.place(self.layout(), ev.x, ev.y)
     if ev.text == "right"
-        self.menu = app.Popup(id: "ctx", x: ev.x, y: ev.y, items: win.MENU)
+        self.context_menu(ev, at)
         return
-    self.held = ev.text == "left"
-    self.ws.on_event(Mouse(col: cell.col, row: cell.row, button: Left, kind: Down))
+    if ev.text != "left"
+        return
+    match at
+        OnTabs | OnActivity => return
+        OnBar => self.bar_down(ev.y)
+        OnMap =>
+            self.pt.drag = pointer.Drag.MapDrag
+            self.map_to(ev.y)
+        OnTreeEdge => self.pt.drag = pointer.Drag.TreeDrag
+        OnPaneEdge => self.pt.drag = pointer.Drag.PaneDrag
+        OnStatus => self.status_click(ev.x)
+        OnGutter => self.gutter_click(cell)
+        OnTree | OnPane =>
+            self.held = true
+            self.ws.on_event(Mouse(col: cell.col, row: cell.row, button: Left, kind: Down))
+        OnText => self.text_down(ev, cell)
 
 ## The caret after a blink tick: it flips, except within 500 ms of a key.
 fn Shell.caret_on_now(self) bool
@@ -8784,9 +9611,11 @@ impl app.App for Shell
             External =>
                 if ev.id == "blink"
                     self.caret_on = self.caret_on_now()
+                    self.hover_tick(time.now_ms())
                 elif ev.id == jb.SOURCE
                     self.ws.job_event(ev.text)
             Key =>
+                self.pointer_key()
                 self.solid_until = time.now_ms() + 500
                 self.caret_on = true
                 self.press_key(win.key_spec(ev.text, ev.ctrl, ev.meta, ev.alt, ev.shift))
@@ -8802,33 +9631,34 @@ impl app.App for Shell
             Move =>
                 self.hover_x = ev.x
                 self.hover_y = ev.y
+                self.pointer_move(ev)
                 if self.tab_drag >= 0
                     self.tab_drop = win.tab_drop(self.tabs(), win.chrome_size(self.m), ev.x)
+                elif self.pt.drag != pointer.Drag.NoDrag
+                    self.pointer_drag(ev)
                 elif self.held
                     cell := win.cell_at(self.m, ev.x, ev.y)
                     self.ws.on_event(Mouse(col: cell.col, row: cell.row, button: Left, kind: Drag))
             Leave =>
                 self.hover_x = -1.0
                 self.hover_y = -1.0
+                self.pointer_leave()
             Up =>
                 if self.tab_drag >= 0
                     if self.tab_drop >= 0 and self.tab_drop != self.tab_drag
                         self.ws.move_tab(self.tab_drag, self.tab_drop)
                     self.tab_drag = -1
                     self.tab_drop = -1
+                elif self.pt.drag != pointer.Drag.NoDrag
+                    self.pointer_up()
                 elif self.held
                     self.held = false
                     cell := win.cell_at(self.m, ev.x, ev.y)
                     self.ws.on_event(Mouse(col: cell.col, row: cell.row, button: Left, kind: Up))
-            Scroll =>
-                n := win.wheel_lines(ev.dy, self.m.ch)
-                if n != 0
-                    self.ws.on_event(Scroll(lines: n))
+            Scroll => self.on_wheel(ev)
             Popup =>
                 self.menu = none
-                k := win.menu_key(ev.text)
-                if k != ""
-                    self.ws.on_event(key_event(k))
+                self.menu_pick(ev.id, ev.text)
             Close =>
                 self.ws.on_event(Close)
             Start | Press | Edit | Submit | Toggle | Click | KeyUp | Appearance | Picked | PickError | Pad | Vsync | Measured | Exited | Other => self.held = self.held
