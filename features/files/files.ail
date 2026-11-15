@@ -1,0 +1,422 @@
+## File commands of the editor (parity plan C2): new file and folder,
+## rename, move, duplicate and delete from the tree, Save as, Save all,
+## Revert file, Compare with disk, Open folder, and hot exit (a backup of
+## every unsaved buffer, restored at start). The pure parts check names,
+## join paths, choose a free "copy" name, plan where open tabs go after a
+## rename or move, and turn a path into a backup file name and back. The
+## rest are thin calls over `std.fs` (std.fs.4-12) that give "" on success
+## and a message for the status line otherwise. It knows nothing of the
+## editor's types: `edit.ail` passes paths and lines in.
+use std.fs
+use std.env
+use features.hunks
+
+## What the workspace remembers between file commands.
+pub struct State
+    ## A command waiting for its second press, as `ACT:PATH` (`delete:`,
+    ## `delete2:` for a folder that is not empty, `saveas:`, `revert:`); ""
+    ## when none.
+    pub armed str
+    ## The tree row a rename, move or duplicate acts on, and the folder a
+    ## new file or folder goes in.
+    pub target str
+    pub dir str
+    ## The std.app host can show a native folder chooser (std.app.22), and
+    ## one is being asked for.
+    pub native bool
+    pub asking bool
+    ## Hot exit: the unsaved tabs as last seen, when that last changed (ms,
+    ## 0 once backed up), and the absolute paths that have a backup.
+    pub sig str
+    pub edited_at int
+    pub backed List[str]
+
+pub fn new_state() State
+    State(
+        armed: "",
+        target: "",
+        dir: ".",
+        native: false,
+        asking: false,
+        sig: "",
+        edited_at: 0,
+        backed: [],
+    )
+
+## What a buffer knows about its file on disk.
+pub struct Disk
+    ## The file changed on disk while the buffer had unsaved edits.
+    pub changed bool
+    ## Ctrl-S was pressed once since: the next press overwrites the file.
+    pub armed bool
+    ## The file was deleted from the tree while its tab stayed open.
+    pub deleted bool
+
+pub fn new_disk() Disk
+    Disk(changed: false, armed: false, deleted: false)
+
+# ---- Names and paths --------------------------------------------------
+
+## Why `name` can't name a new file or folder, or "" when it can: not
+## empty, no space at either end, not `.` or `..`, no `/` or `\` (Move goes
+## to another folder), none of `<>:"|?*` (Windows refuses them) and no
+## control characters.
+pub fn name_error(name str) str
+    if name.trim() == ""
+        return "type a name"
+    if name != name.trim()
+        return "a name can't start or end with a space"
+    if name == "." or name == ".."
+        return "`{name}` is not a name"
+    for c in name.chars()
+        if c == '/' or c == '\\'
+            return "a name can't hold `{c}`: Move (m) puts it in another folder"
+        if "<>:\"|?*".contains(c)
+            return "a name can't hold `{c}`"
+        if c.code() < 32
+            return "a name can't hold a control character"
+    ""
+
+## `name` inside `dir`: `.` and "" are the working directory, and an
+## absolute `name` stays as it is.
+pub fn join(dir str, name str) str
+    if dir == "" or dir == "." or name.starts_with("/")
+        return name
+    if dir.ends_with("/")
+        return "{dir}{name}"
+    "{dir}/{name}"
+
+## The folder holding `p`: `.` for a bare name, `/` at the root.
+pub fn parent(p str) str
+    k := p.rfind("/") else return "."
+    if k == 0
+        return "/"
+    p.slice(0, k)
+
+## The last part of `p`.
+pub fn base(p str) str
+    k := p.rfind("/") else return p
+    p.slice(k + 1, p.len())
+
+## `p` made absolute against `cwd` (`env.cwd()`).
+pub fn absolute(cwd str, p str) str
+    if p.starts_with("/")
+        return p
+    join(cwd, p)
+
+## A name for a copy of `name` that `taken` (the folder's entries) doesn't
+## hold: `a copy.md`, then `a copy 2.md`, `a copy 3.md`. A folder, or a
+## name whose only dot starts it (`.bashrc`), gets the words at the end.
+pub fn copy_name(name str, taken List[str], folder bool) str
+    mut stem := name
+    mut ext := ""
+    if dot := name.rfind(".")
+        if dot > 0 and not folder
+            stem = name.slice(0, dot)
+            ext = name.slice(dot, name.len())
+    for n in 1..taken.len() + 2
+        mut cand := "{stem} copy{ext}"
+        if n > 1
+            cand = "{stem} copy {n}{ext}"
+        if not taken.contains(cand)
+            return cand
+    unreachable("one of taken.len() + 1 names is free")
+
+## Where a tab on `p` goes when `from` (a file or a folder) is renamed or
+## moved to `to`, or `none` when it is not affected.
+pub fn moved(p str, from str, to str) str?
+    if p == from
+        return to
+    rest := p.strip_prefix("{from}/") else return none
+    "{to}/{rest}"
+
+## The plan for the open tabs: the path each tab of `paths` has after
+## `from` became `to` (unchanged ones as they were).
+pub fn plan(paths List[str], from str, to str) List[str]
+    mut out := List[str]()
+    for p in paths
+        out.push(moved(p, from, to) else p)
+    out
+
+## The folders to expand so that the tree rooted at `root` shows `p`, as
+## the tree names them (relative to `.`, else under `root`); `none` when
+## `p` is outside `root`.
+pub fn ancestors(root str, p str) List[str]?
+    here := root == "" or root == "."
+    mut rel := p
+    if here
+        if p.starts_with("/")
+            return none
+    else
+        rel = p.strip_prefix("{root}/") else return none
+    parts := rel.split("/")
+    mut out := List[str]()
+    mut at := if here then "" else root
+    for i in 0..parts.len() - 1
+        at = join(at, parts[i])
+        out.push(at)
+    out
+
+## A path as one file name, reversibly: `%` `/` `\` and `:` become `%25`
+## `%2F` `%5C` and `%3A` (no hash, so two paths never share a name).
+pub fn escape(p str) str
+    mut out := List[str]()
+    for c in p.chars()
+        out.push(escape_char(c))
+    out.join("")
+
+fn escape_char(c char) str
+    match c
+        '%' => "%25"
+        '/' => "%2F"
+        '\\' => "%5C"
+        ':' => "%3A"
+        _ => "{c}"
+
+## The path `escape` made `name` from.
+pub fn unescape(name str) str
+    cs := name.chars()
+    mut out := List[str]()
+    mut i := 0
+    while i < cs.len()
+        if cs[i] == '%' and i + 2 < cs.len()
+            got := match cs[i + 1..i + 3].join("")
+                "25" => "%"
+                "2F" => "/"
+                "5C" => "\\"
+                "3A" => ":"
+                _ => ""
+            if got != ""
+                out.push(got)
+                i += 3
+                continue
+        out.push("{cs[i]}")
+        i += 1
+    out.join("")
+
+## A buffer's text as lines, as the editor splits a file.
+pub fn text_lines(text str) List[str]
+    mut out := text.split("\n")
+    if out.len() > 1 and out[out.len() - 1] == ""
+        out.pop()
+    if out.len() == 0
+        out.push("")
+    out
+
+## The lines of the buffer `buf` that differ from the file's `disk`, as
+## unified rows with two lines of context (features/hunks); none when equal.
+pub fn compare_rows(disk List[str], buf List[str]) List[str]
+    mut out := List[str]()
+    for b in hunks.with_context(hunks.diff(disk, buf), 2, disk.len())
+        out.extend(hunks.unified(b, disk))
+    out
+
+## The row the open list shows under a file command's prompt.
+pub fn hint(mode str, dir str) str
+    match mode
+        "files.new" => "Enter creates the file in {dir}; Esc cancels"
+        "files.dir" => "Enter creates the folder in {dir}; Esc cancels"
+        "files.rename" => "Enter renames; open tabs follow; Esc cancels"
+        "files.move" => "type the folder to move it into; Enter moves; Esc cancels"
+        "files.saveas" => "Enter saves the tab under this path; Esc cancels"
+        "files.open" => "type a folder; Enter shows it in the tree and reopens its tabs"
+        _ => "Esc cancels"
+
+# ---- On disk ----------------------------------------------------------
+
+## Whether `p` is a directory (std.fs.10).
+pub fn is_dir(p str) bool
+    m := fs.metadata(p) else return false
+    m.is_dir
+
+## `p`'s modification time in ms, or -1 when it is missing.
+pub fn mtime(p str) int
+    m := fs.metadata(p) else return -1
+    m.modified_ms
+
+fn is_link(p str) bool
+    t := fs.read_link(p) else return false
+    t.len() >= 0
+
+## How many entries the folder `p` holds (0 for a file or a missing path).
+pub fn entries(p str) int
+    names := fs.list_dir(p) else return 0
+    names.len()
+
+## Creates the empty file `p`; refuses a path that exists.
+pub fn make_file(p str) str
+    if fs.exists(p)
+        return "{p} exists"
+    fs.write_text(p, "") else err
+        return "can't create {err.path}: {err.kind}"
+    ""
+
+## Creates the folder `p`; refuses a path that exists.
+pub fn make_folder(p str) str
+    if fs.exists(p)
+        return "{p} exists"
+    fs.make_dir(p) else err
+        return "can't create {err.path}: {err.kind}"
+    ""
+
+## Renames or moves `from` to `to` (std.fs.11); refuses to replace
+## anything and to move a folder into itself.
+pub fn rename(from str, to str) str
+    if from == to
+        return "{to} is where it is already"
+    if to.starts_with("{from}/")
+        return "can't move {from} into itself"
+    if fs.exists(to)
+        return "{to} exists"
+    fs.rename(from, to) else err
+        return "can't move {err.path}: {err.kind}"
+    ""
+
+## Copies the file or folder `from` to `to` (std.fs.12); refuses to replace.
+pub fn duplicate(from str, to str) str
+    if fs.exists(to)
+        return "{to} exists"
+    fs.copy(from, to) else err
+        return "can't copy {err.path}: {err.kind}"
+    ""
+
+## Removes `p` and, when it is a folder, everything in it; a symbolic
+## link is removed, not followed. std.fs has no call that removes a tree
+## (std.fs.6), so this walks it with `list_dir` and `remove`.
+pub fn remove_tree(p str) ! fs.IoError
+    if is_dir(p) and not is_link(p)
+        for n in fs.list_dir(p)?
+            remove_tree("{p}/{n}")?
+    fs.remove(p)?
+
+## Deletes the file or empty folder `p`, or with `all` a whole folder.
+pub fn delete(p str, all bool) str
+    if all
+        remove_tree(p) else err
+            return "can't delete {err.path}: {err.kind}"
+        return ""
+    fs.remove(p) else err
+        return "can't delete {err.path}: {err.kind}"
+    ""
+
+# ---- Hot exit -----------------------------------------------------------
+
+## A backup of an unsaved buffer: the absolute path of its file and the text.
+pub struct Backup
+    pub path str
+    pub text str
+
+## Where backups live: `~/.ail-edit.d/backup`, beside the settings file
+## `~/.ail-edit`; `none` without a home directory.
+pub fn backup_dir() str?
+    home := env.home() else return none
+    "{home}/.ail-edit.d/backup"
+
+## Writes the backup of the file at absolute path `abs`.
+pub fn save_backup(abs str, text str) str
+    dir := backup_dir() else return "no home directory for backups"
+    fs.make_dir(dir) else err
+        return "can't make {err.path}: {err.kind}"
+    fs.write_text("{dir}/{escape(abs)}", text) else err
+        return "can't write {err.path}: {err.kind}"
+    ""
+
+## Removes the backup of `abs`, if there is one.
+pub fn drop_backup(abs str)
+    dir := backup_dir() else return
+    p := "{dir}/{escape(abs)}"
+    if fs.exists(p)
+        fs.remove(p) else return
+
+## The backups of files under the folder `under` that are newer than their
+## file (or whose file is gone); older ones are removed.
+pub fn pending_backups(under str) List[Backup]
+    mut out := List[Backup]()
+    dir := backup_dir() else return out
+    names := fs.list_dir(dir) else return out
+    for n in names
+        p := unescape(n)
+        if not p.starts_with("{under}/")
+            continue
+        b := "{dir}/{n}"
+        if mtime(p) >= mtime(b)
+            fs.remove(b) else continue
+            continue
+        text := fs.read_text(b) else continue
+        out.push(Backup(path: p, text: text))
+    out
+
+# ---- Tests ----------------------------------------------------------------
+
+@test fn names_are_checked()
+    assert_eq(name_error("notes.md"), "")
+    assert_eq(name_error(".bashrc"), "")
+    assert_eq(name_error(""), "type a name")
+    assert_eq(name_error("  "), "type a name")
+    assert_eq(name_error(" a"), "a name can't start or end with a space")
+    assert_eq(name_error(".."), "`..` is not a name")
+    assert(name_error("a/b").contains("Move"))
+    assert(name_error("a\\b").contains("Move"))
+    assert(name_error("a:b").contains("`:`"))
+    assert(name_error("a\tb").contains("control"))
+
+@test fn paths_join_and_split()
+    assert_eq(join(".", "a.md"), "a.md")
+    assert_eq(join("", "a.md"), "a.md")
+    assert_eq(join("src", "a.md"), "src/a.md")
+    assert_eq(join("/w/", "a.md"), "/w/a.md")
+    assert_eq(join("src", "/abs/a.md"), "/abs/a.md")
+    assert_eq(parent("src/a.md"), "src")
+    assert_eq(parent("a.md"), ".")
+    assert_eq(parent("/a.md"), "/")
+    assert_eq(base("src/a.md"), "a.md")
+    assert_eq(base("a.md"), "a.md")
+    assert_eq(absolute("/w", "src/a.md"), "/w/src/a.md")
+    assert_eq(absolute("/w", "/x/a.md"), "/x/a.md")
+
+@test fn copy_names_are_free()
+    assert_eq(copy_name("a.md", ["a.md"], false), "a copy.md")
+    assert_eq(copy_name("a.md", ["a.md", "a copy.md"], false), "a copy 2.md")
+    assert_eq(copy_name("a.md", ["a.md", "a copy.md", "a copy 2.md"], false), "a copy 3.md")
+    assert_eq(copy_name(".bashrc", [".bashrc"], false), ".bashrc copy")
+    assert_eq(copy_name("v1.2", ["v1.2"], true), "v1.2 copy")
+    assert_eq(copy_name("Makefile", [], false), "Makefile copy")
+
+@test fn tabs_follow_a_rename_or_move()
+    assert_eq(moved("a.md", "a.md", "b.md") else "", "b.md")
+    assert_eq(moved("src/x/a.md", "src/x", "lib/x") else "", "lib/x/a.md")
+    assert(moved("src/xy/a.md", "src/x", "lib/x") == none)
+    assert(moved("b.md", "a.md", "c.md") == none)
+    assert_eq(plan(["a.md", "d/b.md", "c.md"], "d", "e/d"), ["a.md", "e/d/b.md", "c.md"])
+
+@test fn ancestors_of_a_path_in_the_tree()
+    assert_eq(ancestors(".", "src/a/b.ail") else List[str](), ["src", "src/a"])
+    assert_eq(ancestors(".", "b.ail") else ["x"], List[str]())
+    assert(ancestors(".", "/abs/b.ail") == none)
+    assert_eq(ancestors("/w", "/w/src/b.ail") else List[str](), ["/w/src"])
+    assert(ancestors("/w", "/v/src/b.ail") == none)
+
+@test fn backup_names_round_trip()
+    p := "/Users/k/a%b/c:d\\e.md"
+    e := escape(p)
+    assert(not e.contains("/"))
+    assert(not e.contains(":"))
+    assert_eq(e, "%2FUsers%2Fk%2Fa%25b%2Fc%3Ad%5Ce.md")
+    assert_eq(unescape(e), p)
+    assert_eq(unescape("50%"), "50%")
+    assert_eq(unescape("%zz"), "%zz")
+
+@test fn text_splits_into_lines()
+    assert_eq(text_lines("a\nb\n"), ["a", "b"])
+    assert_eq(text_lines(""), [""])
+    assert_eq(text_lines("a"), ["a"])
+
+@test fn buffer_compared_with_the_disk()
+    rows := compare_rows(["a", "b", "c"], ["a", "B", "c"])
+    assert_eq(rows, ["@@ -1,3 +1,3 @@", " a", "-b", "+B", " c"])
+    assert_eq(compare_rows(["a"], ["a"]).len(), 0)
+
+@test fn hints_name_the_folder()
+    assert(hint("files.new", "src").contains("src"))
+    assert(hint("files.open", "").contains("folder"))
+    assert_eq(hint("other", ""), "Esc cancels")

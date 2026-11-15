@@ -29,6 +29,8 @@ use features.tests as ttree
 use features.taskpanel as tp
 use features.agent
 use features.ask
+use features.syntax
+use features.files as fops
 
 # Colors, 0xRRGGBB.
 BG := 0x1e1e1e
@@ -236,6 +238,11 @@ struct Editor
     zen bool
     ## The semantic layer (Ctrl-Shift-L): kind colors, code lens, inlay hints, pending fix preview.
     layer sem.State
+    ## The buffer's language (features/syntax) and the start state of each
+    ## line its colourer has scanned (parity P8).
+    hl Highlight
+    ## The file on disk: changed under unsaved edits, Ctrl-S armed, deleted (P8).
+    disk fops.Disk
 
 fn Editor.new(path str, text str, cols int, rows int) Editor
     mut lines := text.split("\n")
@@ -291,6 +298,8 @@ fn Editor.new(path str, text str, cols int, rows int) Editor
         anchor_line: 0,
         anchor_col: 0,
         clip: "",
+        hl: Highlight.new(path),
+        disk: fops.new_disk(),
     )
 
 ## The buffer as file text: lines joined with `\n`, ending with one.
@@ -431,7 +440,7 @@ fn opens_block(s str) bool
 fn Editor.newline(mut self)
     head := self.lines[self.line].slice(0, self.col)
     mut n := indent_of(head).min(self.col)
-    if opens_block(head)
+    if self.is_ail() and opens_block(head)
         n += INDENT
     self.insert("\n{" ".repeat(n)}")
 
@@ -556,7 +565,7 @@ fn Editor.over_closer(self, t str) bool
 ## or the end of the line: `(` gives `()` with the cursor inside.
 fn Editor.insert_paired(mut self, t str)
     ts := t.chars()
-    if ts.len() != 1 or not OPENERS.contains(t)
+    if ts.len() != 1 or not OPENERS.contains(t) or t != "\"" and not syntax.brackets(self.hl.lang).contains(t)
         self.insert(t)
         return
     cs := self.cur()
@@ -590,9 +599,16 @@ fn Editor.line_span(self) Range
         return Range(line: r.line, col: 0, end_line: end, end_col: 0)
     Range(line: self.line, col: 0, end_line: self.line, end_col: 0)
 
-## Comments the lines out with `# ` at their least indentation, or, when
-## every non-blank one is already commented, removes the comments.
+## Comments the lines out with the language's comment marker (`# ` for
+## AIL, `<!-- ` and ` -->` for Markdown; features/syntax) at their least
+## indentation, or, when every non-blank one is already commented, removes
+## the comments.
 fn Editor.toggle_comment(mut self)
+    pre := syntax.comment_prefix(self.hl.lang)
+    if pre == ""
+        self.message = "this file's language has no comments"
+        return
+    suf := syntax.comment_suffix(self.hl.lang)
     span := self.line_span()
     mut ind := 1000000
     mut all_commented := true
@@ -601,24 +617,39 @@ fn Editor.toggle_comment(mut self)
         if t.trim() == ""
             continue
         ind = ind.min(indent_of(t))
-        if not t.trim().starts_with("#")
+        if not t.trim().starts_with(pre) or suf != "" and not t.trim().ends_with(suf)
             all_commented = false
     if ind == 1000000
         return
     self.snapshot()
+    mut tail := ""
+    if suf != ""
+        tail = " {suf}"
     for l in span.line..=span.end_line
         cs := self.lines[l].chars()
         if self.lines[l].trim() == ""
             continue
-        i := indent_of(self.lines[l])
         if all_commented
-            mut n := 1
-            if i + 1 < cs.len() and cs[i + 1] == ' '
-                n = 2
-            self.lines[l] = "{cs[..i].join("")}{cs[i + n..].join("")}"
+            self.lines[l] = uncomment(self.lines[l], pre, suf)
         else
-            self.lines[l] = "{cs[..ind].join("")}# {cs[ind..].join("")}"
+            self.lines[l] = "{cs[..ind].join("")}{pre} {cs[ind..].join("")}{tail}"
     self.set_col(self.col.min(self.cur().len()))
+
+## A commented line without its marker `pre` (and one space after it) and,
+## when the language closes comments, its `suf` (and one space before it).
+fn uncomment(text str, pre str, suf str) str
+    cs := text.chars()
+    i := indent_of(text)
+    mut n := pre.chars().len()
+    if i + n < cs.len() and cs[i + n] == ' '
+        n += 1
+    mut body := cs[(i + n).min(cs.len())..].join("")
+    if suf != ""
+        if b := body.strip_suffix(suf)
+            body = b
+            if b2 := body.strip_suffix(" ")
+                body = b2
+    "{cs[..i].join("")}{body}"
 
 fn Editor.duplicate_line(mut self)
     span := self.line_span()
@@ -682,6 +713,8 @@ fn word_marks(cs List[char], word str) List[bool]
 ## After typing, a line that now reads `else` or `elif` moves back one level
 ## to line up with its `if`, also an `if` that is a value or deferred (lex.block.1).
 fn Editor.dedent_else(mut self)
+    if not self.is_ail()
+        return
     t := self.lines[self.line].trim()
     if t != "else" and t != "elif"
         return
@@ -703,13 +736,14 @@ fn Editor.dedent_else(mut self)
 ## position, searching at most 500 lines away.
 fn Editor.bracket_match(self) Range?
     cs := self.cur()
+    known := syntax.brackets(self.hl.lang)
     mut c := self.col
-    if c >= cs.len() or not "()[]\{}".contains(cs[c])
+    if c >= cs.len() or not known.contains(cs[c])
         c -= 1
     if c < 0 or c >= cs.len()
         return none
     ch := cs[c]
-    brackets := "()[]\{}".chars()
+    brackets := known.chars()
     i := brackets.index_of(ch) else return none
     other := brackets[i + 1 - 2 * (i % 2)]
     mut step := 1
@@ -904,7 +938,7 @@ fn Editor.candidates(self) List[Completion]
         owned := self.member_of == "" or sym.id.starts_with("{sym.kind}:{self.member_of}.")
         if nested == member and owned and sym.name.starts_with(prefix) and seen.add(sym.name)
             out.push(Completion(text: sym.name, detail: sym.signature))
-    if not member
+    if not member and self.is_ail()
         for k in KEYWORDS.sorted()
             if k.starts_with(prefix) and seen.add(k)
                 out.push(Completion(text: k, detail: "keyword"))
@@ -1064,6 +1098,8 @@ fn Editor.text_without(self, a int, b int) str
 fn Editor.query_context(mut self)
     self.locals = []
     self.member_of = ""
+    if not self.is_ail()
+        return
     cs := self.cur()
     mut a := self.col
     while a > 0 and is_word(cs[a - 1])
@@ -1652,6 +1688,7 @@ fn Editor.render(self) Screen
     for l in 0..self.top.min(self.lines.len())
         if self.lines[l].contains(TRIPLE)
             inside = ends_in_triple(self.lines[l].chars(), inside)
+    mut hs := self.hl_start(self.top)
     ht := fold.hidden(self.lines, self.folded)
     first_row := fold.rank(ht, self.top)
     mut scanned := 0
@@ -1698,7 +1735,12 @@ fn Editor.render(self) Screen
             s.put(r, (gw + cs.len() - self.left + 1).max(gw), "... {hidden_n} lines", GUTTER_FG, bg)
         if self.left >= cs.len()
             continue
-        mut fgs := line_colors(cs, starts_inside)
+        mut fgs := List[int]()
+        if self.is_ail()
+            fgs = line_colors(cs, starts_inside)
+        else
+            hs = self.hl_walk(hs, l)
+            fgs = lang_colors(self.hl.lang, self.lines[l], hs.state)
         if self.layer.level > 0
             fgs = sem.recolor(cs, fgs, self.layer.kinds, layer_colors())
         end := cs.len().min(self.left + w)
@@ -1712,7 +1754,7 @@ fn Editor.render(self) Screen
             for xr in extra_sel
                 shade = sel_bg(xr, l, k, shade)
             bgs.push(shade)
-            if sc.levels[k] > 0
+            if sc.levels[k] > 0 and self.is_ail()
                 fgs[k] = PAIR_FGS[(sc.levels[k] - 1) % PAIR_FGS.len()]
         mut i := self.left
         while i < end
@@ -2198,6 +2240,7 @@ enum Command
 fn Editor.apply(mut self, cmd Command)
     if cmd != Quit
         self.quit_armed = false
+    self.disk.armed = false
     if self.prompt == NoPrompt
         self.message = ""
     if self.pane == Outline and self.outline_key(cmd)
@@ -2698,6 +2741,8 @@ fn parse_outline(text str) List[OutlineItem]
 ## Runs `ail ARGS... FILE` on the buffer: on the file itself when it's
 ## saved, else on a copy beside it, so relative imports still resolve.
 fn Editor.ail_on_buffer(mut self, args List[str]) proc.Output?
+    if not self.is_ail()
+        return none
     mut file := self.path
     if self.dirty
         file = "{self.path}.edit-check.ail"
@@ -2724,12 +2769,21 @@ fn Editor.check(mut self)
 
 ## Formats (when the program has no errors), writes the file, and checks it.
 fn Editor.save(mut self)
-    self.format()
+    if self.disk.changed and not self.disk.armed
+        self.disk.armed = true
+        self.message = "{base_name(self.path)} changed on disk: Ctrl-S again overwrites it (palette: Compare with disk, Revert file)"
+        return
+    if self.is_ail()
+        self.format()
     fs.write_text(self.path, self.text()) else err
         self.message = "can't save {err.path}: {err.kind}"
         return
     self.dirty = false
+    self.disk = fops.new_disk()
     self.saves += 1
+    if not self.is_ail()
+        self.message = "saved"
+        return
     self.check()
     self.refresh_layer()
     self.message = "saved; {self.message}"
@@ -2850,7 +2904,7 @@ fn Editor.next_code_line(self, l int) int
 ## Rebuilds what the layer shows from `ail api`: kind colors and the code
 ## lens from `--symbols`, and at level 2 the inlay hints.
 fn Editor.refresh_layer(mut self)
-    if self.layer.level == 0 and not self.layer.hints_on
+    if self.layer.level == 0 and not self.layer.hints_on or not self.is_ail()
         return
     self.index()
     mut names := List[str]()
@@ -2930,6 +2984,9 @@ fn Editor.render_ghosts(self, mut s Screen, h int, gw int, shown Set[int])
 ## "h" toggles inlay hints (Alt-I), "x" is fix-all (Ctrl-Shift-.), "y" is
 ## the `ail fix` preview (palette), "f" previews the first fix (Ctrl-.).
 fn Editor.layer_key(mut self, k str)
+    if not self.is_ail()
+        self.message = "semantic layer, inlay hints and fixes: AIL files only"
+        return
     self.layer.pending = false
     self.layer.proposed = []
     if k == "l"
@@ -4514,8 +4571,8 @@ fn Workspace.save_session(self)
         text = fs.read_text(path) else ""
     fs.write_text(path, with_setting(
         text,
-        session_key(env.cwd()),
-        session_value(self.eds, self.active),
+        session_key(self.session_dir()),
+        session_value(self.session_tabs(), self.active),
     )) else err
         return
 
@@ -5345,6 +5402,50 @@ fn key_rows() List[KeyRow]
             "",
             "Click places the caret, drag or Shift-click selects, the wheel scrolls, a click on a diagnostic or an output location jumps to it",
         ),
+        key_row(
+            "Ctrl-Shift-S",
+            "Save as",
+            "ctrl+shift+s",
+            "Save the tab under a new path, which the tab then shows (Enter twice replaces a file)",
+        ),
+        key_row("Ctrl-Alt-S", "Save all", "ctrl+alt+s", "Save every tab with unsaved changes"),
+        key_row(
+            "Palette",
+            "Revert file",
+            "",
+            "Reload the tab from disk (one undo step); with unsaved changes, run it twice",
+        ),
+        key_row(
+            "Palette",
+            "Compare with disk",
+            "",
+            "The lines where the tab and its file on disk differ, in the pane (Esc closes)",
+        ),
+        key_row("Palette", "Reveal in tree", "", "Show the active file in the tree, its folders expanded"),
+        key_row(
+            "Palette",
+            "Open folder",
+            "",
+            "Show another folder in the tree and reopen its tabs (the window's folder chooser, else a path prompt)",
+        ),
+        key_row(
+            "Tree: N, Shift-N",
+            "",
+            "",
+            "In the focused tree (Ctrl-B): a new file (opened) or a new folder in the selected folder",
+        ),
+        key_row(
+            "Tree: R or F2, M, C",
+            "",
+            "",
+            "In the focused tree: rename, move to another folder, duplicate; open tabs follow",
+        ),
+        key_row(
+            "Tree: D or Delete",
+            "",
+            "",
+            "In the focused tree: delete, pressed twice (three times for a folder that is not empty); open tabs stay, marked deleted",
+        ),
     ]
 
 ## The README's key table (`--keys`).
@@ -5418,6 +5519,8 @@ enum WsKey
     Hierarchy
     Zoom(key str)
     Diff(kind str)
+    SaveAs
+    SaveAll
 
 fn workspace_key(k str, ctrl bool, alt bool, shift bool) WsKey?
     if alt and shift and not ctrl
@@ -5472,7 +5575,10 @@ fn workspace_key(k str, ctrl bool, alt bool, shift bool) WsKey?
             "x" | "X" => TestTool("contracts")
             "k" | "K" => TaskPanel
             "a" | "A" => AskBar
+            "s" | "S" => SaveAs
             _ => none
+    if alt and (k == "s" or k == "S")
+        return SaveAll
     match k
         "b" | "B" => Tree
         "w" | "W" => CloseTab
@@ -5508,6 +5614,8 @@ fn Workspace.choices(self) List[str]
         return ["Enter creates NAME/ with ail.pkg and main.ail (ail new); Esc cancels"]
     if self.picker_mode == "bind"
         return ["NEWKEY as COMMAND, e.g. ctrl+alt+t as Next theme; Esc cancels"]
+    if self.picker_mode.starts_with("files.")
+        return [fops.hint(self.picker_mode, self.filing.dir)]
     if not self.commanding
         return self.matches()
     mut out := List[str]()
@@ -5523,6 +5631,8 @@ fn Workspace.choose(mut self)
     self.picking = false
     m := self.picker_mode
     self.picker_mode = ""
+    if self.files_choose(m)
+        return
     if m == "new"
         self.new_project(self.field.text)
         return
@@ -5587,6 +5697,10 @@ fn Workspace.run_command(mut self, name str)
             self.message = "agent marks {on_off(not self.watch.hidden)}"
         "Count tokens" => self.token_report()
         "Toggle token meter" => self.askbar.toggle()
+        "Reveal in tree" => self.reveal_active()
+        "Revert file" => self.revert_file()
+        "Compare with disk" => self.compare_with_disk()
+        "Open folder" => self.open_folder_command()
         _ => self.message = "no command `{name}`"
 
 ## The "New file" palette row: the file picker, with a hint.
@@ -5671,6 +5785,8 @@ struct Workspace
     watch agent.State
     ## The ask bar and the token meter (features/ask, plan S8).
     askbar ask.Bar
+    ## File commands and hot exit (features/files, parity P8).
+    filing fops.State
 
 fn Workspace.new(ed Editor) Workspace
     Workspace(
@@ -5721,6 +5837,7 @@ fn Workspace.new(ed Editor) Workspace
         zen: false,
         watch: agent.new_state(),
         askbar: ask.Bar.new(),
+        filing: fops.new_state(),
     )
 
 ## The file name a tab shows: the path after its last `/`.
@@ -5836,6 +5953,8 @@ fn Workspace.dispatch(mut self, ev ui.Event)
                 return
     self.repl_step = 0
     if self.tree_focus
+        if self.tree_command(ev)
+            return
         if k := pressed(ev)
             if self.tree_key(k)
                 return
@@ -5890,6 +6009,8 @@ fn Workspace.dispatch(mut self, ev ui.Event)
                             self.eds[self.active].test_quietly()
                         else
                             self.eds[self.active].tests = ""
+                    SaveAs => self.start_save_as()
+                    SaveAll => self.save_all()
                 return
             saves := self.eds[self.active].saves
             self.eds[self.active].on_event(ev)
@@ -5988,6 +6109,8 @@ fn Workspace.tab_labels(self) List[str]
             flag = "{flag} E{e}"
         if w > 0
             flag = "{flag} W{w}"
+        if ed.disk.deleted
+            flag = "{flag} deleted"
         out.push(" {base_name(ed.path)}{flag} ")
     out
 
@@ -6827,7 +6950,7 @@ fn impact_of(file str, rev str) tp.Impact
 ## After a save: marks the affected declarations in the gutter. Nothing is
 ## marked when the file can't be compared (no git revision, or errors).
 fn Editor.impact_refresh(mut self)
-    if self.dirty
+    if self.dirty or not self.is_ail()
         return
     job := task_job()
     mut rev := "HEAD"
@@ -7209,6 +7332,9 @@ fn Workspace.agent_poll(mut self, now int)
             e.scroll()
             self.eds[i] = e
         self.message = p.note
+        if not p.reload
+            self.eds[i].disk.changed = true
+            self.message = "{p.note}: Ctrl-S twice overwrites; palette: Compare with disk, Revert file"
     if now - self.watch.scanned < 1000
         return
     self.watch.scanned = now
@@ -7572,6 +7698,9 @@ fn Workspace.askbar_refresh(mut self)
     ed := self.eds[self.active]
     if not self.askbar.stale(ed.path, ed.saves)
         return
+    if not ed.is_ail()
+        self.askbar.counted(ed.path, ed.saves, -1)
+        return
     mut n := -1
     if ed.path != "" and fs.exists(ed.path)
         if t := ask.tokens_of(ail_command(), ed.path)
@@ -7601,6 +7730,8 @@ fn Workspace.render_askbar(self, mut s Screen)
 ## 500 ms have passed since the last edit.
 fn Workspace.idle(mut self, now int)
     self.agent_poll(now)
+    self.eds[self.active].hl_sync()
+    self.hot_exit(now)
     if self.live_problems and self.typed_at > 0 and now - self.typed_at >= 500
         self.refresh_problems()
 
@@ -8202,6 +8333,736 @@ DEPTH_SAMPLE := "fn main()\n    x := 1\n    if x > 0\n        print(x)\n\nfn oth
     assert(s.text[1].contains("alpha"))
     assert(s.text[1].contains("beta"))
 
+# ---- Files and languages (parity P8) ----------------------------------------
+
+## The buffer's language (features/syntax, C3) and the colourer state each
+## scanned line starts in: `starts[i]` is line `i`'s, valid while
+## `seen[0..i]` are still the buffer's lines. `render` reads it and
+## `hl_sync` fills it, so a long Markdown file isn't rescanned from the top.
+struct Highlight
+    lang syntax.Lang
+    seen List[str]
+    starts List[int]
+
+## The language of `path`; a buffer without a path is AIL.
+fn Highlight.new(path str) Highlight
+    mut lang := syntax.lang_of(path)
+    if path == ""
+        lang = syntax.Lang.Ail
+    Highlight(lang: lang, seen: [], starts: [0])
+
+## A line and the colourer state it starts in.
+struct HlAt
+    line int
+    state int
+
+## Whether the buffer is AIL. Only then do `ail check`, format on save,
+## completion from the index, the semantic layer, inlay hints and the token
+## meter run, and do AIL's block indent and colours apply.
+fn Editor.is_ail(self) bool
+    self.hl.lang == syntax.Lang.Ail
+
+## Points the tab at `p` (Save as, a rename or move in the tree) and
+## chooses its language again.
+fn Editor.set_path(mut self, p str)
+    self.path = p
+    self.hl = Highlight.new(p)
+    self.indexed = false
+    self.diags = []
+
+## The latest cached start state at or before line `to` whose lines above
+## are unchanged.
+fn Editor.hl_start(self, to int) HlAt
+    n := self.hl.seen.len().min(self.lines.len()).min(to)
+    mut k := 0
+    while k < n and self.hl.seen[k] == self.lines[k]
+        k += 1
+    HlAt(line: k, state: self.hl.starts[k])
+
+## `at` carried down the buffer to the start of line `to`.
+fn Editor.hl_walk(self, at HlAt, to int) HlAt
+    mut st := at.state
+    mut k := at.line
+    while k < to and k < self.lines.len()
+        st = lang_next(self.hl.lang, self.lines[k], st)
+        k += 1
+    HlAt(line: k, state: st)
+
+## Fills the start states down to the last visible line, keeping those
+## above the first changed line (called while the window waits).
+fn Editor.hl_sync(mut self)
+    if self.is_ail()
+        return
+    want := (self.top + self.rows).min(self.lines.len())
+    at := self.hl_start(want)
+    mut seen := self.hl.seen[..at.line]
+    mut starts := self.hl.starts[..at.line + 1]
+    mut st := at.state
+    for k in at.line..want
+        st = lang_next(self.hl.lang, self.lines[k], st)
+        seen.push(self.lines[k])
+        starts.push(st)
+    self.hl.seen = seen
+    self.hl.starts = starts
+
+## The state the line after `text` starts in. A line of AIL inside a
+## Markdown fence carries the editor's own `"""` state in the fence's.
+fn lang_next(lang syntax.Lang, text str, state int) int
+    ln := syntax.line(lang, text, state)
+    if not ln.embed_ail
+        return ln.state
+    if ends_in_triple(text.chars(), syntax.inner(ln.state) == 1)
+        return syntax.with_inner(ln.state, 1)
+    syntax.with_inner(ln.state, 0)
+
+## The foreground colour of each character of a line that is not AIL;
+## AIL lines inside it (`embed_ail`) use the AIL colourer.
+fn lang_colors(lang syntax.Lang, text str, state int) List[int]
+    ln := syntax.line(lang, text, state)
+    if ln.embed_ail
+        return line_colors(text.chars(), syntax.inner(state) == 1)
+    [kind_fg(k) for k in ln.kinds]
+
+## The theme colour of a `syntax.Kind`, from the editor's existing colours.
+fn kind_fg(k syntax.Kind) int
+    match k
+        Plain => FG
+        Keyword => KEYWORD_FG
+        Str => STRING_FG
+        Number => NUMBER_FG
+        Comment => COMMENT_FG
+        Heading => FN_FG
+        Emphasis => ATTR_FG
+        Code => STRING_FG
+        Link => TYPE_FG
+        Key => FIELD_FG
+        Punct => OP_FG
+        Tag => ATTR_FG
+        Variable => VARIANT_FG
+        Constant => CONST_FG
+        Invalid => ERROR_FG
+
+## The tree's keys that change files (C2): `n` new file, `N` or Shift-N new
+## folder, `r` or F2 rename, `m` move, `c` duplicate, `d` or Delete delete
+## (asks first). True if `ev` was one of them.
+fn Workspace.tree_command(mut self, ev ui.Event) bool
+    k := pressed(ev) else return false
+    shifted := match ev
+        Key(_, _, _, s) => s
+        Resize(_, _) | Close | Mouse(_, _, _, _) | Scroll(_) => false
+    if k != "d" and k != "delete"
+        self.filing.armed = ""
+    here := self.tree_here()
+    acts := ["r", "f2", "m", "c", "d", "delete"]
+    if k == "N" or k == "n" and shifted
+        self.tree_prompt("files.dir", "new folder: ", "")
+    elif k == "n"
+        self.tree_prompt("files.new", "new file: ", "")
+    elif here == "" and acts.contains(k)
+        self.message = "select a file or folder first"
+    elif k == "r" or k == "f2"
+        self.tree_prompt("files.rename", "rename to: ", fops.base(here))
+    elif k == "m"
+        self.tree_prompt("files.move", "move to folder: ", fops.parent(here))
+    elif k == "c"
+        self.tree_duplicate(here)
+    elif k == "d" or k == "delete"
+        self.tree_delete(here)
+    else
+        return false
+    true
+
+## The path of the selected tree row, or "".
+fn Workspace.tree_here(self) str
+    if self.tree_sel < self.tree.len()
+        return self.tree[self.tree_sel].path
+    ""
+
+## Opens a file command's prompt holding `text`; a new entry goes in the
+## selected folder, or beside the selected file.
+fn Workspace.tree_prompt(mut self, m str, label str, text str)
+    here := self.tree_here()
+    self.filing.target = here
+    self.filing.dir = self.tree_root
+    if here != ""
+        if self.tree[self.tree_sel].dir
+            self.filing.dir = here
+        else
+            self.filing.dir = fops.parent(here)
+    self.start_mode(m, label)
+    self.field = widgets.TextField.new(label, text)
+
+## Enter in a file command's prompt; false for any other prompt.
+fn Workspace.files_choose(mut self, m str) bool
+    if not m.starts_with("files.")
+        return false
+    entry := self.field.text
+    match m
+        "files.new" => self.tree_new(entry, false)
+        "files.dir" => self.tree_new(entry, true)
+        "files.rename" => self.tree_rename(entry)
+        "files.move" => self.tree_move(entry.trim())
+        "files.saveas" => self.save_as(entry.trim())
+        "files.open" => self.open_folder(entry.trim())
+        _ => self.message = "no file command `{m}`"
+    true
+
+## Rebuilds the tree and selects the row of `p` when it shows.
+fn Workspace.tree_show(mut self, p str)
+    self.tree = self.tree_rows(self.tree_root, 0)
+    self.tree_sel = self.tree_sel.min((self.tree.len() - 1).max(0))
+    for i in 0..self.tree.len()
+        if self.tree[i].path == p
+            self.tree_sel = i
+
+## A new file (opened in a tab) or folder called `name` in the prompt's folder.
+fn Workspace.tree_new(mut self, name str, folder bool)
+    why := fops.name_error(name)
+    if why != ""
+        self.message = why
+        return
+    p := fops.join(self.filing.dir, name)
+    mut err := ""
+    if folder
+        err = fops.make_folder(p)
+    else
+        err = fops.make_file(p)
+    if err != ""
+        self.message = err
+        return
+    if self.filing.dir != self.tree_root
+        self.expanded.add(self.filing.dir)
+    self.tree_show(p)
+    if folder
+        self.message = "created folder {p}"
+        return
+    self.open(p)
+    self.tree_focus = false
+    self.message = "created {p}"
+
+fn Workspace.tree_rename(mut self, name str)
+    why := fops.name_error(name)
+    if why != ""
+        self.message = why
+        return
+    src := self.filing.target
+    self.move_entry(src, fops.join(fops.parent(src), name))
+
+## Moves the selected entry into the folder `dest` (under the tree's root
+## when relative).
+fn Workspace.tree_move(mut self, dest str)
+    if dest == ""
+        self.message = "type the folder to move it into"
+        return
+    folder := fops.join(self.tree_root, dest)
+    if not fops.is_dir(folder)
+        self.message = "no folder {folder}"
+        return
+    src := self.filing.target
+    self.move_entry(src, fops.join(folder, fops.base(src)))
+
+## Renames or moves `src` to `dst`; open tabs and expanded folders follow.
+fn Workspace.move_entry(mut self, src str, dst str)
+    err := fops.rename(src, dst)
+    if err != ""
+        self.message = err
+        return
+    before := [e.path for e in self.eds]
+    after := fops.plan(before, src, dst)
+    mut n := 0
+    for i in 0..self.eds.len()
+        if after[i] != before[i]
+            self.eds[i].set_path(after[i])
+            self.watch.stamp(after[i])
+            n += 1
+    mut kept := Set[str]()
+    for x in self.expanded
+        kept.add(fops.moved(x, src, dst) else x)
+    self.expanded = kept
+    self.tree_show(dst)
+    self.message = "{src} -> {dst}; {n} open tab(s) follow"
+
+## `d` twice deletes the selected entry, three times for a folder that is
+## not empty. Its open tabs stay, marked deleted and unsaved.
+fn Workspace.tree_delete(mut self, p str)
+    full := fops.is_dir(p) and fops.entries(p) > 0
+    if self.filing.armed != "delete:{p}" and self.filing.armed != "delete2:{p}"
+        self.filing.armed = "delete:{p}"
+        self.message = "delete {p}? d again deletes it"
+        return
+    if full and self.filing.armed == "delete:{p}"
+        self.filing.armed = "delete2:{p}"
+        self.message = "{p} holds {fops.entries(p)} entries: d again deletes it and everything in it"
+        return
+    self.filing.armed = ""
+    err := fops.delete(p, full)
+    if err != ""
+        self.message = err
+        return
+    mut n := 0
+    for i in 0..self.eds.len()
+        if fops.moved(self.eds[i].path, p, p) != none
+            self.eds[i].disk.deleted = true
+            self.eds[i].dirty = true
+            n += 1
+    self.tree_show("")
+    self.message = "deleted {p}; {n} open tab(s) kept, marked deleted"
+
+## `c`: a copy beside the selected entry, named `NAME copy`.
+fn Workspace.tree_duplicate(mut self, p str)
+    dir := fops.parent(p)
+    taken := fs.list_dir(dir) else List[str]()
+    dst := fops.join(dir, fops.copy_name(fops.base(p), taken, fops.is_dir(p)))
+    err := fops.duplicate(p, dst)
+    if err != ""
+        self.message = err
+        return
+    self.tree_show(dst)
+    self.message = "copied {p} to {dst}"
+
+## Palette "Reveal in tree": opens the tree on the active file, expanding
+## its folders.
+fn Workspace.reveal_active(mut self)
+    mut p := self.eds[self.active].path
+    if self.tree_root == "." or self.tree_root == ""
+        p = p.strip_prefix("{env.cwd()}/") else p
+    elif not p.starts_with("/")
+        p = fops.absolute(env.cwd(), p)
+    ups := fops.ancestors(self.tree_root, p) else
+        self.message = "{p} is outside the tree's folder {self.tree_root}"
+        return
+    for u in ups
+        self.expanded.add(u)
+    self.tree_open = true
+    self.tree_focus = true
+    self.resize_tabs()
+    self.tree_show(p)
+    if self.tree_here() == p
+        self.message = "revealed {p}"
+    else
+        self.message = "{p} is in a folder the tree hides"
+
+## Ctrl-Shift-S: the path prompt for Save as.
+fn Workspace.start_save_as(mut self)
+    self.start_mode("files.saveas", "save as: ")
+    self.field = widgets.TextField.new("save as: ", self.eds[self.active].path)
+
+## Saves the active tab as `p`, which it then shows; replacing another
+## file takes Enter twice.
+fn Workspace.save_as(mut self, p str)
+    if p == ""
+        self.message = "type a path"
+        return
+    was := self.eds[self.active].path
+    for i in 0..self.eds.len()
+        if i != self.active and self.eds[i].path == p
+            self.message = "{p} is open in another tab"
+            return
+    if p != was and fs.exists(p) and self.filing.armed != "saveas:{p}"
+        self.filing.armed = "saveas:{p}"
+        self.start_mode("files.saveas", "save as: ")
+        self.field = widgets.TextField.new("save as: ", p)
+        self.message = "{p} exists: Enter again replaces it"
+        return
+    self.filing.armed = ""
+    n := self.eds[self.active].saves
+    self.eds[self.active].set_path(p)
+    self.eds[self.active].disk = fops.new_disk()
+    self.eds[self.active].run(Save)
+    if self.eds[self.active].saves == n
+        self.message = self.eds[self.active].message
+        self.eds[self.active].set_path(was)
+        return
+    self.watch.saved(p)
+    if self.tree_open
+        self.tree_show(p)
+    self.message = "saved as {p}"
+
+## Ctrl-Alt-S: saves every tab with unsaved edits, except those whose file
+## changed on disk (Ctrl-S twice saves one of them).
+fn Workspace.save_all(mut self)
+    mut saved := 0
+    mut held := List[str]()
+    for i in 0..self.eds.len()
+        if not self.eds[i].dirty
+            continue
+        if self.eds[i].disk.changed
+            held.push(base_name(self.eds[i].path))
+            continue
+        n := self.eds[i].saves
+        self.eds[i].run(Save)
+        if self.eds[i].saves != n
+            saved += 1
+            self.watch.saved(self.eds[i].path)
+    mut note := "saved {saved} file(s)"
+    if held.len() > 0
+        note = "{note}; changed on disk, not saved: {held.join(", ")} (Ctrl-S twice overwrites)"
+    self.message = note
+
+## Palette "Revert file": the file on disk replaces the buffer (one undo
+## step); with unsaved edits it asks first.
+fn Workspace.revert_file(mut self)
+    mut ed := self.eds[self.active]
+    if not fs.exists(ed.path)
+        self.message = "{ed.path} is not on disk"
+        return
+    key := "revert:{ed.path}:{ed.undo.len()}"
+    if ed.dirty and self.filing.armed != key
+        self.filing.armed = key
+        self.message = "Revert file drops the unsaved edits: run it again to revert"
+        return
+    self.filing.armed = ""
+    text := fs.read_text(ed.path) else err
+        self.message = "can't read {err.path}: {err.kind}"
+        return
+    ed.snapshot()
+    ed.lines = fops.text_lines(text)
+    ed.line = ed.line.min(ed.lines.len() - 1)
+    ed.set_col(ed.col.min(ed.cur().len()))
+    ed.dirty = false
+    ed.disk = fops.new_disk()
+    ed.indexed = false
+    ed.diags = []
+    ed.scroll()
+    self.eds[self.active] = ed
+    self.watch.stamp(ed.path)
+    self.message = "reverted {ed.path} to the file on disk"
+
+## Palette "Compare with disk": the lines where the buffer and its file
+## differ, as unified rows in the pane (features/hunks).
+fn Workspace.compare_with_disk(mut self)
+    ed := self.eds[self.active]
+    text := fs.read_text(ed.path) else err
+        self.message = "can't read {err.path}: {err.kind}"
+        return
+    diff_rows := fops.compare_rows(fops.text_lines(text), ed.lines)
+    if diff_rows.len() == 0
+        self.message = "the buffer is the same as {ed.path} on disk"
+        return
+    mut shown := ["--- {ed.path} on disk", "+++ the buffer"]
+    shown.extend(diff_rows)
+    self.eds[self.active].pane_text = shown
+    self.eds[self.active].pane = Pane.Text
+    self.message = "compare with disk: Esc closes"
+
+## Palette "Open folder": the host's folder chooser in the std.app window
+## (std.app.22, answered in `Shell.update`), else a prompt for a path.
+fn Workspace.open_folder_command(mut self)
+    if self.filing.native
+        self.filing.asking = true
+        self.message = "choose a folder"
+        return
+    self.start_mode("files.open", "open folder: ")
+
+## Shows the folder `d` in the tree and reopens the tabs remembered for it.
+## The process keeps its working directory (std has no call that changes
+## it), so the file picker and project search still list that directory.
+fn Workspace.open_folder(mut self, d str)
+    if d == ""
+        self.message = "type a folder"
+        return
+    mut dir := fops.absolute(env.cwd(), d)
+    if dir.len() > 1 and dir.ends_with("/")
+        dir = dir.slice(0, dir.len() - 1)
+    if not fops.is_dir(dir)
+        self.message = "no folder {dir}"
+        return
+    self.tree_root = dir
+    self.expanded = Set[str]()
+    self.tree_open = true
+    self.tree_focus = true
+    self.tree_sel = 0
+    self.resize_tabs()
+    self.tree = self.tree_rows(dir, 0)
+    n := self.restore_folder(dir)
+    self.message = "folder {dir}: {n} tab(s) reopened; Ctrl-P still lists {env.cwd()}"
+
+## Opens the tabs the settings remember for `dir`; how many opened.
+fn Workspace.restore_folder(mut self, dir str) int
+    value := setting(self.prefs, session_key(dir)) else return 0
+    mut n := 0
+    for at in session_places(value)
+        p := fops.absolute(dir, at.path)
+        if fs.exists(p)
+            self.open(p)
+            self.eds[self.active].jump_to(at)
+            n += 1
+    n
+
+## The folder whose tabs `save_session` remembers: the one Open folder
+## chose, else the working directory.
+fn Workspace.session_dir(self) str
+    if self.tree_root == "." or self.tree_root == ""
+        return env.cwd()
+    self.tree_root
+
+## The tabs as `save_session` stores them: with absolute paths when the
+## session belongs to a folder other than the working directory.
+fn Workspace.session_tabs(self) List[Editor]
+    cwd := env.cwd()
+    if self.session_dir() == cwd
+        return self.eds
+    mut out := self.eds
+    for mut e in out
+        e.path = fops.absolute(cwd, e.path)
+    out
+
+## Hot exit (C2): 2 s after the unsaved tabs last changed, writes each one's
+## text to `~/.ail-edit.d/backup/`; a backup goes when its tab is saved,
+## reverted or closed. Off under tests (`remember` is false there).
+## `typed_at` is only set while the problems list is live, so this keeps
+## its own time from the unsaved tabs' depth and cursors.
+fn Workspace.hot_exit(mut self, now int)
+    if not self.remember
+        return
+    cwd := env.cwd()
+    mut parts := List[str]()
+    for e in self.eds
+        if e.dirty
+            parts.push("{e.path}:{e.undo.len()}:{e.lines.len()}:{e.line}:{e.col}")
+    sig := parts.join("|")
+    if sig != self.filing.sig
+        self.filing.sig = sig
+        self.filing.edited_at = now
+    mut kept := List[str]()
+    for b in self.filing.backed
+        mut live := false
+        for e in self.eds
+            if e.dirty and fops.absolute(cwd, e.path) == b
+                live = true
+        if live
+            kept.push(b)
+        else
+            fops.drop_backup(b)
+    self.filing.backed = kept
+    if self.filing.edited_at == 0 or now - self.filing.edited_at < 2000
+        return
+    self.filing.edited_at = 0
+    for e in self.eds
+        if e.dirty
+            abs := fops.absolute(cwd, e.path)
+            if fops.save_backup(abs, e.text()) == "" and not self.filing.backed.contains(abs)
+                self.filing.backed.push(abs)
+
+## At start: a backup newer than its file reopens that file with the
+## backup's text as unsaved edits, and the message row says so.
+fn Workspace.restore_backups(mut self)
+    cwd := env.cwd()
+    found := fops.pending_backups(cwd)
+    for b in found
+        self.open(b.path.strip_prefix("{cwd}/") else b.path)
+        mut ed := self.eds[self.active]
+        ed.lines = fops.text_lines(b.text)
+        ed.line = ed.line.min(ed.lines.len() - 1)
+        ed.set_col(ed.col.min(ed.cur().len()))
+        ed.dirty = true
+        ed.indexed = false
+        ed.diags = []
+        ed.scroll()
+        self.eds[self.active] = ed
+        self.filing.backed.push(b.path)
+    if found.len() > 0
+        dir := fops.backup_dir() else ""
+        self.message = "restored unsaved edits of {found.len()} file(s) from {dir}"
+
+@test fn markdown_and_json_buffers_get_their_own_colours()
+    src := "# Title\ntext *em* here\n```ail\nx := \"\"\"\nfn no\n\"\"\"\n```\n```json\n\{\"k\": 1}\n```"
+    mut ed := Editor.new("README.md", src, 60, 16)
+    assert_eq(ed.hl.lang, syntax.Lang.Markdown)
+    assert(not ed.is_ail())
+    s := ed.render()
+    gw := ed.gutter_width()
+    assert_eq(fg_at(s, 0, gw), FN_FG)
+    assert_eq(fg_at(s, 1, gw), FG)
+    assert_eq(fg_at(s, 1, gw + 6), ATTR_FG)
+    # An `ail` fence uses the AIL colourer, its `"""` carried down the lines.
+    assert_eq(fg_at(s, 3, gw), FG)
+    assert_eq(fg_at(s, 3, gw + 5), STRING_FG)
+    assert_eq(fg_at(s, 4, gw), STRING_FG)
+    assert_eq(fg_at(s, 8, gw + 1), FIELD_FG)
+    # The start states are cached and kept above the first changed line.
+    ed.hl_sync()
+    assert_eq(ed.hl.starts.len(), ed.lines.len() + 1)
+    at := ed.hl_start(5)
+    assert_eq(at.line, 5)
+    assert_eq(syntax.inner(at.state), 1)
+    ed.lines[2] = "plain"
+    assert_eq(ed.hl_start(5).line, 2)
+    assert_eq(fg_at(ed.render(), 4, gw), FG)
+    j := Editor.new("data/x.json", "\{\"name\": \"ail\", \"ok\": true}\n[1, nope]", 60, 10)
+    assert_eq(j.hl.lang, syntax.Lang.Json)
+    js := j.render()
+    jw := j.gutter_width()
+    assert_eq(fg_at(js, 0, jw + 1), FIELD_FG)
+    assert_eq(fg_at(js, 0, jw + 10), STRING_FG)
+    assert_eq(fg_at(js, 0, jw + 22), CONST_FG)
+    assert_eq(fg_at(js, 1, jw + 1), NUMBER_FG)
+    assert_eq(fg_at(js, 1, jw + 4), ERROR_FG)
+    # An AIL buffer keeps the AIL colourer.
+    assert(Editor.new("t.ail", "", 40, 10).is_ail())
+    assert(Editor.new("", "", 40, 10).is_ail())
+
+@test fn ail_only_features_are_quiet_on_a_markdown_buffer()
+    mut ws := Workspace.new(Editor.new("notes.md", "# A\nif x\n", 40, 10))
+    assert(not ws.eds[0].is_ail())
+    # No AIL block indent: the next line keeps the previous line's indent.
+    ws.eds[0].jump_to(Loc(path: "", line: 2, col: 5))
+    ws.on_event(press("enter"))
+    assert_eq(ws.eds[0].lines[2], "")
+    # Ctrl-/ uses the language's comment markers.
+    ws.eds[0].jump_to(Loc(path: "", line: 1, col: 1))
+    ws.on_event(key_event("ctrl+/"))
+    assert_eq(ws.eds[0].lines[0], "<!-- # A -->")
+    ws.on_event(key_event("ctrl+/"))
+    assert_eq(ws.eds[0].lines[0], "# A")
+    # No `ail check`, semantic layer, inlay hints, keyword completion or token meter.
+    ws.eds[0].run(Check)
+    assert_eq(ws.eds[0].diags.len(), 0)
+    ws.run_command("Semantic layer")
+    assert_eq(ws.eds[0].layer.level, 0)
+    assert(ws.eds[0].message.contains("AIL files only"))
+    ws.on_event(key_event("alt+i"))
+    assert(not ws.eds[0].layer.hints_on)
+    ws.eds[0].lines = ["wh"]
+    ws.eds[0].jump_to(Loc(path: "", line: 1, col: 3))
+    for c in ws.eds[0].candidates()
+        assert(c.text != "while")
+    assert_eq(ws.askbar.segment(), "")
+    # Markdown matches and closes `(` and `[` only.
+    ws.eds[0].lines = ["\{x} (y)"]
+    ws.eds[0].jump_to(Loc(path: "", line: 1, col: 1))
+    assert(ws.eds[0].bracket_match() == none)
+    ws.eds[0].jump_to(Loc(path: "", line: 1, col: 5))
+    assert(ws.eds[0].bracket_match() != none)
+    ws.eds[0].apply(Insert("\{"))
+    assert_eq(ws.eds[0].lines[0], "\{x} \{(y)")
+    # A JSON buffer has no comment toggle.
+    mut jw := Workspace.new(Editor.new("a.json", "[1]\n", 40, 10))
+    jw.on_event(key_event("ctrl+/"))
+    assert_eq(jw.eds[0].lines[0], "[1]")
+
+## The index of the tree row showing `p`.
+fn tree_index(ws Workspace, p str) int
+    for i in 0..ws.tree.len()
+        if ws.tree[i].path == p
+            return i
+    -1
+
+## Types `s` into the open prompt and presses Enter.
+fn prompt_enter(mut ws Workspace, s str)
+    for c in s.chars()
+        ws.on_event(press("{c}"))
+    ws.on_event(press("enter"))
+
+# test.sandbox.2: it makes files in a temporary directory. Only Markdown and
+# JSON files are opened, so no `ail` runs.
+@needs(fs) @test fn tree_commands_change_files_and_tabs_follow()
+    d := fs.make_temp_dir("ail-edit-files-")?
+    fs.write_text("{d}/a.md", "# A\n")?
+    fs.make_dir("{d}/sub")?
+    mut ws := Workspace.new(Editor.new("{d}/a.md", "# A\n", 40, 10))
+    ws.on_event(Resize(cols: 80, rows: 20))
+    ws.tree_root = d
+    ws.on_event(key_event("ctrl+b"))
+    assert_eq(ws.tree[0].path, "{d}/sub")
+    # `n` on a folder row: a new file inside it, opened in a tab.
+    ws.on_event(press("n"))
+    assert(ws.picking)
+    prompt_enter(mut ws, "x/y")
+    assert(ws.message.contains("Move"))
+    ws.on_event(press("n"))
+    prompt_enter(mut ws, "b.md")
+    assert(fs.exists("{d}/sub/b.md"))
+    assert_eq(ws.eds[ws.active].path, "{d}/sub/b.md")
+    assert_eq(ws.tree_here(), "{d}/sub/b.md")
+    # Shift-N: a new folder beside the selected file.
+    ws.on_event(key_event("ctrl+b"))
+    ws.on_event(key_event("shift+n"))
+    prompt_enter(mut ws, "docs")
+    assert(fops.is_dir("{d}/sub/docs"))
+    # F2 renames; the open tab follows and takes the new language.
+    ws.tree_sel = tree_index(ws, "{d}/a.md")
+    ws.on_event(key_event("f2"))
+    assert_eq(ws.field.text, "a.md")
+    ws.field = widgets.TextField.new("rename to: ", "")
+    prompt_enter(mut ws, "c.json")
+    assert(fs.exists("{d}/c.json") and not fs.exists("{d}/a.md"))
+    assert_eq(ws.eds[0].path, "{d}/c.json")
+    assert_eq(ws.eds[0].hl.lang, syntax.Lang.Json)
+    # `m` moves it into another folder.
+    ws.tree_sel = tree_index(ws, "{d}/c.json")
+    ws.on_event(press("m"))
+    ws.field = widgets.TextField.new("move to folder: ", "")
+    prompt_enter(mut ws, "{d}/sub")
+    assert(fs.exists("{d}/sub/c.json"))
+    assert_eq(ws.eds[0].path, "{d}/sub/c.json")
+    # `c` duplicates it.
+    ws.tree_sel = tree_index(ws, "{d}/sub/c.json")
+    ws.on_event(press("c"))
+    assert(fs.exists("{d}/sub/c copy.json"))
+    # `d` asks, then deletes; an open file's tab stays, marked deleted.
+    ws.tree_sel = tree_index(ws, "{d}/sub/c.json")
+    ws.on_event(press("d"))
+    assert(ws.message.contains("d again"))
+    assert(fs.exists("{d}/sub/c.json"))
+    ws.on_event(press("d"))
+    assert(not fs.exists("{d}/sub/c.json"))
+    assert(ws.eds[0].disk.deleted and ws.eds[0].dirty)
+    assert(ws.tab_labels()[0].contains("deleted"))
+    # A folder that is not empty takes a third press.
+    ws.tree_sel = tree_index(ws, "{d}/sub")
+    ws.on_event(press("d"))
+    ws.on_event(press("d"))
+    assert(ws.message.contains("everything in it"))
+    assert(fops.is_dir("{d}/sub"))
+    ws.on_event(press("d"))
+    assert(not fs.exists("{d}/sub"))
+    # Save as, Revert file, Compare with disk; a change on disk under edits.
+    p := "{d}/n.md"
+    fs.write_text(p, "one\ntwo\n")?
+    ws.open(p)
+    ws.tree_focus = false
+    ws.on_event(press("X"))
+    ws.run_command("Compare with disk")
+    assert(ws.eds[ws.active].pane_text.contains("-one"))
+    assert(ws.eds[ws.active].pane_text.contains("+Xone"))
+    ws.run_command("Revert file")
+    assert(ws.eds[ws.active].dirty)
+    ws.run_command("Revert file")
+    assert_eq(ws.eds[ws.active].lines, ["one", "two"])
+    assert(not ws.eds[ws.active].dirty)
+    ws.on_event(press("Y"))
+    ws.watch.stamps = [agent.Stamp(path: p, ms: 1)]
+    fs.write_text(p, "one\nTWO\n")?
+    ws.idle(time.now_ms())
+    assert(ws.message.contains("Ctrl-S twice"))
+    ws.on_event(key_event("ctrl+s"))
+    assert(ws.eds[ws.active].message.contains("again overwrites"))
+    assert_eq(fs.read_text(p)?, "one\nTWO\n")
+    ws.on_event(key_event("ctrl+s"))
+    assert_eq(fs.read_text(p)?, ws.eds[ws.active].text())
+    ws.on_event(key_event("ctrl+shift+s"))
+    assert_eq(ws.picker_mode, "files.saveas")
+    ws.field = widgets.TextField.new("save as: ", "")
+    prompt_enter(mut ws, "{d}/m.md")
+    assert_eq(ws.eds[ws.active].path, "{d}/m.md")
+    assert_eq(fs.read_text("{d}/m.md")?, ws.eds[ws.active].text())
+    ws.on_event(press("Z"))
+    ws.on_event(key_event("ctrl+alt+s"))
+    assert(ws.message.starts_with("saved "))
+    assert(not ws.eds[ws.active].dirty)
+    # Reveal and Open folder (the headless prompt).
+    ws.tree_open = false
+    ws.run_command("Reveal in tree")
+    assert(ws.tree_open)
+    assert_eq(ws.tree_here(), "{d}/m.md")
+    ws.tree_root = "."
+    ws.run_command("Open folder")
+    assert_eq(ws.picker_mode, "files.open")
+    prompt_enter(mut ws, d)
+    assert_eq(ws.tree_root, d)
+    fops.remove_tree(d)?
+
 # ---- Window front end (std.app, S1) --------------------------------------
 
 ## The `std.app` window: the workspace drawn on a canvas (`window/`), pixel
@@ -8476,7 +9337,16 @@ impl app.App for Shell
                     self.ws.on_event(key_event(k))
             Close =>
                 self.ws.on_event(Close)
-            Start | Press | Edit | Submit | Toggle | Click | KeyUp | Appearance | Picked | PickError | Pad | Vsync | Measured | Exited | Other => self.held = self.held
+            Start => self.ws.filing.native = true
+            Picked =>
+                self.ws.filing.asking = false
+                if ev.text != ""
+                    self.ws.open_folder(ev.text)
+            PickError =>
+                self.ws.filing.asking = false
+                self.ws.filing.native = false
+                self.ws.start_mode("files.open", "open folder: ")
+            Press | Edit | Submit | Toggle | Click | KeyUp | Appearance | Pad | Vsync | Measured | Exited | Other => self.held = self.held
         self.ws.idle(time.now_ms())
         self.relayout()
         if self.ws.quit
@@ -8504,6 +9374,11 @@ impl app.App for Shell
 
     fn hover(self) bool
         true
+
+    fn pick(self) app.Picker?
+        if not self.ws.filing.asking
+            return none
+        app.Picker(id: "open-folder", prompt: "Open folder", folders: true, start: "")
 
 @test fn the_app_shell_draws_and_edits_without_a_window()
     mut sh := Shell.new(Workspace.new(Editor.new("t.ail", "fn main()\n", 100, 32)))
@@ -8540,6 +9415,7 @@ fn Workspace.start_up(mut self, flags List[str])
     self.welcome = flags.contains("--welcome")
     if flags.contains("--start") and self.value_of("welcome") == "on"
         self.welcome = true
+    self.restore_backups()
 
 ## Opens the `std.app` window, or prints one screen when there is no host.
 fn app_main(mut ed Editor, flags List[str])
