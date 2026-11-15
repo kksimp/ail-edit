@@ -125,7 +125,7 @@ pub fn comment_prefix(lang Lang) str
 pub fn comment_suffix(lang Lang) str
     match lang
         Markdown => "-->"
-        _ => ""
+        Ail | Json | Toml | Yaml | Shell | Pkg | Plain => ""
 
 ## The bracket pairs to match and auto-close, as opener then closer:
 ## "()[]{}" for code and data, "()[]" for Markdown, "" for package files.
@@ -133,7 +133,7 @@ pub fn brackets(lang Lang) str
     match lang
         Markdown => "()[]"
         Pkg => ""
-        _ => "()[]\{}"
+        Ail | Json | Toml | Yaml | Shell | Plain => "()[]\{}"
 
 # ---- Lines -------------------------------------------------------------
 
@@ -367,6 +367,7 @@ fn md_line(cs List[char], state int) Line
                 more = true
     if listed and md_task(cs, q)
         fill(mut ks, q, q + 3, Kind.Punct)
+        q = skip_blank(cs, q + 3)
     still := md_inline(mut ks, cs, q, n, Kind.Plain)
     done(ks, still + MD_PARA)
 
