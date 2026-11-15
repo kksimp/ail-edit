@@ -37,6 +37,8 @@ use features.syntax
 use features.files as fops
 use features.textops
 use features.wrap
+use features.review
+use features.hunks as hk
 
 # Colors, 0xRRGGBB.
 BG := 0x1e1e1e
@@ -5167,7 +5169,7 @@ fn key_rows() List[KeyRow]
             "palette",
             "Git change gutter",
             "",
-            "Mark the lines that differ from git HEAD with `+` in the gutter (`git diff -U0`), until the next edit",
+            "Take the live change gutter's base from git HEAD (`git show HEAD:FILE`) instead of the saved text, or back; the gutter marks `+` added, `~` changed, `_` deleted below, 300 ms after the last edit",
         ),
         key_row(
             "Ctrl-Shift-P",
@@ -5275,7 +5277,7 @@ fn key_rows() List[KeyRow]
             "palette",
             "Agent changes",
             "",
-            "List the files an agent changed beside the editor and the lines it changed (marked `+` in the gutter until you save); Enter jumps",
+            "List the files an agent changed beside the editor and the lines it changed (marked `+` in the gutter until kept or reverted in Review changes); Enter jumps",
         ),
         key_row(
             "palette",
@@ -5680,6 +5682,48 @@ fn key_rows() List[KeyRow]
             "",
             "Switch the file between LF and CRLF line endings, written on the next save; the status row shows `CRLF` for a CRLF file",
         ),
+        key_row(
+            "Ctrl-Alt-R",
+            "Review changes",
+            "ctrl+alt+r",
+            "The change set since the last checkpoint (taken when an agent starts changing files, before Apply agent edit, or by Take checkpoint): a summary, each file with +/- counts and its hunks as unified rows. Up/Down, ] [ next and previous hunk, Enter opens, k keeps the hunk, r reverts it (one undo step; saved only if the tab had no unsaved edits), K R the whole file, u twice restores the checkpoint, c picks another checkpoint, s side by side, v verifies, a runs `ail review`",
+        ),
+        key_row(
+            "palette",
+            "Take checkpoint",
+            "",
+            "Hold every open file as it is now, so Review changes compares against this point",
+        ),
+        key_row(
+            "palette",
+            "Compare side by side",
+            "",
+            "The file's changes as two read-only columns over the text area, old left and new right, the changed part of each line marked; Up/Down, PageUp/PageDown scroll, Esc returns",
+        ),
+        key_row(
+            "Alt-F5",
+            "Next change",
+            "alt+f5",
+            "The caret to the next change of the live change gutter, wrapping",
+        ),
+        key_row(
+            "Shift-Alt-F5",
+            "Previous change",
+            "shift+alt+f5",
+            "The caret to the previous change of the live change gutter, wrapping",
+        ),
+        key_row(
+            "palette",
+            "Revert this change",
+            "",
+            "Put back the base's lines of the change at the caret, as one undo step",
+        ),
+        key_row(
+            "palette",
+            "Peek change",
+            "",
+            "The change at the caret as unified rows (3 lines of context) in the pane",
+        ),
     ]
 
 ## The README's key table (`--keys`).
@@ -5756,8 +5800,14 @@ enum WsKey
     SaveAs
     SaveAll
     WordWrap
+    Review
+    Change(dir str)
 
 fn workspace_key(k str, ctrl bool, alt bool, shift bool) WsKey?
+    if ctrl and alt and not shift and (k == "r" or k == "R")
+        return Review
+    if alt and not ctrl and k == "f5"
+        return Change(if shift then "prev" else "next")
     if alt and shift and not ctrl
         return match k
             "c" | "C" => AgentPack
@@ -5919,7 +5969,7 @@ fn Workspace.run_command(mut self, name str)
         "Font smaller" => self.zoom("-")
         "Font reset" => self.zoom("0")
         "API diff" => self.diff_view("api")
-        "Git change gutter" => self.diff_view("gutter")
+        "Git change gutter" => self.git_gutter()
         "Select all occurrences" => self.eds[self.active].run(Depth("all"))
         "Fold all" => self.eds[self.active].run(Depth("fold_all"))
         "Semantic layer" => self.eds[self.active].layer_key("l")
@@ -5958,6 +6008,10 @@ fn Workspace.run_command(mut self, name str)
         "Indent lines" => self.eds[self.active].run(Depth("indent"))
         "Outdent lines" => self.eds[self.active].run(Depth("outdent"))
         "Toggle line endings" => self.eds[self.active].run(Depth("eol"))
+        "Take checkpoint" => self.take_checkpoint()
+        "Compare side by side" => self.side_view()
+        "Revert this change" => self.revert_change()
+        "Peek change" => self.peek_change()
         _ => self.message = "no command `{name}`"
 
 ## The "New file" palette row: the file picker, with a hint.
@@ -6053,6 +6107,9 @@ struct Workspace
     filing fops.State
     ## Surround, trim and final newline on save, word wrap (parity C6); copied to every tab.
     tprefs TextPrefs
+    ## Agent review (parity P4, features/review): checkpoints, the change set
+    ## and its panel, the side-by-side view and the live change gutter.
+    review_state review.State
 
 fn Workspace.new(ed Editor) Workspace
     Workspace(
@@ -6108,6 +6165,7 @@ fn Workspace.new(ed Editor) Workspace
         nav_state: NavState.new(),
         filing: fops.new_state(),
         tprefs: TextPrefs.new(),
+        review_state: review.State.new(),
     )
 
 ## The file name a tab shows: the path after its last `/`.
@@ -6206,6 +6264,8 @@ fn event_spec(ev ui.Event) str?
         Resize(_, _) | Close | Mouse(_, _, _, _) | Scroll(_) => none
 
 fn Workspace.dispatch(mut self, ev ui.Event)
+    if self.review_state.side.open and self.side_event(ev)
+        return
     self.sync_text_prefs()
     if self.welcome
         if self.welcome_event(ev)
@@ -6293,6 +6353,8 @@ fn Workspace.dispatch(mut self, ev ui.Event)
                     SaveAs => self.start_save_as()
                     SaveAll => self.save_all()
                     WordWrap => self.toggle_wrap()
+                    Review => self.review_open()
+                    Change(d) => self.change_step(d == "next")
                 return
             saves := self.eds[self.active].saves
             self.eds[self.active].on_event(ev)
@@ -6802,6 +6864,8 @@ fn Workspace.hits_key(mut self, k str) bool
     if self.hits_title.starts_with("jobs: ") and k == "enter"
         self.browsing = false
         self.open_job(self.hit_sel)
+        return true
+    if self.hits_title.starts_with(REVIEW_TITLE) and self.review_key(k)
         return true
     if k == "up"
         self.hit_sel = (self.hit_sel - 1).max(0)
@@ -7435,19 +7499,12 @@ fn Workspace.card_view(mut self)
 # ---- Semantic diff (Ctrl-Shift-D, Ctrl-Shift-V, palette) ----------------------
 
 ## The saved file against git HEAD, three ways (`ail diff`, `ail api --diff`,
-## `ail verify --diff`) as a list whose rows jump to the declaration, or the
-## `+` marks of `git diff -U0` in the gutter (S5, features/diff).
+## `ail verify --diff`) as a list whose rows jump to the declaration (S5,
+## features/diff). The change gutter is live (`git_gutter`, parity P4).
 fn Workspace.diff_view(mut self, kind str)
     path := self.eds[self.active].path
     if self.eds[self.active].dirty
         self.message = "the diff is of the saved file: save with Ctrl-S first"
-        return
-    if kind == "gutter"
-        g := proc.run("git", ["diff", "-U0", "HEAD", "--", path], none, jb.QUERY_MS) else err
-            self.message = jb.failure(err, jb.QUERY_MS)
-            return
-        self.eds[self.active].git_marks = sdiff.changed_lines(g.out)
-        self.message = "{self.eds[self.active].git_marks.len()} lines differ from HEAD; an edit clears the marks"
         return
     mut args := ["diff", "--no-tests", "--json", "--rev", "HEAD", path]
     mut title := "semantic diff vs HEAD"
@@ -7620,6 +7677,7 @@ fn Workspace.agent_poll(mut self, now int)
     for i in 0..self.eds.len()
         p := self.watch.poll(self.eds[i].path, self.eds[i].lines, self.eds[i].dirty) else continue
         if p.reload
+            self.review_state.outside(p.path, self.eds[i].lines, now)
             mut e := self.eds[i]
             e.lines = without_cr(p.lines)
             e.line = e.line.min(e.lines.len() - 1)
@@ -7643,21 +7701,26 @@ fn Workspace.agent_poll(mut self, now int)
         if f.ends_with(".ail") and not open.contains(f)
             names.push(f)
     found := self.watch.changed_files(names)
+    self.review_outside(found, now)
     if found.len() > 0
         self.message = "agent changed {found.join(", ")}; Ctrl-Shift-D lists"
 
-## The gutter mark of lines an agent changed: `+` after the line number.
+## The gutter mark of lines an agent changed: `+` after the line number, on
+## the lines of the review's change set (one model with the review panel).
 fn Workspace.agent_marks(self, mut s Screen)
     if self.watch.hidden
         return
     ed := self.eds[self.active]
+    marked := self.review_state.changed_lines(ed.path)
+    if marked.is_empty()
+        return
     x0 := self.left()
     # Off with word wrap: the marks follow buffer rows (parity C6).
     if ed.tx.prefs.wrapping
         return
     for r in 0..ed.text_rows()
         l := ed.top + r
-        if r + 1 < self.rows and self.watch.marked(ed.path, l)
+        if r + 1 < self.rows and marked.contains(l)
             mut bg := BG
             if l == ed.line
                 bg = LINE_BG
@@ -7710,6 +7773,7 @@ fn Workspace.agent_apply(mut self)
         if not out.ok
             self.show_list("agent edit refused; nothing applied", self.agent_rows(out.report))
             return
+        _ := self.review_state.before_apply(ed.path, ed.lines)
         mut e := self.eds[self.active]
         old := e.lines
         e.snapshot()
@@ -7744,17 +7808,14 @@ fn Workspace.agent_apply(mut self)
     self.watch.pending = hunks
     self.show_list("agent edit preview; Ctrl-Shift-L applies", self.agent_rows(out.report))
 
-## Ctrl-Shift-D: open tabs with agent marks and files changed on disk, as a
-## list Enter jumps from.
+## "Agent changes": the files of the review's change set with the lines
+## its hunks cover, and changed files with no base, as a list Enter jumps
+## from (the same model as the review panel, parity P4).
 fn Workspace.agent_changes(mut self)
+    self.review_refresh()
     mut found := List[Hit]()
-    for e in self.eds
-        n := self.watch.marked_count(e.path)
-        if n > 0
-            at := Loc(path: e.path, line: self.watch.first_mark(e.path) + 1, col: 1)
-            found.push(Hit(loc: at, text: "{e.path}: {n} line(s) changed by an agent"))
-    for f in self.watch.recent
-        found.push(Hit(loc: Loc(path: f, line: 1, col: 1), text: "{f}: changed on disk"))
+    for rw in self.review_state.agent_rows()
+        found.push(Hit(loc: Loc(path: rw.path, line: rw.line, col: 1), text: rw.text))
     if found.len() == 0
         self.message = "no agent changes seen"
         return
@@ -7763,6 +7824,10 @@ fn Workspace.agent_changes(mut self)
 ## The active tab's pane as JSON (`--print --json`, D4): what a person sees,
 ## for an agent.
 fn Workspace.panel_json(self) str
+    if self.review_state.side.open
+        return self.review_state.side_json()
+    if self.eds[self.active].pane == Text and self.hits_title.starts_with(REVIEW_TITLE)
+        return self.review_state.json(self.hits_title)
     ed := self.eds[self.active]
     mut title := "none"
     mut found := List[str]()
@@ -8038,6 +8103,7 @@ fn Workspace.idle(mut self, now int)
     self.hot_exit(now)
     if self.live_problems and self.typed_at > 0 and now - self.typed_at >= 500
         self.refresh_problems()
+    self.review_idle(now)
 
 @test fn sessions_round_trip()
     mut a := Editor.new("src/a,b.ail", "x\nyz", 40, 10)
@@ -8402,6 +8468,7 @@ fn Workspace.render(self) Screen
     if inner.cursor_row >= 0
         s.cursor_row = inner.cursor_row + 1
         s.cursor_col = inner.cursor_col + x0
+    self.review_marks(mut s)
     self.agent_marks(mut s)
     self.render_jobs(mut s)
     self.bookmark_marks(mut s)
@@ -8411,6 +8478,7 @@ fn Workspace.render(self) Screen
     if self.welcome
         self.render_welcome(mut s)
     self.render_askbar(mut s)
+    self.render_side(mut s)
     if self.picking
         self.render_picker(mut s)
     s
@@ -12113,6 +12181,486 @@ fn wrapped(text str) Editor
         seen.add(r.name)
     for name in names
         assert(seen.contains(name))
+# ---- Agent review, checkpoints, live change gutter (parity P4, features/review) ----
+
+## The review panel's title starts with this; its keys go to `review_key`.
+REVIEW_TITLE := "review vs "
+
+## The timeout of `git show` (ms) and of `ail review` (ms).
+GIT_MS := 1500
+REVIEW_MS := 30000
+
+## The tab holding `path`, or -1.
+fn Workspace.review_tab(self, path str) int
+    for i in 0..self.eds.len()
+        p := self.eds[i].path
+        if p == path or p == "./{path}" or "./{p}" == path
+            return i
+    -1
+
+## A file's lines on disk, or none.
+fn disk_lines(path str) List[str]?
+    if not fs.exists(path)
+        return none
+    text := fs.read_text(path) else return none
+    text_lines(text)
+
+## git HEAD's text of `path` (`git -C DIR show HEAD:./NAME`, with a
+## timeout), or none outside a checkout or for a file git doesn't have.
+fn head_lines(path str) List[str]?
+    parts := path.split("/")
+    mut dir := "."
+    if parts.len() > 1
+        dir = parts[..parts.len() - 1].join("/")
+        if dir == ""
+            dir = "/"
+    name := parts[parts.len() - 1]
+    r := proc.run("git", ["-C", dir, "show", "HEAD:./{name}"], none, GIT_MS) else return none
+    if r.status != 0
+        return none
+    text_lines(r.out)
+
+## The held files as they are now: open tabs as the editor has them, the
+## others from disk (a missing one counts as deleted).
+fn Workspace.review_current(self) List[hk.Current]
+    mut out := List[hk.Current]()
+    for p in self.review_state.held_paths()
+        slot := self.review_tab(p)
+        if slot >= 0
+            out.push(hk.Current(path: p, lines: self.eds[slot].lines))
+            continue
+        got := disk_lines(p) else continue
+        out.push(hk.Current(path: p, lines: got))
+    out
+
+fn Workspace.review_refresh(mut self)
+    self.review_state.refresh(self.review_current())
+
+## Files the agent watch found changed that are not open: their text from
+## before is git HEAD's, else unknown ("no base").
+fn Workspace.review_outside(mut self, paths List[str], now int)
+    for p in paths
+        self.review_state.outside(p, head_lines(p), now)
+
+## The live gutter's base for `path`: git HEAD's text when git marks are on
+## (the `gitmarks` setting or Git change gutter), else the text as last
+## saved, else the buffer (a file not saved yet).
+fn Workspace.gutter_base(self, path str) List[str]
+    if self.gitmarks or self.review_state.git
+        if fs.exists(path)
+            if head := head_lines(path)
+                return head
+    if saved := disk_lines(path)
+        return saved
+    slot := self.review_tab(path)
+    if slot >= 0
+        return self.eds[slot].lines
+    List[str]()
+
+## Marks the active buffer against its base now, taking the base first if
+## it has none or was saved since.
+fn Workspace.gutter_now(mut self)
+    ed := self.eds[self.active]
+    if self.review_state.needs_base(ed.path, ed.saves)
+        self.review_state.set_base(ed.path, self.gutter_base(ed.path), ed.saves, ed.lines)
+    else
+        self.review_state.recompute(ed.path, ed.lines)
+
+## While the editor waits: the active buffer's live gutter takes its base
+## (on open and after a save) and is recomputed 300 ms after its last edit;
+## the change set follows outside changes and edits to held files.
+fn Workspace.review_idle(mut self, now int)
+    ed := self.eds[self.active]
+    if self.review_state.needs_base(ed.path, ed.saves)
+        self.review_state.set_base(ed.path, self.gutter_base(ed.path), ed.saves, ed.lines)
+    elif self.review_state.tick(ed.path, ed.lines, now) and self.review_state.holds(ed.path)
+        self.review_state.stale = true
+    if self.review_state.stale
+        self.review_refresh()
+        if self.browsing and self.hits_title.starts_with(REVIEW_TITLE)
+            self.review_show(self.hit_sel)
+
+fn review_fg(mark str) int
+    if mark == "+"
+        return COMMENT_FG
+    if mark == "~"
+        return WARN_FG
+    ERROR_FG
+
+## The live change gutter of the active buffer, after the line number where
+## no other mark is: `+` added, `~` changed, `_` lines deleted below.
+fn Workspace.review_marks(self, mut s Screen)
+    ed := self.eds[self.active]
+    kinds := self.review_state.kinds_of(ed.path)
+    if kinds.is_empty()
+        return
+    x := self.left() + ed.gutter_width() - 1
+    ht := fold.hidden(ed.lines, ed.folded)
+    first := fold.rank(ht, ed.top)
+    for r in 0..ed.text_rows()
+        l := fold.nth(ht, first + r)
+        if l < 0
+            break
+        if r + 1 >= self.rows or l >= kinds.len()
+            continue
+        ch := review.mark_char(kinds[l])
+        cs := s.text[r + 1].chars()
+        if ch == " " or x < 1 or x >= cs.len() or cs[x] != ' ' or not cs[x - 1].is_digit()
+            continue
+        mut bg := BG
+        if l == ed.line
+            bg = LINE_BG
+        s.put(r + 1, x, ch, review_fg(ch), bg)
+
+## Ctrl-Alt-R: the change set since the checkpoint as a list (features/review).
+fn Workspace.review_open(mut self)
+    self.review_refresh()
+    self.review_show(0)
+
+## Shows the review rows, row `sel` selected.
+fn Workspace.review_show(mut self, sel int)
+    mut found := List[Hit]()
+    for rw in self.review_state.rows
+        found.push(Hit(loc: Loc(path: rw.path, line: rw.line, col: 1), text: rw.text))
+    self.show_list(
+        "{REVIEW_TITLE}{self.review_state.label()}: k keep, r revert, K R file, ] [ hunk, s side, u restore, c checkpoint, v verify, a ail review",
+        found,
+    )
+    self.hit_sel = sel.min(found.len() - 1).max(0)
+    self.fill_hits()
+
+## A key in the review panel: the state changes as `review.State.key`
+## says and its plan is carried out. False for keys the list handles.
+fn Workspace.review_key(mut self, k str) bool
+    plan := self.review_state.key(k, self.hit_sel)
+    if not plan.used
+        return false
+    if plan.what == "review"
+        self.browsing = false
+        self.review_findings()
+        return true
+    if plan.what == "verify"
+        self.browsing = false
+        if plan.path != ""
+            self.open(plan.path)
+        self.diff_view("verify")
+        return true
+    mut said := List[str]()
+    if plan.note != ""
+        said.push(plan.note)
+    for w in plan.writes
+        said.push(self.review_write(w, plan.what == "revert"))
+    if plan.what == "cycle" or plan.what == "restore"
+        self.review_refresh()
+    self.review_show(plan.sel)
+    self.message = said.join("; ")
+    true
+
+## Puts a planned text in place. In an open tab (opened first when
+## `open_tab`) it is one undo step, saved only when the tab had no unsaved
+## edits so the disk and an agent agree; a file not open is written on disk.
+## Gives what happened, for the message.
+fn Workspace.review_write(mut self, w hk.Restore, open_tab bool) str
+    mut slot := self.review_tab(w.path)
+    if slot < 0 and (w.remove or not open_tab)
+        if w.remove
+            if fs.exists(w.path)
+                fs.remove(w.path) else err
+                    return "can't remove {err.path}: {err.kind}"
+            return "removed {w.path}"
+        fs.write_text(w.path, "{w.lines.join("\n")}\n") else err
+            return "can't write {err.path}: {err.kind}"
+        self.watch.saved(w.path)
+        return "wrote {w.path}"
+    if slot < 0
+        back := self.active
+        self.open(w.path)
+        self.active = back
+        slot = self.review_tab(w.path)
+        if slot < 0
+            return "can't open {w.path}"
+    mut buf := self.eds[slot]
+    was_dirty := buf.dirty
+    buf.snapshot()
+    buf.lines = if w.lines.is_empty() then [""] else w.lines
+    buf.line = buf.line.min(buf.lines.len() - 1)
+    buf.set_col(buf.col.min(buf.cur().len()))
+    buf.scroll()
+    if was_dirty
+        self.eds[slot] = buf
+        return "{w.path} changed in its tab, not saved (it had unsaved edits); Ctrl-Z undoes"
+    fs.write_text(buf.path, buf.text()) else err
+        self.eds[slot] = buf
+        return "can't save {err.path}: {err.kind}"
+    buf.dirty = false
+    buf.saves += 1
+    self.eds[slot] = buf
+    self.watch.saved(w.path)
+    "{w.path} saved (it had no unsaved edits); Ctrl-Z undoes"
+
+## `a` in the review panel: `ail review --files OLD NEW --json` (api.rev.1,
+## api.rev.5; a checkpoint is no git revision, so each changed `.ail` file's
+## text at the checkpoint and now go to copies beside it), with a timeout.
+## The findings are rows that jump to the declaration they name.
+fn Workspace.review_findings(mut self)
+    mut found := List[Hit]()
+    for f in self.review_state.files
+        if not f.path.ends_with(".ail") or f.kind != hk.FileKind.Modified
+            continue
+        old_copy := "{f.path}.review-base.ail"
+        new_copy := "{f.path}.review-head.ail"
+        fs.write_text(old_copy, "{f.before.join("\n")}\n") else err
+            self.message = "can't write {err.path}: {err.kind}"
+            return
+        fs.write_text(new_copy, "{f.after.join("\n")}\n") else err
+            self.message = "can't write {err.path}: {err.kind}"
+            return
+        mut report := ""
+        mut why := ""
+        review_args := ["review", "--files", old_copy, new_copy, "--json"]
+        if r := proc.run(ail_command(), review_args, none, REVIEW_MS)
+            report = r.out
+            why = r.err.trim()
+        else err
+            why = "can't run {err.cmd}: {err.kind}"
+        for c in [old_copy, new_copy]
+            fs.remove(c) else err
+                why = "can't remove {err.path}: {err.kind}"
+        got := review.findings(report)
+        if got.is_empty()
+            first_why := why.lines().first() else "no report"
+            found.push(Hit(
+                loc: Loc(path: f.path, line: 0, col: 1),
+                text: "{f.path}: ail review: {first_why}",
+            ))
+            continue
+        for t in got
+            at := review.decl_line(f.after, review.finding_id(t))
+            found.push(Hit(loc: Loc(path: f.path, line: at, col: 1), text: "{f.path}: {t}"))
+    if found.is_empty()
+        self.message = "ail review: no changed .ail file in the change set"
+        return
+    self.show_list("ail review vs {self.review_state.label()}: {found.len()} rows", found)
+
+## "Take checkpoint": holds every open file as it is now.
+fn Workspace.take_checkpoint(mut self)
+    name := self.review_state.take("checkpoint")
+    for e in self.eds
+        self.review_state.hold(e.path, e.lines)
+    self.message = "{name}: {self.eds.len()} open file(s) held; Review changes (Ctrl-Alt-R) compares against it"
+
+## "Git change gutter": the live gutter's base from git HEAD, or back to the
+## saved text (git stays on while the `gitmarks` setting is on).
+fn Workspace.git_gutter(mut self)
+    self.review_state.git = not self.review_state.git
+    self.review_state.clear_bases()
+    self.gutter_now()
+    if self.review_state.git or self.gitmarks
+        self.message = "change gutter against git HEAD; live, 300 ms after each edit"
+    else
+        self.message = "change gutter against the saved text"
+
+## "Compare side by side": the active file's part of the change set, else
+## the buffer against its gutter base, as two columns over the text area.
+fn Workspace.side_view(mut self)
+    ed := self.eds[self.active]
+    self.review_refresh()
+    fi := self.review_state.file_index(ed.path)
+    if fi >= 0 and self.review_state.open_side(fi)
+        return
+    self.gutter_now()
+    base := self.review_state.base_of(ed.path)
+    if not self.review_state.open_side_of(ed.path, base, ed.lines, "the gutter's base")
+        self.message = "no changes in {ed.path} to compare"
+
+## The rows the side-by-side view shows below its title.
+fn Workspace.side_height(self) int
+    (self.rows - 2).max(1)
+
+## Keys while the side-by-side view shows: it scrolls, Escape returns, and
+## it is read-only (Ctrl-Q and closing the window still work). True when
+## the event was used up.
+fn Workspace.side_event(mut self, ev ui.Event) bool
+    if is_quit_key(ev)
+        return false
+    match ev
+        Key(k, _, _, _) =>
+            if not self.review_state.side_key(k.name(), self.side_height())
+                self.message = "side by side is read-only: Up/Down, PageUp/PageDown scroll, Esc returns"
+            true
+        Scroll(n) =>
+            last := (self.review_state.side.pairs.len() - 1).max(0)
+            self.review_state.side.top = (self.review_state.side.top + n).min(last).max(0)
+            true
+        Mouse(_, _, _, _) => true
+        Resize(_, _) | Close => false
+
+fn side_fg(look review.Look) int
+    match look
+        Plain => FG
+        Number => GUTTER_FG
+        Old | OldMark => ERROR_FG
+        New | NewMark => COMMENT_FG
+        Gap => GUTTER_FG
+
+fn side_bg(look review.Look) int
+    match look
+        OldMark => ERROR_BG
+        NewMark => BRACKET_BG
+        Gap => PANE_BG
+        Plain | Number | Old | New => BG
+
+## The side-by-side view over the whole text area: a title row, then old on
+## the left and new on the right, the changed part of a line emphasised.
+fn Workspace.render_side(self, mut s Screen)
+    sd := self.review_state.side
+    if not sd.open
+        return
+    x0 := self.left()
+    width := (self.cols - x0).max(10)
+    for r in 1..self.rows
+        s.put(r, x0, " ".repeat(width), FG, BG)
+    head := " side by side: {sd.path}, {sd.label} | now; Up/Down, PageUp/PageDown scroll, Esc returns"
+    s.put(1, x0, head.pad_right(width, ' '), STATUS_FG, STATUS_BG)
+    for k in 0..self.side_height()
+        i := sd.top + k
+        if i >= sd.pairs.len() or 2 + k >= self.rows
+            break
+        for c in review.side_row(sd.pairs[i], width)
+            s.put(2 + k, x0 + c.col, c.text, side_fg(c.look), side_bg(c.look))
+    s.cursor_row = -1
+    s.cursor_col = -1
+
+## The change of the live gutter at the caret, if any.
+fn Workspace.change_here(mut self) hk.Hunk?
+    self.gutter_now()
+    ed := self.eds[self.active]
+    found := self.review_state.hunks_of(ed.path)
+    at := review.hunk_at(found, ed.line, ed.lines.len()) else
+        self.message = "no change at the caret (Alt-F5 goes to the next)"
+        return none
+    found[at]
+
+## Alt-F5 and Shift-Alt-F5: the caret to the next or previous change of
+## the live gutter, wrapping.
+fn Workspace.change_step(mut self, forward bool)
+    self.gutter_now()
+    ed := self.eds[self.active]
+    found := self.review_state.hunks_of(ed.path)
+    target := review.next_change(found, ed.line, ed.lines.len(), forward) else
+        self.message = "no changes against the gutter's base"
+        return
+    self.eds[self.active].jump_to(Loc(path: ed.path, line: target + 1, col: 1))
+    nth := review.hunk_at(found, target, ed.lines.len()) else 0
+    self.message = "change {nth + 1} of {found.len()}"
+
+## "Revert this change": the base's lines of the change at the caret go
+## back, as one undo step.
+fn Workspace.revert_change(mut self)
+    h := self.change_here() else return
+    mut buf := self.eds[self.active]
+    buf.snapshot()
+    back_lines := hk.revert(buf.lines, h).lines
+    buf.lines = if back_lines.is_empty() then [""] else back_lines
+    buf.line = buf.line.min(buf.lines.len() - 1)
+    buf.set_col(buf.col.min(buf.cur().len()))
+    buf.scroll()
+    self.eds[self.active] = buf
+    self.gutter_now()
+    self.message = "reverted the change ({h.old_count} line(s) back); Ctrl-Z undoes"
+
+## "Peek change": the change at the caret as unified rows in the pane.
+fn Workspace.peek_change(mut self)
+    h := self.change_here() else return
+    path := self.eds[self.active].path
+    mut peeked := List[Hit]()
+    for t in review.peek_rows(self.review_state.base_of(path), h)
+        peeked.push(Hit(loc: Loc(path: path, line: h.new_start + 1, col: 1), text: t))
+    self.show_list("peek change at line {h.new_start + 1}", peeked)
+
+# fs: the gutter takes its base when the window waits (test.sandbox.2); the
+# file does not exist, so the base is the buffer.
+@needs(fs) @test fn the_live_change_gutter_marks_edits_after_idle()
+    mut ws := Workspace.new(Editor.new("p4-gutter-none.ail", "a\nb\nc\n", 40, 12))
+    ws.idle(100)
+    assert(not ws.review_state.needs_base("p4-gutter-none.ail", 0))
+    ws.eds[0].line = 1
+    ws.on_event(press("x"))
+    ws.idle(200)
+    assert(ws.render().text[2].starts_with("  2 "))
+    ws.idle(400)
+    assert(ws.render().text[2].starts_with("  2 "))
+    ws.idle(600)
+    assert(ws.render().text[2].starts_with("  2~"))
+    assert(ws.render().text[1].starts_with("  1 "))
+    ws.eds[0].line = 0
+    ws.on_event(key_event("alt+f5"))
+    assert_eq(ws.eds[0].line, 1)
+    assert_eq(ws.message, "change 1 of 1")
+    ws.run_command("Revert this change")
+    assert_eq(ws.eds[0].lines, ["a", "b", "c"])
+    ws.on_event(key_event("ctrl+z"))
+    assert_eq(ws.eds[0].lines[1], "xb")
+    ws.run_command("Peek change")
+    assert(ws.hits_title.starts_with("peek change at line 2"))
+    assert_eq(ws.hits[0].text, "@@ -1,3 +1,3 @@")
+    assert_eq(ws.hits[3].text, "+xb")
+    ws.on_event(press("escape"))
+    ws.run_command("Compare side by side")
+    assert(ws.review_state.side.open)
+    shown := ws.render()
+    assert(shown.text[1].contains("side by side: p4-gutter-none.ail"))
+    assert(shown.text[3].contains("2 b"))
+    assert(shown.text[3].contains("2 xb"))
+    assert(ws.panel_json().contains("\"panel\":\"side by side\""))
+    ws.on_event(press("q"))
+    assert_eq(ws.eds[0].lines[1], "xb")
+    ws.on_event(press("escape"))
+    assert(not ws.review_state.side.open)
+    kn := workspace_key("f5", false, true, false) else Zoom("")
+    assert(kn == Change("next"))
+    kp := workspace_key("f5", false, true, true) else Zoom("")
+    assert(kp == Change("prev"))
+
+@test fn review_panel_reverts_a_hunk_through_its_keys()
+    mut ws := Workspace.new(Editor.new("p4-review.ail", "a\nB\nc\nd\n", 40, 16))
+    ws.eds[0].dirty = true
+    ws.review_state.outside("p4-review.ail", ["a", "b", "c"], 1000)
+    kr := workspace_key("r", true, true, false) else Zoom("")
+    assert(kr == Review)
+    ws.on_event(key_event("ctrl+alt+r"))
+    assert(ws.hits_title.starts_with("review vs agent turn 1"))
+    assert_eq(ws.hits[0].text, "agent turn 1: 1 file, +2 -1")
+    assert_eq(ws.hits[1].text, "p4-review.ail  +2 -1")
+    assert_eq(ws.hits[2].text, "@@ -1,3 +1,3 @@")
+    # The agent marks read the same change set.
+    assert(ws.render().text[2].starts_with("  2+"))
+    assert(ws.render().text[4].starts_with("  4+"))
+    assert(ws.panel_json().contains("\"against\":\"agent turn 1\""))
+    ws.on_event(press("]"))
+    assert_eq(ws.hit_sel, 2)
+    ws.on_event(press("s"))
+    assert(ws.review_state.side.open)
+    ws.on_event(press("escape"))
+    assert(not ws.review_state.side.open)
+    assert(ws.browsing)
+    ws.on_event(press("r"))
+    assert_eq(ws.eds[0].lines, ["a", "b", "c", "d"])
+    assert(ws.message.contains("not saved"))
+    assert(ws.eds[0].dirty)
+    assert_eq(ws.hits[0].text, "agent turn 1: 1 file, +1 -0")
+    assert(not ws.render().text[2].starts_with("  2+"))
+    ws.on_event(press("u"))
+    assert(ws.message.contains("u again restores"))
+    ws.on_event(press("u"))
+    assert_eq(ws.eds[0].lines, ["a", "b", "c"])
+    assert(ws.hits[0].text.starts_with("no checkpoint yet"))
+    ws.on_event(press("escape"))
+    ws.on_event(key_event("ctrl+z"))
+    assert_eq(ws.eds[0].lines, ["a", "b", "c", "d"])
+    ws.run_command("Take checkpoint")
+    assert_eq(ws.review_state.stack.labels(), ["checkpoint 2"])
+    assert(ws.message.starts_with("checkpoint 2: 1 open file(s) held"))
 
 # ---- Window front end (std.app, S1) --------------------------------------
 
