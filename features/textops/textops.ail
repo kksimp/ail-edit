@@ -1,0 +1,860 @@
+## Editing commands (parity plan W4): join, sort, reverse, change case,
+## delete and select lines, indent and outdent, trim, surround, transpose,
+## box selection, expand and shrink selection, and line endings. Every one
+## is a pure function of the buffer's lines and a selection; positions are
+## 0-based and columns count characters (`line.chars()`). As in the editor,
+## the lines hold no final empty line: the file's last newline is implied
+## (`Editor.new` drops it, `Editor.text` adds it back). AIL source has no
+## tabs (lex.block.1), so indentation is spaces, 4 a level.
+
+## A stretch of the buffer from (line, col) up to, not including,
+## (end_line, end_col), with the start never after the end. An empty one
+## is a caret.
+pub struct Sel
+    pub line int
+    pub col int
+    pub end_line int
+    pub end_col int
+
+## The result of an edit: the new lines and the selection after it.
+pub struct Edit
+    pub lines List[str]
+    pub sel Sel
+
+## A run of whole lines, `first` to `last` inclusive.
+pub struct Span
+    pub first int
+    pub last int
+
+## A position in the buffer.
+pub struct Pos
+    pub line int
+    pub col int
+
+## How `sort_lines` orders the lines.
+pub enum Order
+    Ascending
+    Descending
+    ## Ascending, each distinct line once.
+    Unique
+
+## What `change_case` does to letters.
+pub enum Case
+    Upper
+    Lower
+    ## The first letter of each word upper case, the rest lower case.
+    Title
+
+## The result of `trim_trailing`: the lines and how many of them changed.
+pub struct Trimmed
+    pub lines List[str]
+    pub changed int
+
+## A file's line ending.
+pub enum Eol
+    Lf
+    Crlf
+
+## The selections an expand command grew from, so shrink can go back.
+pub struct ExpandStack
+    pub steps List[Sel]
+
+INDENT := 4
+PAIR_OPEN := "([\{\"'`"
+PAIR_CLOSE := ")]}\"'`"
+BRACKET_OPEN := "([\{"
+BRACKET_CLOSE := ")]}"
+NO_INDENT := 1000000
+
+# ---- Selections -----------------------------------------------------------
+
+## The selection between (l, c) and (el, ec), put in buffer order.
+pub fn sel(l int, c int, el int, ec int) Sel
+    if el < l or el == l and ec < c
+        return Sel(line: el, col: ec, end_line: l, end_col: c)
+    Sel(line: l, col: c, end_line: el, end_col: ec)
+
+## A caret at (l, c): an empty selection.
+pub fn caret(l int, c int) Sel
+    Sel(line: l, col: c, end_line: l, end_col: c)
+
+## Whether `s` selects nothing.
+pub fn empty(s Sel) bool
+    s.line == s.end_line and s.col == s.end_col
+
+## `s` with both ends moved inside the buffer.
+pub fn clamp(lines List[str], s Sel) Sel
+    if lines.len() == 0
+        return caret(0, 0)
+    last := lines.len() - 1
+    l := s.line.max(0).min(last)
+    el := s.end_line.max(0).min(last)
+    sel(l, s.col.max(0).min(lines[l].len()), el, s.end_col.max(0).min(lines[el].len()))
+
+## The lines a line command acts on: the selection's, without a last line
+## that the selection only reaches at column 0.
+pub fn span_of(s Sel) Span
+    mut last := s.end_line
+    if s.end_col == 0 and last > s.line
+        last -= 1
+    Span(first: s.line, last: last)
+
+fn before_eq(l1 int, c1 int, l2 int, c2 int) bool
+    l1 < l2 or l1 == l2 and c1 <= c2
+
+## Whether `outer` holds all of `inner`.
+pub fn contains(outer Sel, inner Sel) bool
+    a := before_eq(outer.line, outer.col, inner.line, inner.col)
+    a and before_eq(inner.end_line, inner.end_col, outer.end_line, outer.end_col)
+
+## How many characters `s` covers, counting each line break as one.
+pub fn size(lines List[str], s Sel) int
+    if s.line == s.end_line
+        return s.end_col - s.col
+    mut n := lines[s.line].len() - s.col + 1
+    for l in s.line + 1..s.end_line
+        n += lines[l].len() + 1
+    n + s.end_col
+
+fn replace_lines(lines List[str], first int, last int, with_lines List[str]) List[str]
+    mut out := lines[..first]
+    out.extend(with_lines)
+    out.extend(lines[last + 1..])
+    out
+
+## Spaces at the start of a line.
+pub fn indent_of(s str) int
+    mut n := 0
+    for c in s.chars()
+        if c != ' '
+            break
+        n += 1
+    n
+
+fn is_word(c char) bool
+    c.is_alnum() or c == '_'
+
+## The word at or just before column `c` of line `l`, or `none` when the
+## caret touches no word character.
+pub fn word_range(lines List[str], l int, c int) Sel?
+    if l < 0 or l >= lines.len()
+        return none
+    cs := lines[l].chars()
+    at_word := c < cs.len() and c >= 0 and is_word(cs[c])
+    after_word := c > 0 and c <= cs.len() and is_word(cs[c - 1])
+    if not at_word and not after_word
+        return none
+    mut a := c
+    while a > 0 and is_word(cs[a - 1])
+        a -= 1
+    mut b := c
+    while b < cs.len() and is_word(cs[b])
+        b += 1
+    Sel(line: l, col: a, end_line: l, end_col: b)
+
+## The whole lines `first` to `last`, through the start of the next line
+## (or to the end of the buffer's last line).
+fn through(lines List[str], first int, last int) Sel
+    if last + 1 < lines.len()
+        return Sel(line: first, col: 0, end_line: last + 1, end_col: 0)
+    Sel(line: first, col: 0, end_line: last, end_col: lines[last].len())
+
+# ---- Line commands ----------------------------------------------------------
+
+## Joins the selected lines, or the caret's line and the next, into one:
+## one space at each join, the joined lines' leading whitespace and the
+## trailing whitespace before each join removed. A caret ends at the last
+## join; a selection covers the joined line from its old start.
+pub fn join_lines(lines List[str], s Sel) Edit
+    sp := span_of(s)
+    mut last := sp.last
+    if last == sp.first
+        last += 1
+    if last >= lines.len()
+        return Edit(lines: lines, sel: s)
+    mut text := lines[sp.first]
+    mut at := 0
+    for l in sp.first + 1..last + 1
+        head := text.trim_end()
+        tail := lines[l].trim_start()
+        if tail == ""
+            text = head
+        elif head == ""
+            text = tail
+        else
+            text = "{head} {tail}"
+        at = head.len()
+    out := replace_lines(lines, sp.first, last, [text])
+    if empty(s)
+        return Edit(lines: out, sel: caret(sp.first, at))
+    Edit(lines: out, sel: sel(sp.first, s.col.min(text.len()), sp.first, text.len()))
+
+## The lines a sort or reverse acts on: the selected lines, or the whole
+## buffer when the selection is on one line.
+fn order_span(lines List[str], s Sel) Span
+    sp := span_of(s)
+    if sp.first == sp.last
+        return Span(first: 0, last: lines.len() - 1)
+    sp
+
+fn unique_of(xs List[str]) List[str]
+    mut seen := Set[str]()
+    mut out := List[str]()
+    for x in xs
+        if seen.add(x)
+            out.push(x)
+    out
+
+fn whole_lines(lines List[str], first int, last int) Sel
+    Sel(line: first, col: 0, end_line: last, end_col: lines[last].len())
+
+## Sorts the selected lines (all lines when the selection is on one line)
+## by `order`; the sorted lines come back selected.
+pub fn sort_lines(lines List[str], s Sel, order Order) Edit
+    if lines.len() == 0
+        return Edit(lines: lines, sel: s)
+    sp := order_span(lines, s)
+    mut part := lines[sp.first..sp.last + 1].sorted()
+    if order == Order.Descending
+        part = part.reversed()
+    elif order == Order.Unique
+        part = unique_of(part)
+    out := replace_lines(lines, sp.first, sp.last, part)
+    Edit(lines: out, sel: whole_lines(out, sp.first, sp.first + part.len() - 1))
+
+## Reverses the order of the selected lines (all lines when the selection
+## is on one line); the lines come back selected.
+pub fn reverse_lines(lines List[str], s Sel) Edit
+    if lines.len() == 0
+        return Edit(lines: lines, sel: s)
+    sp := order_span(lines, s)
+    part := lines[sp.first..sp.last + 1].reversed()
+    out := replace_lines(lines, sp.first, sp.last, part)
+    Edit(lines: out, sel: whole_lines(out, sp.first, sp.last))
+
+## Deletes the selected lines, or the caret's line. The caret goes to the
+## line that took their place, at the old column or that line's end. The
+## buffer keeps at least one (empty) line.
+pub fn delete_lines(lines List[str], s Sel) Edit
+    sp := span_of(s)
+    mut out := replace_lines(lines, sp.first, sp.last, List[str]())
+    if out.len() == 0
+        out.push("")
+    l := sp.first.min(out.len() - 1)
+    Edit(lines: out, sel: caret(l, s.col.min(out[l].len())))
+
+## Select line: the caret's line (or the selected lines) through the start
+## of the next line; a selection that already is that grows by one line.
+pub fn select_line(lines List[str], s Sel) Sel
+    if lines.len() == 0
+        return s
+    sp := span_of(s)
+    full := through(lines, sp.first, sp.last)
+    if full != s
+        return full
+    through(lines, sp.first, (sp.last + 1).min(lines.len() - 1))
+
+## Indents the selected lines (or the caret's) by 4 spaces; blank lines
+## stay as they are. The selection moves with the text, except that a
+## selection starting at column 0 keeps starting there.
+pub fn indent_lines(lines List[str], s Sel) Edit
+    sp := span_of(s)
+    mut out := lines
+    for l in sp.first..sp.last + 1
+        if lines[l].trim() != ""
+            out[l] = "    {lines[l]}"
+    mut c := s.col
+    if lines[s.line].trim() != "" and (empty(s) or c > 0)
+        c += INDENT
+    mut ec := s.end_col
+    if s.end_line <= sp.last and lines[s.end_line].trim() != ""
+        ec += INDENT
+    if empty(s)
+        ec = c
+    Edit(lines: out, sel: sel(s.line, c, s.end_line, ec))
+
+## Outdents the selected lines (or the caret's) by up to 4 spaces each.
+pub fn outdent_lines(lines List[str], s Sel) Edit
+    sp := span_of(s)
+    mut out := lines
+    for l in sp.first..sp.last + 1
+        n := indent_of(lines[l]).min(INDENT)
+        out[l] = lines[l].slice(n, lines[l].len())
+    c := (s.col - indent_of(lines[s.line]).min(INDENT)).max(0)
+    mut ec := s.end_col
+    if s.end_line <= sp.last
+        ec = (ec - indent_of(lines[s.end_line]).min(INDENT)).max(0)
+    Edit(lines: out, sel: sel(s.line, c, s.end_line, ec))
+
+## Removes trailing whitespace from every line; `changed` counts the lines
+## that had some.
+pub fn trim_trailing(lines List[str]) Trimmed
+    mut out := List[str]()
+    mut changed := 0
+    for l in lines
+        t := l.trim_end()
+        if t != l
+            changed += 1
+        out.push(t)
+    Trimmed(lines: out, changed: changed)
+
+## Exactly one final newline: drops the empty lines at the end of the
+## buffer, since the editor writes the last newline itself. At least one
+## line stays.
+pub fn final_newline(lines List[str]) List[str]
+    mut out := lines
+    while out.len() > 1 and out[out.len() - 1] == ""
+        _ := out.pop()
+    if out.len() == 0
+        out.push("")
+    out
+
+# ---- Characters ---------------------------------------------------------------
+
+fn title_case(s str, mid_word bool) str
+    mut out := List[str]()
+    mut inside := mid_word
+    for c in s.chars()
+        t := "{c}"
+        if is_word(c)
+            if inside
+                out.push(t.to_lower())
+            else
+                out.push(t.to_upper())
+            inside = true
+        else
+            out.push(t)
+            inside = false
+    out.join("")
+
+## Changes the case of the selection, or of the word at the caret. The
+## changed text comes back selected.
+pub fn change_case(lines List[str], s Sel, case Case) Edit
+    mut r := s
+    if empty(s)
+        w := word_range(lines, s.line, s.col) else return Edit(lines: lines, sel: s)
+        r = w
+    mut out := lines
+    mut ec := r.end_col
+    for l in r.line..r.end_line + 1
+        text := lines[l]
+        a := if l == r.line then r.col else 0
+        b := if l == r.end_line then r.end_col else text.len()
+        mid := text.slice(a, b)
+        mid_word := a > 0 and is_word(text.chars()[a - 1])
+        t := match case
+            Upper => mid.to_upper()
+            Lower => mid.to_lower()
+            Title => title_case(mid, mid_word)
+        out[l] = "{text.slice(0, a)}{t}{text.slice(b, text.len())}"
+        if l == r.end_line
+            ec = a + t.len()
+    Edit(lines: out, sel: sel(r.line, r.col, r.end_line, ec))
+
+## Swaps the two characters around the caret and moves the caret past
+## them; at the end of a line it swaps the last two. Nothing changes at
+## column 0 or on a line shorter than two characters.
+pub fn transpose(lines List[str], s Sel) Edit
+    cs := lines[s.line].chars()
+    c := s.col.min(cs.len() - 1)
+    if c < 1
+        return Edit(lines: lines, sel: s)
+    mut swapped := cs
+    swapped.swap(c - 1, c)
+    mut out := lines
+    out[s.line] = swapped.join("")
+    Edit(lines: out, sel: caret(s.line, c + 1))
+
+## The closer for the opener `open`: one of `(`, `[`, `{`, `"`, `'` and a
+## backtick; `none` for anything else.
+pub fn closer_of(open str) str?
+    cs := open.chars()
+    if cs.len() != 1
+        return none
+    i := PAIR_OPEN.chars().index_of(cs[0]) else return none
+    "{PAIR_CLOSE.chars()[i]}"
+
+## Surrounds the selection with `open` and its closer, keeping the same
+## text selected; at a caret it inserts the pair with the caret inside.
+## An `open` that is not a pair opener changes nothing.
+pub fn surround(lines List[str], s Sel, open str) Edit
+    close := closer_of(open) else return Edit(lines: lines, sel: s)
+    mut out := lines
+    endl := lines[s.end_line]
+    out[s.end_line] = "{endl.slice(0, s.end_col)}{close}{endl.slice(s.end_col, endl.len())}"
+    startl := out[s.line]
+    out[s.line] = "{startl.slice(0, s.col)}{open}{startl.slice(s.col, startl.len())}"
+    mut ec := s.end_col
+    if s.end_line == s.line
+        ec += 1
+    Edit(lines: out, sel: sel(s.line, s.col + 1, s.end_line, ec))
+
+fn is_pair(o char, c char) bool
+    i := PAIR_OPEN.chars().index_of(o) else return false
+    PAIR_CLOSE.chars()[i] == c
+
+## Deletes the opener at (ol, oc) and the closer at (cl, cc); what was
+## between them comes back selected.
+fn remove_pair(lines List[str], ol int, oc int, cl int, cc int) Edit
+    mut out := lines
+    endl := lines[cl]
+    out[cl] = "{endl.slice(0, cc)}{endl.slice(cc + 1, endl.len())}"
+    startl := out[ol]
+    out[ol] = "{startl.slice(0, oc)}{startl.slice(oc + 1, startl.len())}"
+    mut ec := cc
+    if cl == ol
+        ec -= 1
+    Edit(lines: out, sel: sel(ol, oc, cl, ec))
+
+## Removes the pair around the selection: the pair just outside it, else a
+## pair it starts and ends with, else the nearest enclosing brackets. The
+## text that was inside comes back selected. Nothing changes without one.
+pub fn unsurround(lines List[str], s Sel) Edit
+    same := Edit(lines: lines, sel: s)
+    sc := lines[s.line].chars()
+    ecs := lines[s.end_line].chars()
+    if s.col > 0 and s.end_col < ecs.len() and is_pair(sc[s.col - 1], ecs[s.end_col])
+        return remove_pair(lines, s.line, s.col - 1, s.end_line, s.end_col)
+    inner := size(lines, s) >= 2 and s.col < sc.len() and s.end_col > 0
+    if inner and is_pair(sc[s.col], ecs[s.end_col - 1])
+        return remove_pair(lines, s.line, s.col, s.end_line, s.end_col - 1)
+    o := find_open(lines, s.line, s.col) else return same
+    k := BRACKET_OPEN.chars().index_of(lines[o.line].chars()[o.col]) else return same
+    c := find_close(lines, s.end_line, s.end_col, BRACKET_CLOSE.chars()[k]) else return same
+    remove_pair(lines, o.line, o.col, c.line, c.col)
+
+# ---- Box selection --------------------------------------------------------------
+
+## Box (column) selection between the anchor (`al`, `ac`) and the caret: one range per
+## line from the anchor's line to the caret's, between the two columns,
+## clipped to each line's length, top to bottom. A line shorter than the
+## left column gives an empty range at its end when `short` is true and is
+## left out otherwise.
+pub fn box_ranges(lines List[str], al int, ac int, line int, col int, short bool) List[Sel]
+    mut out := List[Sel]()
+    if lines.len() == 0
+        return out
+    top := al.min(line).max(0)
+    bottom := al.max(line).min(lines.len() - 1)
+    left := ac.min(col).max(0)
+    right := ac.max(col).max(0)
+    for l in top..bottom + 1
+        n := lines[l].len()
+        if n < left and not short
+            continue
+        out.push(Sel(line: l, col: left.min(n), end_line: l, end_col: right.min(n)))
+    out
+
+# ---- Expand and shrink selection -------------------------------------------------
+
+## The nearest unmatched opening bracket before (l, c), or `none`. Brackets
+## inside strings and comments count too.
+fn find_open(lines List[str], l int, c int) Pos?
+    opens := BRACKET_OPEN.chars()
+    closes := BRACKET_CLOSE.chars()
+    mut depth := 0
+    mut li := l
+    mut i := c - 1
+    while li >= 0
+        cs := lines[li].chars()
+        i = i.min(cs.len() - 1)
+        while i >= 0
+            ch := cs[i]
+            if closes.contains(ch)
+                depth += 1
+            elif opens.contains(ch)
+                if depth == 0
+                    return Pos(line: li, col: i)
+                depth -= 1
+            i -= 1
+        li -= 1
+        if li >= 0
+            i = lines[li].len() - 1
+    none
+
+## The first unmatched closing bracket at or after (l, c) when it is
+## `close`, else `none`.
+fn find_close(lines List[str], l int, c int, close char) Pos?
+    opens := BRACKET_OPEN.chars()
+    closes := BRACKET_CLOSE.chars()
+    mut depth := 0
+    mut li := l
+    mut i := c
+    while li < lines.len()
+        cs := lines[li].chars()
+        while i < cs.len()
+            ch := cs[i]
+            if opens.contains(ch)
+                depth += 1
+            elif closes.contains(ch)
+                if depth == 0
+                    if ch == close
+                        return Pos(line: li, col: i)
+                    return none
+                depth -= 1
+            i += 1
+        li += 1
+        i = 0
+    none
+
+## The word around a caret, or around a selection inside one word; `s`
+## itself otherwise.
+pub fn expand_to_word(lines List[str], s Sel) Sel
+    w := word_range(lines, s.line, s.col) else return s
+    if contains(w, s)
+        return w
+    s
+
+## The inside of the nearest bracket pair around `s`; when `s` already is
+## that inside, the pair with its brackets. `s` itself when no pair holds it.
+pub fn expand_to_brackets(lines List[str], s Sel) Sel
+    o := find_open(lines, s.line, s.col) else return s
+    k := BRACKET_OPEN.chars().index_of(lines[o.line].chars()[o.col]) else return s
+    c := find_close(lines, s.end_line, s.end_col, BRACKET_CLOSE.chars()[k]) else return s
+    inside := sel(o.line, o.col + 1, c.line, c.col)
+    if inside == s
+        return sel(o.line, o.col, c.line, c.col + 1)
+    inside
+
+## The last line of the run after line `l` whose lines are blank or
+## indented at least `ind`, without blank lines at its end.
+fn reach_down(lines List[str], l int, ind int) int
+    mut last := l
+    mut i := l + 1
+    while i < lines.len()
+        if lines[i].trim() != ""
+            if indent_of(lines[i]) < ind
+                break
+            last = i
+        i += 1
+    last
+
+fn reach_up(lines List[str], l int, ind int) int
+    mut first := l
+    mut i := l - 1
+    while i >= 0
+        if lines[i].trim() != ""
+            if indent_of(lines[i]) < ind
+                break
+            first = i
+        i -= 1
+    first
+
+## The indentation block around `s` (AIL blocks are indentation,
+## lex.block.1): the lines around it indented at least as deep as its
+## least indented line. When `s` already holds that block, the block with
+## its header line. `s` itself on blank lines.
+pub fn expand_to_block(lines List[str], s Sel) Sel
+    sp := span_of(s)
+    mut ind := NO_INDENT
+    for l in sp.first..sp.last + 1
+        if lines[l].trim() != ""
+            ind = ind.min(indent_of(lines[l]))
+    if ind == NO_INDENT
+        return s
+    top := reach_up(lines, sp.first, ind)
+    bottom := reach_down(lines, sp.last, ind)
+    b := whole_lines(lines, top, bottom)
+    if b != s and contains(b, s)
+        return b
+    mut h := top - 1
+    while h >= 0 and (lines[h].trim() == "" or indent_of(lines[h]) >= ind)
+        h -= 1
+    if h < 0
+        return whole_lines(lines, 0, lines.len() - 1)
+    whole_lines(lines, h, reach_down(lines, h, indent_of(lines[h]) + 1))
+
+## The next larger selection around `s`: the smallest of the word, the
+## bracket inside or pair, and the indentation block that holds more than
+## `s`; else the whole buffer.
+pub fn expand(lines List[str], s Sel) Sel
+    mut best := whole_lines(lines, 0, lines.len() - 1)
+    for c in [expand_to_word(lines, s), expand_to_brackets(lines, s), expand_to_block(lines, s)]
+        if c != s and contains(c, s) and size(lines, c) < size(lines, best)
+            best = c
+    best
+
+## An empty stack.
+pub fn ExpandStack.new() ExpandStack
+    ExpandStack(steps: [])
+
+## Expands `s` with `expand` and remembers `s` for `shrink`.
+pub fn ExpandStack.grow(mut self, lines List[str], s Sel) Sel
+    next := expand(lines, s)
+    if next != s
+        self.steps.push(s)
+    next
+
+## The selection before the last expand, or `s` when there is none.
+pub fn ExpandStack.shrink(mut self, s Sel) Sel
+    self.steps.pop() else s
+
+## Forgets every step; the editor calls it when the selection changes
+## any other way.
+pub fn ExpandStack.clear(mut self)
+    self.steps.clear()
+
+# ---- Line endings -------------------------------------------------------------------
+
+## The line ending most lines of `text` use: CRLF when more lines end in
+## `\r\n` than in a bare `\n`, else LF.
+pub fn detect_eol(text str) Eol
+    crlf := text.count("\r\n")
+    lf := text.count("\n") - crlf
+    if crlf > lf then Eol.Crlf else Eol.Lf
+
+## The lines of `text` as the editor holds them: split at `\n`, a `\r`
+## before it dropped, and no empty line for a final newline.
+pub fn split_lines(text str) List[str]
+    mut out := List[str]()
+    for l in text.split("\n")
+        out.push(l.strip_suffix("\r") else l)
+    if out.len() > 1 and out[out.len() - 1] == ""
+        _ := out.pop()
+    if out.len() == 0
+        out.push("")
+    out
+
+## The characters of a line ending.
+pub fn eol_text(eol Eol) str
+    if eol == Eol.Crlf then "\r\n" else "\n"
+
+## The file text of `lines`, each line ended with `eol`.
+pub fn join_with(lines List[str], eol Eol) str
+    sep := eol_text(eol)
+    "{lines.join(sep)}{sep}"
+
+# ---- Tests -------------------------------------------------------------------------
+
+@test fn selections_order_clamp_and_span()
+    assert_eq(sel(2, 1, 0, 3), Sel(line: 0, col: 3, end_line: 2, end_col: 1))
+    assert(empty(caret(1, 2)))
+    assert(not empty(sel(0, 0, 0, 1)))
+    assert_eq(clamp(["ab", "c"], sel(0, 9, 7, 9)), sel(0, 2, 1, 1))
+    assert_eq(clamp(List[str](), caret(3, 3)), caret(0, 0))
+    assert_eq(span_of(sel(1, 2, 3, 0)), Span(first: 1, last: 2))
+    assert_eq(span_of(caret(4, 0)), Span(first: 4, last: 4))
+    assert(contains(sel(0, 0, 2, 0), sel(1, 1, 1, 3)))
+    assert(not contains(sel(1, 2, 2, 0), sel(1, 1, 1, 3)))
+    assert_eq(size(["ab", "cde", "f"], sel(0, 1, 2, 1)), 7)
+    assert_eq(size(["abc"], sel(0, 1, 0, 3)), 2)
+
+@test fn words_and_indents()
+    assert_eq(indent_of("    x"), 4)
+    assert_eq(indent_of(""), 0)
+    ls := ["let foo_bar = 1", ""]
+    assert_eq(word_range(ls, 0, 6) else caret(9, 9), sel(0, 4, 0, 11))
+    assert_eq(word_range(ls, 0, 11) else caret(9, 9), sel(0, 4, 0, 11))
+    assert(word_range(ls, 0, 12) == none)
+    assert(word_range(ls, 1, 0) == none)
+    assert(word_range(ls, 5, 0) == none)
+
+@test fn join_lines_joins_with_one_space()
+    ls := ["a  ", "    b", "c"]
+    e := join_lines(ls, caret(0, 0))
+    assert_eq(e.lines, ["a b", "c"])
+    assert_eq(e.sel, caret(0, 1))
+    all := join_lines(ls, sel(0, 0, 2, 1))
+    assert_eq(all.lines, ["a b c"])
+    assert_eq(all.sel, sel(0, 0, 0, 5))
+    blank := join_lines(["x", "   ", "y"], caret(0, 1))
+    assert_eq(blank.lines, ["x", "y"])
+    last := join_lines(["only"], caret(0, 2))
+    assert_eq(last.lines, ["only"])
+    assert_eq(last.sel, caret(0, 2))
+
+@test fn sort_lines_three_ways()
+    ls := ["b", "a", "c", "a"]
+    up := sort_lines(ls, caret(0, 0), Order.Ascending)
+    assert_eq(up.lines, ["a", "a", "b", "c"])
+    assert_eq(up.sel, sel(0, 0, 3, 1))
+    down := sort_lines(ls, caret(1, 0), Order.Descending)
+    assert_eq(down.lines, ["c", "b", "a", "a"])
+    uniq := sort_lines(ls, caret(0, 0), Order.Unique)
+    assert_eq(uniq.lines, ["a", "b", "c"])
+    assert_eq(uniq.sel, sel(0, 0, 2, 1))
+    part := sort_lines(["z", "y", "x", "w"], sel(1, 0, 3, 0), Order.Ascending)
+    assert_eq(part.lines, ["z", "x", "y", "w"])
+    assert_eq(part.sel, sel(1, 0, 2, 1))
+
+@test fn reverse_lines_reverses_the_selection()
+    e := reverse_lines(["1", "2", "3", "4"], sel(0, 0, 2, 1))
+    assert_eq(e.lines, ["3", "2", "1", "4"])
+    assert_eq(e.sel, sel(0, 0, 2, 1))
+    assert_eq(reverse_lines(["1", "2"], caret(0, 0)).lines, ["2", "1"])
+
+@test fn delete_lines_keeps_one_line()
+    e := delete_lines(["a", "bb", "ccc"], caret(1, 2))
+    assert_eq(e.lines, ["a", "ccc"])
+    assert_eq(e.sel, caret(1, 2))
+    tail := delete_lines(["a", "bb"], sel(1, 0, 1, 2))
+    assert_eq(tail.lines, ["a"])
+    assert_eq(tail.sel, caret(0, 0))
+    gone := delete_lines(["a", "b"], sel(0, 0, 1, 1))
+    assert_eq(gone.lines, [""])
+    assert_eq(gone.sel, caret(0, 0))
+    span := delete_lines(["a", "b", "c"], sel(0, 1, 2, 0))
+    assert_eq(span.lines, ["c"])
+
+@test fn select_line_grows_a_line_each_time()
+    ls := ["a", "b", "c"]
+    one := select_line(ls, caret(0, 1))
+    assert_eq(one, sel(0, 0, 1, 0))
+    two := select_line(ls, one)
+    assert_eq(two, sel(0, 0, 2, 0))
+    three := select_line(ls, two)
+    assert_eq(three, sel(0, 0, 2, 1))
+    assert_eq(select_line(ls, three), three)
+    assert_eq(select_line(ls, caret(2, 0)), sel(2, 0, 2, 1))
+
+@test fn indent_and_outdent_by_four()
+    ls := ["a", "", "  b"]
+    e := indent_lines(ls, sel(0, 0, 2, 1))
+    assert_eq(e.lines, ["    a", "", "      b"])
+    assert_eq(e.sel, sel(0, 0, 2, 5))
+    c := indent_lines(["x"], caret(0, 1))
+    assert_eq(c.sel, caret(0, 5))
+    o := outdent_lines(e.lines, e.sel)
+    assert_eq(o.lines, ["a", "", "  b"])
+    assert_eq(o.sel, sel(0, 0, 2, 1))
+    short := outdent_lines(["  x"], caret(0, 1))
+    assert_eq(short.lines, ["x"])
+    assert_eq(short.sel, caret(0, 0))
+
+@test fn trim_and_final_newline()
+    t := trim_trailing(["a  ", "b", "c ", ""])
+    assert_eq(t.lines, ["a", "b", "c", ""])
+    assert_eq(t.changed, 2)
+    assert_eq(trim_trailing(List[str]()).changed, 0)
+    assert_eq(final_newline(["a", "", ""]), ["a"])
+    assert_eq(final_newline(["a"]), ["a"])
+    assert_eq(final_newline(["", ""]), [""])
+    assert_eq(final_newline(List[str]()), [""])
+
+@test fn change_case_of_selection_and_word()
+    ls := ["hello WORLD x_y"]
+    up := change_case(ls, sel(0, 0, 0, 5), Case.Upper)
+    assert_eq(up.lines, ["HELLO WORLD x_y"])
+    assert_eq(up.sel, sel(0, 0, 0, 5))
+    low := change_case(ls, caret(0, 8), Case.Lower)
+    assert_eq(low.lines, ["hello world x_y"])
+    assert_eq(low.sel, sel(0, 6, 0, 11))
+    title := change_case(ls, sel(0, 0, 0, 15), Case.Title)
+    assert_eq(title.lines, ["Hello World X_y"])
+    mid := change_case(["abcd"], sel(0, 2, 0, 4), Case.Title)
+    assert_eq(mid.lines, ["abcd"])
+    multi := change_case(["ab", "cd"], sel(0, 1, 1, 1), Case.Upper)
+    assert_eq(multi.lines, ["aB", "Cd"])
+    none_here := change_case(["  "], caret(0, 1), Case.Upper)
+    assert_eq(none_here.lines, ["  "])
+
+@test fn transpose_swaps_around_the_caret()
+    e := transpose(["abc"], caret(0, 1))
+    assert_eq(e.lines, ["bac"])
+    assert_eq(e.sel, caret(0, 2))
+    end := transpose(["abc"], caret(0, 3))
+    assert_eq(end.lines, ["acb"])
+    assert_eq(end.sel, caret(0, 3))
+    assert_eq(transpose(["abc"], caret(0, 0)).lines, ["abc"])
+    assert_eq(transpose(["a"], caret(0, 1)).lines, ["a"])
+    assert_eq(transpose([""], caret(0, 0)).lines, [""])
+
+@test fn surround_and_unsurround()
+    assert_eq(closer_of("(") else "", ")")
+    assert_eq(closer_of("`") else "", "`")
+    assert_eq(closer_of("'") else "", "'")
+    assert(closer_of("x") == none)
+    assert(closer_of("((") == none)
+    e := surround(["say hi"], sel(0, 4, 0, 6), "\"")
+    assert_eq(e.lines, ["say \"hi\""])
+    assert_eq(e.sel, sel(0, 5, 0, 7))
+    back := unsurround(e.lines, e.sel)
+    assert_eq(back.lines, ["say hi"])
+    assert_eq(back.sel, sel(0, 4, 0, 6))
+    c := surround(["ab"], caret(0, 1), "[")
+    assert_eq(c.lines, ["a[]b"])
+    assert_eq(c.sel, caret(0, 2))
+    m := surround(["ab", "cd"], sel(0, 1, 1, 1), "\{")
+    assert_eq(m.lines, ["a\{b", "c}d"])
+    assert_eq(m.sel, sel(0, 2, 1, 1))
+    assert_eq(surround(["ab"], caret(0, 1), "x").lines, ["ab"])
+    whole := unsurround(["f(x)"], sel(0, 1, 0, 4))
+    assert_eq(whole.lines, ["fx"])
+    assert_eq(whole.sel, sel(0, 1, 0, 2))
+    near := unsurround(["g[a, b]"], caret(0, 3))
+    assert_eq(near.lines, ["ga, b"])
+    assert_eq(unsurround(["plain"], caret(0, 2)).lines, ["plain"])
+
+@test fn box_ranges_clip_to_lines()
+    ls := ["abcdef", "ab", "abcdefgh"]
+    rs := box_ranges(ls, 2, 5, 0, 3, false)
+    assert_eq(rs, [sel(0, 3, 0, 5), sel(2, 3, 2, 5)])
+    with_short := box_ranges(ls, 0, 3, 2, 5, true)
+    assert_eq(with_short, [sel(0, 3, 0, 5), sel(1, 2, 1, 2), sel(2, 3, 2, 5)])
+    clipped := box_ranges(ls, 0, 1, 1, 4, false)
+    assert_eq(clipped, [sel(0, 1, 0, 4), sel(1, 1, 1, 2)])
+    assert_eq(box_ranges(ls, 0, 2, 0, 2, false), [caret(0, 2)])
+    assert_eq(box_ranges(List[str](), 0, 0, 1, 1, true).len(), 0)
+
+
+@test fn expand_to_word_and_brackets()
+    ls := ["f(a, g(bc))"]
+    w := expand_to_word(ls, caret(0, 8))
+    assert_eq(w, sel(0, 7, 0, 9))
+    assert_eq(expand_to_word(ls, sel(0, 2, 0, 5)), sel(0, 2, 0, 5))
+    assert_eq(expand_to_word(ls, caret(0, 4)), caret(0, 4))
+    pair := expand_to_brackets(ls, w)
+    assert_eq(pair, sel(0, 6, 0, 10))
+    outer := expand_to_brackets(ls, pair)
+    assert_eq(outer, sel(0, 2, 0, 10))
+    assert_eq(expand_to_brackets(ls, outer), sel(0, 1, 0, 11))
+    assert_eq(expand_to_brackets(["x"], caret(0, 0)), caret(0, 0))
+    across := expand_to_brackets(["call(", "    a", ")"], caret(1, 5))
+    assert_eq(across, sel(0, 5, 2, 0))
+
+@test fn expand_to_block_climbs_the_indentation()
+    ls := ["fn a()", "    x := 1", "", "    if x", "        y", "fn b()"]
+    one := expand_to_block(ls, caret(4, 9))
+    assert_eq(one, sel(4, 0, 4, 9))
+    two := expand_to_block(ls, one)
+    assert_eq(two, sel(3, 0, 4, 9))
+    three := expand_to_block(ls, two)
+    assert_eq(three, sel(1, 0, 4, 9))
+    four := expand_to_block(ls, three)
+    assert_eq(four, sel(0, 0, 4, 9))
+    assert_eq(expand_to_block(ls, four), sel(0, 0, 5, 6))
+    assert_eq(expand_to_block(ls, caret(2, 0)), caret(2, 0))
+
+@test fn expand_and_shrink_retrace_their_steps()
+    ls := ["f(a, g(bc))"]
+    assert_eq(expand(ls, caret(0, 8)), sel(0, 7, 0, 9))
+    mut st := ExpandStack.new()
+    a := st.grow(ls, caret(0, 8))
+    b := st.grow(ls, a)
+    assert_eq(b, sel(0, 6, 0, 10))
+    c := st.grow(ls, b)
+    assert_eq(c, sel(0, 2, 0, 10))
+    assert_eq(st.shrink(c), b)
+    assert_eq(st.shrink(b), a)
+    assert_eq(st.shrink(a), caret(0, 8))
+    assert_eq(st.shrink(caret(0, 8)), caret(0, 8))
+    _ := st.grow(ls, caret(0, 8))
+    st.clear()
+    assert_eq(st.steps.len(), 0)
+    whole := expand(ls, sel(0, 0, 0, 11))
+    assert_eq(whole, sel(0, 0, 0, 11))
+
+@test fn line_endings_round_trip()
+    assert_eq(detect_eol("a\r\nb\r\nc\n"), Eol.Crlf)
+    assert_eq(detect_eol("a\nb\r\n"), Eol.Lf)
+    assert_eq(detect_eol(""), Eol.Lf)
+    assert_eq(split_lines("a\r\nb\r\n"), ["a", "b"])
+    assert_eq(split_lines("a\nb"), ["a", "b"])
+    assert_eq(split_lines(""), [""])
+    assert_eq(split_lines("\n"), [""])
+    assert_eq(split_lines("a\n\n"), ["a", ""])
+    assert_eq(eol_text(Eol.Crlf), "\r\n")
+    assert_eq(join_with(["a", "b"], Eol.Crlf), "a\r\nb\r\n")
+    assert_eq(join_with(["a"], Eol.Lf), "a\n")
+    text := "x\r\n  y\r\n"
+    assert_eq(join_with(split_lines(text), detect_eol(text)), text)
