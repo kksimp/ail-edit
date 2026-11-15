@@ -1,0 +1,1600 @@
+## Highlighting for the files of an AIL project that are not AIL (parity
+## plan W3): Markdown, JSON, TOML, YAML, shell scripts, and the package
+## files `ail.pkg` and `ail.lock` (spec mod.pkg.2, mod.pkg.8). One line at a
+## time: `line` gives a `Kind` per character and the state to start the next
+## line with, so the editor colours a row after scanning the rows above it,
+## the way it carries `"""` for AIL. AIL lines keep the editor's own
+## colourer: `line` marks them `embed_ail`, also inside a Markdown fence
+## marked `ail`, where `inner` and `with_inner` keep the editor's `"""` state.
+
+## A file's language, from its name (`lang_of`). `Pkg` is `ail.pkg` and
+## `ail.lock`: lines of words, `#` comments and quoted words.
+pub enum Lang
+    Ail
+    Markdown
+    Json
+    Toml
+    Yaml
+    Shell
+    Pkg
+    Plain
+
+## What a character is; the editor maps each kind to a theme colour.
+pub enum Kind
+    Plain
+    Keyword
+    Str
+    Number
+    Comment
+    Heading
+    Emphasis
+    Code
+    Link
+    Key
+    Punct
+    Tag
+    Variable
+    Constant
+    Invalid
+
+## One highlighted line.
+pub struct Line
+    ## One kind per character of the line (`text.chars()`).
+    pub kinds List[Kind]
+    ## The state to start the next line with; a file's first line starts at 0.
+    pub state int
+    ## True for a line of AIL (an `.ail` file, or inside a Markdown fence
+    ## marked `ail`): the editor colours it with its AIL colourer, and
+    ## `kinds` is only a fallback.
+    pub embed_ail bool
+
+# ---- Languages ---------------------------------------------------------
+
+## The language of the file at `path` (`/` or `\` separated), from its name,
+## ignoring case: `ail.pkg` and `ail.lock` are `Pkg`, shell start-up files
+## such as `.bashrc` are `Shell`, then the extension decides (`.md`, `.json`,
+## `.toml`, `.yaml`, `.yml`, `.sh`, `.bash`, `.zsh`, `.ail`). Anything else is
+## `Plain`.
+pub fn lang_of(path str) Lang
+    p := path.replace("\\", "/")
+    mut name := p
+    if k := p.rfind("/")
+        name = p.slice(k + 1, p.len())
+    low := name.to_lower()
+    if low == "ail.pkg" or low == "ail.lock"
+        return Lang.Pkg
+    if SH_FILES.split(" ").contains(low)
+        return Lang.Shell
+    dot := low.rfind(".") else return Lang.Plain
+    ext_lang(low.slice(dot + 1, low.len()))
+
+SH_FILES := ".bashrc .bash_profile .zshrc .zprofile .profile"
+
+fn ext_lang(ext str) Lang
+    match ext
+        "ail" => Lang.Ail
+        "md" | "markdown" => Lang.Markdown
+        "json" => Lang.Json
+        "toml" => Lang.Toml
+        "yaml" | "yml" => Lang.Yaml
+        "sh" | "bash" | "zsh" => Lang.Shell
+        _ => Lang.Plain
+
+## The language a Markdown fence's info word names: `ail`, `json`, `sh`...
+fn info_lang(word str) Lang
+    w := word.to_lower()
+    match w
+        "shell" => Lang.Shell
+        "pkg" => Lang.Pkg
+        _ => ext_lang(w)
+
+fn lang_code(lang Lang) int
+    match lang
+        Plain => 0
+        Ail => 1
+        Markdown => 2
+        Json => 3
+        Toml => 4
+        Yaml => 5
+        Shell => 6
+        Pkg => 7
+
+fn code_lang(n int) Lang
+    match n
+        1 => Lang.Ail
+        2 => Lang.Markdown
+        3 => Lang.Json
+        4 => Lang.Toml
+        5 => Lang.Yaml
+        6 => Lang.Shell
+        7 => Lang.Pkg
+        _ => Lang.Plain
+
+## What the comment toggle puts before a line (the editor adds a space):
+## `#` for AIL, TOML, YAML, shell and package files, `<!--` for Markdown
+## (closed by `comment_suffix`), and "" when the language has no comments
+## (JSON, plain text).
+pub fn comment_prefix(lang Lang) str
+    match lang
+        Ail | Toml | Yaml | Shell | Pkg => "#"
+        Markdown => "<!--"
+        Json | Plain => ""
+
+## What the comment toggle puts after a line (after a space): `-->` for
+## Markdown, else "".
+pub fn comment_suffix(lang Lang) str
+    match lang
+        Markdown => "-->"
+        _ => ""
+
+## The bracket pairs to match and auto-close, as opener then closer:
+## "()[]{}" for code and data, "()[]" for Markdown, "" for package files.
+pub fn brackets(lang Lang) str
+    match lang
+        Markdown => "()[]"
+        Pkg => ""
+        _ => "()[]\{}"
+
+# ---- Lines -------------------------------------------------------------
+
+## Highlights one line of `lang` that starts in `state`: 0 for a file's
+## first line, afterwards the `state` of the `Line` before it. States carry
+## Markdown fences and HTML comments, TOML multi-line strings, YAML block
+## scalars and quoted strings, and shell quotes and heredocs.
+pub fn line(lang Lang, text str, state int) Line
+    line_of(lang, text.chars(), state)
+
+fn line_of(lang Lang, cs List[char], state int) Line
+    match lang
+        Markdown => md_line(cs, state)
+        Json => json_line(cs)
+        Toml => toml_line(cs, state)
+        Yaml => yaml_line(cs, state)
+        Shell => sh_line(cs, state)
+        Pkg => pkg_line(cs)
+        Ail => Line(kinds: kinds_of(cs.len(), Kind.Plain), state: state, embed_ail: true)
+        Plain => done(kinds_of(cs.len(), Kind.Plain), 0)
+
+fn done(ks List[Kind], state int) Line
+    Line(kinds: ks, state: state, embed_ail: false)
+
+fn kinds_of(n int, k Kind) List[Kind]
+    mut out := List[Kind]()
+    for _ in 0..n
+        out.push(k)
+    out
+
+## Sets characters `from` up to `to` (clipped to the line) to `k`.
+fn fill(mut ks List[Kind], from int, to int, k Kind)
+    mut i := from.max(0)
+    while i < to and i < ks.len()
+        ks[i] = k
+        i += 1
+
+## A space or a tab.
+fn blank(c char) bool
+    c == ' ' or c.code() == 9
+
+fn skip_blank(cs List[char], from int) int
+    mut i := from
+    while i < cs.len() and blank(cs[i])
+        i += 1
+    i
+
+## How many `c` follow from `from`, stopping at `to`.
+fn run_of(cs List[char], from int, c char, to int) int
+    mut j := from
+    while j < to and cs[j] == c
+        j += 1
+    j - from
+
+## Where `pat` next starts at or after `from`, or -1.
+fn find_text(cs List[char], pat str, from int) int
+    q := pat.chars()
+    mut i := from.max(0)
+    while i + q.len() <= cs.len()
+        if cs[i..i + q.len()] == q
+            return i
+        i += 1
+    -1
+
+fn starts_at(cs List[char], i int, pat str) bool
+    q := pat.chars()
+    i + q.len() <= cs.len() and cs[i..i + q.len()] == q
+
+fn text_of(cs List[char], from int, to int) str
+    cs[from..to].join("")
+
+## Just past the `quote` that closes a string whose text starts at `from`,
+## or -1 when the line ends first. With `escapes` a backslash hides the
+## character after it.
+fn close_quote(cs List[char], from int, quote char, escapes bool) int
+    mut j := from
+    while j < cs.len()
+        if escapes and cs[j] == '\\'
+            j += 2
+        elif cs[j] == quote
+            return j + 1
+        else
+            j += 1
+    -1
+
+## Just past the closing quote of the string opened at `q`, or -1.
+fn quote_end(cs List[char], q int, escapes bool) int
+    close_quote(cs, q + 1, cs[q], escapes)
+
+## Just past three `quote`s (and up to two more, which TOML lets close the
+## string), searching from `from`, or -1.
+fn close_triple(cs List[char], from int, quote char, escapes bool) int
+    n := cs.len()
+    mut j := from
+    while j < n
+        if escapes and cs[j] == '\\'
+            j += 2
+        elif j + 2 < n and cs[j] == quote and cs[j + 1] == quote and cs[j + 2] == quote
+            mut e := j + 3
+            while e < n and e < j + 5 and cs[e] == quote
+                e += 1
+            return e
+        else
+            j += 1
+    -1
+
+## Whether `s` is a number: a sign, digits with `_` and one `.`, an
+## exponent; `0x` and `0o` forms; `.inf` and `.nan`. `s` is lower case.
+fn is_number(s str) bool
+    if s == ".inf" or s == "-.inf" or s == "+.inf" or s == ".nan"
+        return true
+    cs := s.chars()
+    n := cs.len()
+    mut i := 0
+    if n > 0 and (cs[0] == '+' or cs[0] == '-')
+        i = 1
+    if i + 2 < n and cs[i] == '0' and (cs[i + 1] == 'x' or cs[i + 1] == 'o')
+        for k in i + 2..n
+            if not (cs[k].is_digit() or "abcdef_".contains(cs[k]))
+                return false
+        return true
+    mut digits := 0
+    mut dots := 0
+    while i < n and (cs[i].is_digit() or cs[i] == '_' or cs[i] == '.')
+        if cs[i] == '.'
+            dots += 1
+        elif cs[i] != '_'
+            digits += 1
+        i += 1
+    if digits == 0 or dots > 1
+        return false
+    if i < n and cs[i] == 'e'
+        i += 1
+        if i < n and (cs[i] == '+' or cs[i] == '-')
+            i += 1
+        start := i
+        while i < n and cs[i].is_digit()
+            i += 1
+        if i == start
+            return false
+    i == n
+
+# ---- Markdown ----------------------------------------------------------
+
+# A Markdown state: `state % 4` is the mode (0 text, 1 inside an HTML
+# comment, 2 inside a fence); `state / 4 % 2` marks a paragraph line before,
+# so an indented line continues it instead of starting code. A fence keeps
+# its `~` (`/ 8 % 2`), its length (`/ 16 % 16`), its info language
+# (`/ 256 % 16`) and that language's own state (`/ 4096`).
+MD_COMMENT := 1
+MD_FENCE := 2
+MD_PARA := 4
+MD_INNER := 4096
+
+## The language of the fenced code block that the Markdown state `state` is
+## inside (`Plain` for an unknown info string), or `none` outside a fence.
+pub fn fence_lang(state int) Lang?
+    if state % 4 != MD_FENCE
+        return none
+    code_lang((state / 256) % 16)
+
+## The state the language inside a Markdown fence keeps; 0 outside one. For
+## a fence marked `ail` the editor keeps its own `"""` state here.
+pub fn inner(state int) int
+    if state % 4 != MD_FENCE
+        return 0
+    state / MD_INNER
+
+## The Markdown state `state` with the fenced language's state set to `v`
+## (0 or more); `state` itself outside a fence.
+pub fn with_inner(state int, v int) int
+    if state % 4 != MD_FENCE
+        return state
+    state % MD_INNER + v * MD_INNER
+
+fn md_line(cs List[char], state int) Line
+    n := cs.len()
+    if state % 4 == MD_FENCE
+        return md_fenced(cs, state)
+    mut ks := kinds_of(n, Kind.Plain)
+    if state % 4 == MD_COMMENT
+        e := find_text(cs, "-->", 0)
+        if e < 0
+            fill(mut ks, 0, n, Kind.Comment)
+            return done(ks, MD_COMMENT)
+        fill(mut ks, 0, e + 3, Kind.Comment)
+        still := md_inline(mut ks, cs, e + 3, n, Kind.Plain)
+        return done(ks, still)
+    p := skip_blank(cs, 0)
+    if p == n
+        return done(ks, 0)
+    para := (state / 4) % 2 == 1
+    ind := indent_width(cs, p)
+    if ind >= 4
+        if not para
+            fill(mut ks, 0, n, Kind.Code)
+            return done(ks, 0)
+    else
+        f := md_fence_open(mut ks, cs, p)
+        if f > 0
+            return done(ks, f)
+        c := cs[p]
+        if c == '#'
+            h := run_of(cs, p, '#', n)
+            if h <= 6 and (p + h == n or blank(cs[p + h]))
+                fill(mut ks, p, n, Kind.Heading)
+                return done(ks, 0)
+        if para and (md_rule(cs, p, '=') > 0 or md_rule(cs, p, '-') > 0)
+            fill(mut ks, p, n, Kind.Heading)
+            return done(ks, 0)
+        if (c == '-' or c == '*' or c == '_') and md_rule(cs, p, c) >= 3
+            fill(mut ks, p, n, Kind.Punct)
+            return done(ks, 0)
+        if c == '[' and md_ref_def(mut ks, cs, p)
+            return done(ks, 0)
+    mut q := p
+    mut listed := false
+    mut more := true
+    while more and q < n
+        more = false
+        if cs[q] == '>'
+            ks[q] = Kind.Punct
+            q = skip_blank(cs, q + 1)
+            more = true
+        else
+            m := md_marker(cs, q)
+            if m > 0
+                fill(mut ks, q, m, Kind.Punct)
+                q = skip_blank(cs, m)
+                listed = true
+                more = true
+    if listed and md_task(cs, q)
+        fill(mut ks, q, q + 3, Kind.Punct)
+    still := md_inline(mut ks, cs, q, n, Kind.Plain)
+    done(ks, still + MD_PARA)
+
+## The width of the indent before `p`; a tab counts 4.
+fn indent_width(cs List[char], p int) int
+    mut w := 0
+    for k in 0..p
+        if cs[k] == ' '
+            w += 1
+        else
+            w += 4
+    w
+
+## How many `c` the line holds from `p` when it holds only `c` and blanks
+## there (a rule or a setext underline), else 0.
+fn md_rule(cs List[char], p int, c char) int
+    mut count := 0
+    for k in p..cs.len()
+        if cs[k] == c
+            count += 1
+        elif not blank(cs[k])
+            return 0
+    count
+
+## Just past a list marker (`-`, `*`, `+`, `1.`, `1)`) at `q`, or -1.
+fn md_marker(cs List[char], q int) int
+    n := cs.len()
+    c := cs[q]
+    if (c == '-' or c == '*' or c == '+') and (q + 1 == n or blank(cs[q + 1]))
+        return q + 1
+    mut j := q
+    while j < n and j - q < 9 and cs[j].is_digit()
+        j += 1
+    if j > q and j < n and (cs[j] == '.' or cs[j] == ')') and (j + 1 == n or blank(cs[j + 1]))
+        return j + 1
+    -1
+
+## Whether a task box `[ ]` or `[x]` starts at `q`.
+fn md_task(cs List[char], q int) bool
+    box := starts_at(cs, q, "[ ]") or starts_at(cs, q, "[x]") or starts_at(cs, q, "[X]")
+    box and (q + 3 == cs.len() or blank(cs[q + 3]))
+
+## Colours a fence opening at `p` and gives the state inside it, or -1
+## when no fence opens there.
+fn md_fence_open(mut ks List[Kind], cs List[char], p int) int
+    n := cs.len()
+    c := cs[p]
+    if c != '`' and c != '~'
+        return -1
+    r := run_of(cs, p, c, n)
+    if r < 3
+        return -1
+    rest := text_of(cs, p + r, n).trim()
+    if c == '`' and rest.contains("`")
+        return -1
+    fill(mut ks, p, p + r, Kind.Punct)
+    fill(mut ks, p + r, n, Kind.Tag)
+    words := rest.words()
+    mut lang := Lang.Plain
+    if words.len() > 0
+        lang = info_lang(words[0])
+    tilde := if c == '~' then 8 else 0
+    MD_FENCE + tilde + r.min(15) * 16 + lang_code(lang) * 256
+
+## A line inside a fence: its closing line, or code in the fence's language.
+fn md_fenced(cs List[char], state int) Line
+    n := cs.len()
+    fc := if (state / 8) % 2 == 1 then '~' else '`'
+    flen := (state / 16) % 16
+    p := skip_blank(cs, 0)
+    if p < n and indent_width(cs, p) < 4 and cs[p] == fc
+        r := run_of(cs, p, fc, n)
+        if r >= flen and skip_blank(cs, p + r) == n
+            mut ks := kinds_of(n, Kind.Plain)
+            fill(mut ks, p, p + r, Kind.Punct)
+            return done(ks, 0)
+    lang := code_lang((state / 256) % 16)
+    if lang == Lang.Ail
+        return Line(kinds: kinds_of(n, Kind.Code), state: state, embed_ail: true)
+    if lang == Lang.Markdown or lang == Lang.Plain
+        return done(kinds_of(n, Kind.Code), state)
+    sub := line_of(lang, cs, state / MD_INNER)
+    done(sub.kinds, state % MD_INNER + sub.state * MD_INNER)
+
+## A link reference definition `[label]: url "title"` at `p`, coloured.
+fn md_ref_def(mut ks List[Kind], cs List[char], p int) bool
+    n := cs.len()
+    close := md_match(cs, p, '[', ']', n)
+    if close < 0 or close + 1 >= n or cs[close + 1] != ':'
+        return false
+    ks[p] = Kind.Punct
+    fill(mut ks, p + 1, close, Kind.Link)
+    fill(mut ks, close, close + 2, Kind.Punct)
+    fill(mut ks, skip_blank(cs, close + 2), n, Kind.Str)
+    true
+
+## The index of the `c` that closes the `o` at `from`, or -1.
+fn md_match(cs List[char], from int, o char, c char, to int) int
+    mut depth := 0
+    mut j := from
+    while j < to
+        if cs[j] == '\\'
+            j += 1
+        elif cs[j] == o
+            depth += 1
+        elif cs[j] == c
+            depth -= 1
+            if depth == 0
+                return j
+        j += 1
+    -1
+
+## Colours a link or image `[text](url)` or `[text][ref]` whose `[` is at
+## `i`, and gives the index just past it, or -1 when none starts there.
+fn md_link(mut ks List[Kind], cs List[char], i int, to int) int
+    close := md_match(cs, i, '[', ']', to)
+    if close < 0 or close + 1 >= to
+        return -1
+    nx := cs[close + 1]
+    if nx != '(' and nx != '['
+        return -1
+    shut_c := if nx == '(' then ')' else ']'
+    shut := md_match(cs, close + 1, nx, shut_c, to)
+    if shut < 0
+        return -1
+    ks[i] = Kind.Punct
+    fill(mut ks, i + 1, close, Kind.Link)
+    fill(mut ks, close, close + 2, Kind.Punct)
+    target := if nx == '(' then Kind.Str else Kind.Link
+    fill(mut ks, close + 2, shut, target)
+    ks[shut] = Kind.Punct
+    shut + 1
+
+## The index of the `>` closing a tag or autolink at `i`, or -1.
+fn md_angle(cs List[char], i int, to int) int
+    if i + 1 >= to or not (cs[i + 1].is_alpha() or cs[i + 1] == '/')
+        return -1
+    mut j := i + 1
+    while j < to and cs[j] != '<'
+        if cs[j] == '>'
+            return j
+        j += 1
+    -1
+
+## The index of the run of exactly `r` backticks closing a code span,
+## searching from `from`, or -1.
+fn md_close_run(cs List[char], from int, r int, to int) int
+    mut j := from
+    while j < to
+        if cs[j] == '`'
+            k := run_of(cs, j, '`', to)
+            if k == r
+                return j
+            j += k
+        else
+            j += 1
+    -1
+
+## The index of the run of `c` closing emphasis opened by `r` of them,
+## searching from `from`, skipping escapes and code spans, or -1.
+fn md_close_emph(cs List[char], from int, c char, r int, to int) int
+    mut j := from
+    while j < to
+        if cs[j] == '\\'
+            j += 2
+        elif cs[j] == '`'
+            k := run_of(cs, j, '`', to)
+            e := md_close_run(cs, j + k, k, to)
+            j = if e >= 0 then e + k else j + k
+        elif cs[j] == c
+            k := run_of(cs, j, c, to)
+            edge := c != '_' or j + k >= to or not cs[j + k].is_alnum()
+            if k >= r and not blank(cs[j - 1]) and edge
+                return j
+            j += k
+        else
+            j += 1
+    -1
+
+MD_ESCAPABLE := "!\"#$%&'()*+,-./:;<=>?@[\\]^_`\{|}~"
+
+## Colours the inline text from `from` to `to` over the kind `base`: escapes,
+## code spans, emphasis, links, images, tags and HTML comments. Gives 1 when
+## an HTML comment is still open at the end of the line, else 0.
+fn md_inline(mut ks List[Kind], cs List[char], from int, to int, base Kind) int
+    mut i := from
+    while i < to
+        c := cs[i]
+        if c == '\\' and i + 1 < to and MD_ESCAPABLE.contains(cs[i + 1])
+            ks[i] = Kind.Punct
+            ks[i + 1] = base
+            i += 2
+            continue
+        if c == '`'
+            r := run_of(cs, i, '`', to)
+            e := md_close_run(cs, i + r, r, to)
+            if e >= 0
+                fill(mut ks, i, e + r, Kind.Code)
+                i = e + r
+            else
+                fill(mut ks, i, i + r, base)
+                i += r
+            continue
+        if c == '*' or c == '_' or c == '~'
+            whole := run_of(cs, i, c, to)
+            r := whole.min(3)
+            edge := c != '_' or i == 0 or not cs[i - 1].is_alnum()
+            opens := i + r < to and not blank(cs[i + r]) and edge and (c != '~' or r == 2)
+            if opens
+                e := md_close_emph(cs, i + r, c, r, to)
+                if e > i + r
+                    fill(mut ks, i, i + r, Kind.Emphasis)
+                    _ := md_inline(mut ks, cs, i + r, e, Kind.Emphasis)
+                    fill(mut ks, e, e + r, Kind.Emphasis)
+                    i = e + r
+                    continue
+            fill(mut ks, i, i + whole, base)
+            i += whole
+            continue
+        if c == '!' and i + 1 < to and cs[i + 1] == '['
+            e := md_link(mut ks, cs, i + 1, to)
+            if e > 0
+                ks[i] = Kind.Punct
+                i = e
+                continue
+        if c == '['
+            e := md_link(mut ks, cs, i, to)
+            if e > 0
+                i = e
+                continue
+        if c == '<'
+            if starts_at(cs, i, "<!--")
+                e := find_text(cs, "-->", i + 4)
+                if e < 0 or e + 3 > to
+                    fill(mut ks, i, to, Kind.Comment)
+                    return 1
+                fill(mut ks, i, e + 3, Kind.Comment)
+                i = e + 3
+                continue
+            e := md_angle(cs, i, to)
+            if e > 0
+                body := text_of(cs, i + 1, e)
+                auto := body.contains("://") or (body.contains("@") and not body.contains(" "))
+                k := if auto then Kind.Link else Kind.Tag
+                fill(mut ks, i, e + 1, k)
+                i = e + 1
+                continue
+        ks[i] = base
+        i += 1
+    0
+
+# ---- JSON --------------------------------------------------------------
+
+fn json_line(cs List[char]) Line
+    n := cs.len()
+    mut ks := kinds_of(n, Kind.Plain)
+    mut i := 0
+    while i < n
+        c := cs[i]
+        if blank(c)
+            i += 1
+        elif "\{}[]:,".contains(c)
+            ks[i] = Kind.Punct
+            i += 1
+        elif c == '"'
+            mut e := quote_end(cs, i, true)
+            mut k := Kind.Str
+            if e < 0
+                e = n
+            else
+                at := skip_blank(cs, e)
+                if at < n and cs[at] == ':'
+                    k = Kind.Key
+            fill(mut ks, i, e, k)
+            i = e
+        elif c == '-' or c.is_digit()
+            mut j := i + 1
+            while j < n and (cs[j].is_digit() or ".eE+-".contains(cs[j]))
+                j += 1
+            fill(mut ks, i, j, Kind.Number)
+            i = j
+        elif c.is_alpha()
+            mut j := i + 1
+            while j < n and cs[j].is_alnum()
+                j += 1
+            word := text_of(cs, i, j)
+            ok := word == "true" or word == "false" or word == "null"
+            k := if ok then Kind.Constant else Kind.Invalid
+            fill(mut ks, i, j, k)
+            i = j
+        else
+            ks[i] = Kind.Invalid
+            i += 1
+    done(ks, 0)
+
+# ---- TOML --------------------------------------------------------------
+
+# A TOML state: 0, or 1 inside a `"""` string, or 2 inside a `'''` one.
+
+fn toml_line(cs List[char], state int) Line
+    n := cs.len()
+    mut ks := kinds_of(n, Kind.Plain)
+    mut i := 0
+    if state == 1 or state == 2
+        q := if state == 1 then '"' else '\''
+        e := close_triple(cs, 0, q, state == 1)
+        if e < 0
+            fill(mut ks, 0, n, Kind.Str)
+            return done(ks, state)
+        fill(mut ks, 0, e, Kind.Str)
+        i = e
+    else
+        p := skip_blank(cs, 0)
+        h := toml_header(cs, p)
+        if h > 0
+            fill(mut ks, p, h, Kind.Heading)
+            fill(mut ks, p, p + run_of(cs, p, '[', h), Kind.Punct)
+            mut b := h
+            while b > p and cs[b - 1] == ']'
+                b -= 1
+            fill(mut ks, b, h, Kind.Punct)
+            i = h
+    st := toml_tokens(mut ks, cs, i, i == 0)
+    done(ks, st)
+
+## A bare key character.
+fn is_bare(c char) bool
+    c.is_alnum() or c == '_' or c == '-'
+
+## A character of a bare value: numbers, dates and times, `inf`, `true`.
+fn toml_word(c char) bool
+    is_bare(c) or c == '.' or c == ':' or c == '+'
+
+## Just past a table header `[a.b]` or `[[a]]` starting at `p`, or -1.
+fn toml_header(cs List[char], p int) int
+    n := cs.len()
+    if p >= n or cs[p] != '['
+        return -1
+    r := run_of(cs, p, '[', n)
+    if r > 2
+        return -1
+    lead := skip_blank(cs, p + r)
+    if lead >= n or not (is_bare(cs[lead]) or cs[lead] == '"' or cs[lead] == '\'')
+        return -1
+    mut j := p + r
+    while j < n and cs[j] != ']'
+        if cs[j] == '"' or cs[j] == '\''
+            e := quote_end(cs, j, cs[j] == '"')
+            if e < 0
+                return -1
+            j = e
+        elif cs[j] == ',' or cs[j] == '='
+            return -1
+        else
+            j += 1
+    if run_of(cs, j, ']', n) < r
+        return -1
+    rest := skip_blank(cs, j + r)
+    if rest < n and cs[rest] != '#'
+        return -1
+    j + r
+
+## Whether a key ends at `e`: `=` or `.` comes next.
+fn toml_keyed(cs List[char], e int) bool
+    at := skip_blank(cs, e)
+    at < cs.len() and (cs[at] == '=' or cs[at] == '.')
+
+fn toml_value_kind(word str) Kind
+    if word == "true" or word == "false"
+        return Kind.Constant
+    body := word.strip_prefix("+") else (word.strip_prefix("-") else word)
+    if body == "inf" or body == "nan" or (body.char_at(0) else 'x').is_digit()
+        return Kind.Number
+    Kind.Invalid
+
+## Colours keys and values from `from`; `key_start` when a key may come
+## first. Gives the state for the next line.
+fn toml_tokens(mut ks List[Kind], cs List[char], from int, key_start bool) int
+    n := cs.len()
+    mut i := from
+    mut want_key := key_start
+    mut opens := List[char]()
+    while i < n
+        c := cs[i]
+        if blank(c)
+            i += 1
+        elif c == '#'
+            fill(mut ks, i, n, Kind.Comment)
+            return 0
+        elif c == '"' or c == '\''
+            esc := c == '"'
+            if i + 2 < n and cs[i + 1] == c and cs[i + 2] == c
+                e := close_triple(cs, i + 3, c, esc)
+                if e < 0
+                    fill(mut ks, i, n, Kind.Str)
+                    if esc
+                        return 1
+                    return 2
+                fill(mut ks, i, e, Kind.Str)
+                i = e
+            else
+                mut e := quote_end(cs, i, esc)
+                if e < 0
+                    e = n
+                k := if want_key and toml_keyed(cs, e) then Kind.Key else Kind.Str
+                fill(mut ks, i, e, k)
+                i = e
+        elif c == '='
+            ks[i] = Kind.Punct
+            want_key = false
+            i += 1
+        elif c == '{' or c == '['
+            ks[i] = Kind.Punct
+            opens.push(c)
+            want_key = c == '{'
+            i += 1
+        elif c == '}' or c == ']'
+            ks[i] = Kind.Punct
+            _ := opens.pop()
+            i += 1
+        elif c == ','
+            ks[i] = Kind.Punct
+            want_key = (opens.last() else ' ') == '{'
+            i += 1
+        elif c == '.' and want_key
+            ks[i] = Kind.Punct
+            i += 1
+        elif toml_word(c)
+            mut kj := i
+            while kj < n and is_bare(cs[kj])
+                kj += 1
+            if want_key and kj > i and toml_keyed(cs, kj)
+                fill(mut ks, i, kj, Kind.Key)
+                i = kj
+                continue
+            mut j := i + 1
+            while j < n and toml_word(cs[j])
+                j += 1
+            # a date and a time separated by a space: 1979-05-27 07:32:00Z
+            date := j - i == 10 and cs[i + 4] == '-' and j + 3 < n and cs[j] == ' '
+            if date and cs[j + 1].is_digit() and cs[j + 3] == ':'
+                j += 1
+                while j < n and toml_word(cs[j])
+                    j += 1
+            fill(mut ks, i, j, toml_value_kind(text_of(cs, i, j)))
+            i = j
+        else
+            ks[i] = Kind.Invalid
+            i += 1
+    0
+
+# ---- YAML --------------------------------------------------------------
+
+# A YAML state: `state % 4` is the mode (0, 1 in a block scalar, 2 in a
+# `"` string, 3 in a `'` string); a block scalar keeps in `state / 4` the
+# column its lines must be indented past.
+
+YAML_CONSTANTS := "true false yes no on off null ~"
+
+fn yaml_line(cs List[char], state int) Line
+    n := cs.len()
+    mut ks := kinds_of(n, Kind.Plain)
+    mode := state % 4
+    p := skip_blank(cs, 0)
+    mut i := 0
+    if mode == 1
+        if p == n or p > state / 4
+            fill(mut ks, 0, n, Kind.Str)
+            return done(ks, state)
+    elif mode == 2 or mode == 3
+        q := if mode == 2 then '"' else '\''
+        e := yaml_close(cs, 0, q)
+        if e < 0
+            fill(mut ks, 0, n, Kind.Str)
+            return done(ks, state)
+        fill(mut ks, 0, e, Kind.Str)
+        i = e
+    marker := starts_at(cs, 0, "---") or starts_at(cs, 0, "...")
+    if i == 0 and marker and (n == 3 or blank(cs[3]))
+        fill(mut ks, 0, 3, Kind.Keyword)
+        i = 3
+    elif i == 0 and n > 0 and cs[0] == '%'
+        fill(mut ks, 0, n, Kind.Keyword)
+        return done(ks, 0)
+    st := yaml_tokens(mut ks, cs, i, mode != 2 and mode != 3)
+    done(ks, st)
+
+## Just past the `q` closing a quoted scalar whose text starts at `from`,
+## or -1: `"` strings have escapes, `'` strings double the quote.
+fn yaml_close(cs List[char], from int, q char) int
+    if q == '"'
+        return close_quote(cs, from, q, true)
+    n := cs.len()
+    mut j := from
+    while j < n
+        if cs[j] == q
+            if j + 1 < n and cs[j + 1] == q
+                j += 2
+            else
+                return j + 1
+        else
+            j += 1
+    -1
+
+## Just past an anchor, alias or tag name that starts at `from`.
+fn yaml_word_end(cs List[char], from int) int
+    mut j := from
+    while j < cs.len() and not blank(cs[j]) and not ",[]\{}".contains(cs[j])
+        j += 1
+    j
+
+## Just past a block scalar header's indicators (`|-`, `>+2`) at `i`.
+fn yaml_indicators_end(cs List[char], i int) int
+    mut j := i + 1
+    while j < cs.len() and (cs[j] == '+' or cs[j] == '-' or cs[j].is_digit())
+        j += 1
+    j
+
+## Whether a block scalar header `|` or `>` at `i` ends the line.
+fn yaml_block_head(cs List[char], i int) bool
+    j := yaml_indicators_end(cs, i)
+    rest := skip_blank(cs, j)
+    rest == cs.len() or cs[rest] == '#' and rest > j
+
+## Where a plain scalar starting at `i` ends: before `: `, ` #`, or in flow
+## context a flow character.
+fn yaml_plain_end(cs List[char], i int, flow int) int
+    n := cs.len()
+    mut j := i
+    while j < n
+        d := cs[j]
+        if d == ':'
+            ends := j + 1 >= n or blank(cs[j + 1])
+            if ends or flow > 0 and ",[]\{}".contains(cs[j + 1])
+                break
+        if d == '#' and j > i and blank(cs[j - 1])
+            break
+        if flow > 0 and ",[]\{}".contains(d)
+            break
+        j += 1
+    j
+
+fn yaml_value_kind(s str) Kind
+    low := s.to_lower()
+    if YAML_CONSTANTS.split(" ").contains(low)
+        return Kind.Constant
+    if is_number(low)
+        return Kind.Number
+    Kind.Str
+
+## Colours the nodes from `from`; `at_node` when a key may come first.
+## Gives the state for the next line.
+fn yaml_tokens(mut ks List[Kind], cs List[char], from int, at_node bool) int
+    n := cs.len()
+    mut i := from
+    mut key_ctx := at_node
+    mut flow := 0
+    mut col := skip_blank(cs, 0)
+    while i < n
+        c := cs[i]
+        nxt_blank := i + 1 >= n or blank(cs[i + 1])
+        if blank(c)
+            i += 1
+        elif c == '#' and (i == 0 or blank(cs[i - 1]))
+            fill(mut ks, i, n, Kind.Comment)
+            return 0
+        elif (c == '-' or c == '?') and nxt_blank and flow == 0 and key_ctx
+            ks[i] = Kind.Punct
+            i += 1
+        elif c == ':' and (nxt_blank or flow > 0)
+            ks[i] = Kind.Punct
+            key_ctx = false
+            i += 1
+        elif c == '[' or c == '{'
+            ks[i] = Kind.Punct
+            flow += 1
+            key_ctx = true
+            i += 1
+        elif c == ']' or c == '}'
+            ks[i] = Kind.Punct
+            flow = (flow - 1).max(0)
+            i += 1
+        elif c == ',' and flow > 0
+            ks[i] = Kind.Punct
+            key_ctx = true
+            i += 1
+        elif c == '&' or c == '*' or c == '!'
+            j := yaml_word_end(cs, i + 1)
+            k := if c == '!' then Kind.Tag else Kind.Variable
+            fill(mut ks, i, j, k)
+            i = j
+        elif (c == '|' or c == '>') and flow == 0 and not key_ctx and yaml_block_head(cs, i)
+            j := yaml_indicators_end(cs, i)
+            fill(mut ks, i, j, Kind.Punct)
+            rest := skip_blank(cs, j)
+            fill(mut ks, rest, n, Kind.Comment)
+            return 1 + col.min(1000) * 4
+        elif c == '"' or c == '\''
+            j := yaml_close(cs, i + 1, c)
+            if j < 0
+                fill(mut ks, i, n, Kind.Str)
+                if c == '"'
+                    return 2
+                return 3
+            at := skip_blank(cs, j)
+            if key_ctx and at < n and cs[at] == ':'
+                fill(mut ks, i, j, Kind.Key)
+                col = i
+            else
+                fill(mut ks, i, j, Kind.Str)
+            i = j
+        else
+            j := yaml_plain_end(cs, i, flow)
+            mut e := j
+            while e > i and blank(cs[e - 1])
+                e -= 1
+            if j < n and cs[j] == ':'
+                fill(mut ks, i, e, Kind.Key)
+                col = i
+            else
+                fill(mut ks, i, e, yaml_value_kind(text_of(cs, i, e)))
+            i = j.max(i + 1)
+    0
+
+# ---- Shell -------------------------------------------------------------
+
+# A shell state: `state % 4` is the mode (0, 1 inside `"`, 2 inside `'`,
+# 3 inside a heredoc). A heredoc keeps `<<-` (`/ 4 % 2`), a quoted
+# delimiter, so no expansion (`/ 8 % 2`), and a hash of the delimiter
+# (`/ 16`), which the closing line must match.
+
+SH_KEYWORDS := "if then else elif fi case esac for select while until do done in function time return local export readonly declare typeset unset break continue exit shift source alias set eval exec trap"
+SH_PUNCT := "|&;<>()\{}[]!="
+SH_QUOTES := "\"'`$\\"
+
+## Where a heredoc's opening ends, and the state it starts (0 for none).
+struct Here
+    end int
+    state int
+
+fn sh_line(cs List[char], state int) Line
+    n := cs.len()
+    mut ks := kinds_of(n, Kind.Plain)
+    mode := state % 4
+    mut i := 0
+    if mode == 3
+        mut p := 0
+        if (state / 4) % 2 == 1
+            while p < n and cs[p].code() == 9
+                p += 1
+        if p < n and hash_of(cs, p, n) == state / 16
+            fill(mut ks, p, n, Kind.Keyword)
+            return done(ks, 0)
+        fill(mut ks, 0, n, Kind.Str)
+        if (state / 8) % 2 == 0
+            sh_vars(mut ks, cs, 0, n)
+        return done(ks, state)
+    if mode == 1
+        e := sh_dquote(mut ks, cs, 0)
+        if e < 0
+            return done(ks, 1)
+        i = e
+    elif mode == 2
+        e := close_quote(cs, 0, '\'', false)
+        if e < 0
+            fill(mut ks, 0, n, Kind.Str)
+            return done(ks, 2)
+        fill(mut ks, 0, e, Kind.Str)
+        i = e
+    st := sh_tokens(mut ks, cs, i)
+    done(ks, st)
+
+## A hash of the characters from `from` to `to`, under 2^20.
+fn hash_of(cs List[char], from int, to int) int
+    mut h := 7
+    for k in from..to
+        h = (h * 31 + cs[k].code()) % 1048573
+    h
+
+## Just past a `$` expansion at `i`: `${...}`, a name, a special parameter,
+## or the `$(` / `$((` that opens a substitution; `i + 1` for a lone `$`.
+fn sh_var_end(cs List[char], i int) int
+    n := cs.len()
+    if i + 1 >= n
+        return i + 1
+    c := cs[i + 1]
+    if c == '{'
+        e := close_quote(cs, i + 2, '}', false)
+        if e < 0
+            return n
+        return e
+    if c == '('
+        if i + 2 < n and cs[i + 2] == '('
+            return i + 3
+        return i + 2
+    if c.is_alpha() or c == '_'
+        mut j := i + 2
+        while j < n and (cs[j].is_alnum() or cs[j] == '_')
+            j += 1
+        return j
+    if c.is_digit() or "@*#?$!-".contains(c)
+        return i + 2
+    i + 1
+
+## Marks the `$` expansions between `from` and `to` as variables.
+fn sh_vars(mut ks List[Kind], cs List[char], from int, to int)
+    mut j := from
+    while j < to
+        if cs[j] == '\\'
+            j += 2
+        elif cs[j] == '$'
+            e := sh_var_end(cs, j)
+            if e > j + 1
+                fill(mut ks, j, e.min(to), Kind.Variable)
+            j = e
+        else
+            j += 1
+
+## Colours a `"` string's text from `from`, with its expansions; gives the
+## index past its closing quote, or -1 when it goes on to the next line.
+fn sh_dquote(mut ks List[Kind], cs List[char], from int) int
+    e := close_quote(cs, from, '"', true)
+    end := if e < 0 then cs.len() else e
+    fill(mut ks, from, end, Kind.Str)
+    sh_vars(mut ks, cs, from, end)
+    e
+
+## Colours a heredoc opening `<<WORD`, `<<-WORD`, `<<'WORD'` at `i`.
+fn sh_heredoc(mut ks List[Kind], cs List[char], i int) Here
+    n := cs.len()
+    mut j := i + 2
+    mut dash := 0
+    if j < n and cs[j] == '-'
+        dash = 1
+        j += 1
+    fill(mut ks, i, j, Kind.Punct)
+    j = skip_blank(cs, j)
+    mut quoted := 0
+    mut a := j
+    mut b := j
+    if j < n and (cs[j] == '\'' or cs[j] == '"')
+        e := close_quote(cs, j + 1, cs[j], false)
+        if e < 0
+            return Here(end: j, state: 0)
+        quoted = 1
+        a = j + 1
+        b = e - 1
+        fill(mut ks, j, e, Kind.Keyword)
+        j = e
+    else
+        if j < n and cs[j] == '\\'
+            quoted = 1
+            j += 1
+        a = j
+        while j < n and not blank(cs[j]) and not ";|&<>()".contains(cs[j])
+            j += 1
+        b = j
+        fill(mut ks, a - quoted, j, Kind.Keyword)
+    if b <= a
+        return Here(end: j, state: 0)
+    Here(end: j, state: 3 + dash * 4 + quoted * 8 + hash_of(cs, a, b) * 16)
+
+fn sh_word_char(c char) bool
+    not blank(c) and not SH_PUNCT.contains(c) and not SH_QUOTES.contains(c)
+
+## A shell variable name.
+fn sh_ident(word str) bool
+    cs := word.chars()
+    if cs.len() == 0 or not (cs[0].is_alpha() or cs[0] == '_')
+        return false
+    for c in cs
+        if not (c.is_alnum() or c == '_')
+            return false
+    true
+
+fn all_digits(word str) bool
+    cs := word.chars()
+    if cs.len() == 0
+        return false
+    for c in cs
+        if not c.is_digit()
+            return false
+    true
+
+## Colours a shell line from `from`; gives the state for the next line.
+fn sh_tokens(mut ks List[Kind], cs List[char], from int) int
+    n := cs.len()
+    mut i := from
+    mut pending := 0
+    while i < n
+        c := cs[i]
+        if blank(c)
+            i += 1
+        elif c == '#' and (i == 0 or blank(cs[i - 1]) or ";|&(".contains(cs[i - 1]))
+            fill(mut ks, i, n, Kind.Comment)
+            return pending
+        elif c == '\\'
+            i += 2
+        elif c == '"'
+            ks[i] = Kind.Str
+            e := sh_dquote(mut ks, cs, i + 1)
+            if e < 0
+                return 1
+            i = e
+        elif c == '\'' or c == '$' and i + 1 < n and cs[i + 1] == '\''
+            q := if c == '$' then i + 1 else i
+            e := close_quote(cs, q + 1, '\'', c == '$')
+            if e < 0
+                fill(mut ks, i, n, Kind.Str)
+                return 2
+            fill(mut ks, i, e, Kind.Str)
+            i = e
+        elif c == '$'
+            e := sh_var_end(cs, i)
+            if e > i + 1
+                fill(mut ks, i, e, Kind.Variable)
+            i = e
+        elif c == '`'
+            mut e := close_quote(cs, i + 1, '`', true)
+            if e < 0
+                e = n
+            fill(mut ks, i, e, Kind.Variable)
+            i = e
+        elif starts_at(cs, i, "<<") and not starts_at(cs, i, "<<<")
+            h := sh_heredoc(mut ks, cs, i)
+            if h.state > 0
+                pending = h.state
+            i = h.end.max(i + 2)
+        elif SH_PUNCT.contains(c)
+            ks[i] = Kind.Punct
+            i += 1
+        else
+            mut j := i + 1
+            while j < n and sh_word_char(cs[j])
+                j += 1
+            word := text_of(cs, i, j)
+            if j < n and cs[j] == '=' and sh_ident(word)
+                fill(mut ks, i, j, Kind.Variable)
+            elif SH_KEYWORDS.split(" ").contains(word)
+                fill(mut ks, i, j, Kind.Keyword)
+            elif all_digits(word)
+                fill(mut ks, i, j, Kind.Number)
+            i = j
+    pending
+
+# ---- Package files -----------------------------------------------------
+
+# `ail.pkg` (mod.pkg.2) and `ail.lock` (mod.pkg.8): a line's first word,
+# the package and dependency names, the keys of `dep` lines, quoted words.
+
+PKG_LEADS := "package ail dep caps unsafe"
+PKG_KEYS := "path git rev tag caps unsafe commit"
+
+fn pkg_line(cs List[char]) Line
+    n := cs.len()
+    mut ks := kinds_of(n, Kind.Plain)
+    mut i := 0
+    mut lead := true
+    mut names_next := false
+    while i < n
+        c := cs[i]
+        if blank(c)
+            i += 1
+        elif c == '#'
+            fill(mut ks, i, n, Kind.Comment)
+            i = n
+        elif c == '"'
+            mut e := quote_end(cs, i, true)
+            if e < 0
+                e = n
+            fill(mut ks, i, e, Kind.Str)
+            i = e
+            lead = false
+            names_next = false
+        else
+            mut j := i + 1
+            while j < n and not blank(cs[j])
+                j += 1
+            word := text_of(cs, i, j)
+            mut k := Kind.Plain
+            if lead and PKG_LEADS.split(" ").contains(word)
+                k = Kind.Keyword
+            elif names_next
+                k = Kind.Variable
+            elif not lead and PKG_KEYS.split(" ").contains(word)
+                k = Kind.Key
+            elif is_number(word)
+                k = Kind.Number
+            names_next = lead and (word == "dep" or word == "package")
+            lead = false
+            fill(mut ks, i, j, k)
+            i = j
+    done(ks, 0)
+
+# ---- Tests -------------------------------------------------------------
+
+@test fn languages_come_from_file_names()
+    assert_eq(lang_of("README.md"), Lang.Markdown)
+    assert_eq(lang_of("/home/a/proj/AGENTS.md"), Lang.Markdown)
+    assert_eq(lang_of("data/x.json"), Lang.Json)
+    assert_eq(lang_of("Cargo.toml"), Lang.Toml)
+    assert_eq(lang_of("ci.yml"), Lang.Yaml)
+    assert_eq(lang_of("C:\\proj\\B.YAML"), Lang.Yaml)
+    assert_eq(lang_of("tools/run.sh"), Lang.Shell)
+    assert_eq(lang_of("~/.zshrc"), Lang.Shell)
+    assert_eq(lang_of("ail.pkg"), Lang.Pkg)
+    assert_eq(lang_of("app/ail.lock"), Lang.Pkg)
+    assert_eq(lang_of("edit.ail"), Lang.Ail)
+    assert_eq(lang_of("notes.txt"), Lang.Plain)
+    assert_eq(lang_of("Makefile"), Lang.Plain)
+
+@test fn comment_and_bracket_settings()
+    assert_eq(comment_prefix(Lang.Shell), "#")
+    assert_eq(comment_prefix(Lang.Toml), "#")
+    assert_eq(comment_prefix(Lang.Json), "")
+    assert_eq(comment_prefix(Lang.Markdown), "<!--")
+    assert_eq(comment_suffix(Lang.Markdown), "-->")
+    assert_eq(comment_suffix(Lang.Yaml), "")
+    assert_eq(brackets(Lang.Json), "()[]\{}")
+    assert_eq(brackets(Lang.Markdown), "()[]")
+    assert_eq(brackets(Lang.Pkg), "")
+
+@test fn ail_and_plain_lines()
+    a := line(Lang.Ail, "x := 1", 0)
+    assert(a.embed_ail)
+    assert_eq(a.kinds.len(), 6)
+    p := line(Lang.Plain, "hi", 0)
+    assert(not p.embed_ail)
+    assert_eq(p.kinds[0], Kind.Plain)
+
+@test fn markdown_headings_emphasis_code()
+    h := line(Lang.Markdown, "## Title", 0)
+    assert_eq(h.kinds[0], Kind.Heading)
+    assert_eq(h.kinds[7], Kind.Heading)
+    assert_eq(h.state, 0)
+    e := line(Lang.Markdown, "a *b* and **c** `d`", 0)
+    assert_eq(e.kinds[0], Kind.Plain)
+    assert_eq(e.kinds[2], Kind.Emphasis)
+    assert_eq(e.kinds[3], Kind.Emphasis)
+    assert_eq(e.kinds[6], Kind.Plain)
+    assert_eq(e.kinds[12], Kind.Emphasis)
+    assert_eq(e.kinds[17], Kind.Code)
+    assert_eq(line(Lang.Markdown, "snake_case_name", 0).kinds[5], Kind.Plain)
+
+@test fn markdown_links_lists_quotes()
+    l := line(Lang.Markdown, "see [docs](a.md) ![i](p.png)", 0)
+    assert_eq(l.kinds[4], Kind.Punct)
+    assert_eq(l.kinds[5], Kind.Link)
+    assert_eq(l.kinds[11], Kind.Str)
+    assert_eq(l.kinds[17], Kind.Punct)
+    assert_eq(l.kinds[19], Kind.Link)
+    q := line(Lang.Markdown, "> - [x] item", 0)
+    assert_eq(q.kinds[0], Kind.Punct)
+    assert_eq(q.kinds[2], Kind.Punct)
+    assert_eq(q.kinds[5], Kind.Punct)
+    assert_eq(q.kinds[8], Kind.Plain)
+    assert_eq(line(Lang.Markdown, "1. one", 0).kinds[1], Kind.Punct)
+    assert_eq(line(Lang.Markdown, "***", 0).kinds[0], Kind.Punct)
+
+@test fn markdown_indented_code_and_setext()
+    assert_eq(line(Lang.Markdown, "    code", 0).kinds[4], Kind.Code)
+    t := line(Lang.Markdown, "text", 0)
+    assert_eq(line(Lang.Markdown, "    more", t.state).kinds[4], Kind.Plain)
+    assert_eq(line(Lang.Markdown, "===", t.state).kinds[0], Kind.Heading)
+    assert_eq(line(Lang.Markdown, "", t.state).state, 0)
+
+@test fn markdown_html_comment_spans_lines()
+    a := line(Lang.Markdown, "text <!-- start", 0)
+    assert_eq(a.kinds[0], Kind.Plain)
+    assert_eq(a.kinds[5], Kind.Comment)
+    b := line(Lang.Markdown, "middle", a.state)
+    assert_eq(b.kinds[0], Kind.Comment)
+    c := line(Lang.Markdown, "end --> *x*", b.state)
+    assert_eq(c.kinds[4], Kind.Comment)
+    assert_eq(c.kinds[9], Kind.Emphasis)
+    assert_eq(c.state % 4, 0)
+
+@test fn markdown_fences_carry_their_language()
+    a := line(Lang.Markdown, "```ail", 0)
+    assert_eq(a.kinds[0], Kind.Punct)
+    assert_eq(a.kinds[3], Kind.Tag)
+    assert_eq(fence_lang(a.state) else Lang.Plain, Lang.Ail)
+    b := line(Lang.Markdown, "x := 1  # *not emphasis*", a.state)
+    assert(b.embed_ail)
+    assert_eq(b.state, a.state)
+    assert_eq(inner(with_inner(b.state, 1)), 1)
+    assert_eq(fence_lang(with_inner(b.state, 1)) else Lang.Plain, Lang.Ail)
+    c := line(Lang.Markdown, "```", with_inner(b.state, 1))
+    assert_eq(c.state, 0)
+    assert_eq(c.kinds[0], Kind.Punct)
+    assert_eq(fence_lang(c.state) else Lang.Markdown, Lang.Markdown)
+    assert_eq(inner(c.state), 0)
+
+@test fn markdown_fences_colour_nested_languages()
+    a := line(Lang.Markdown, "~~~~ sh", 0)
+    assert_eq(fence_lang(a.state) else Lang.Plain, Lang.Shell)
+    b := line(Lang.Markdown, "echo \"a", a.state)
+    assert_eq(b.kinds[0], Kind.Plain)
+    assert_eq(b.kinds[5], Kind.Str)
+    assert_eq(inner(b.state), 1)
+    c := line(Lang.Markdown, "~~~", b.state)
+    assert_eq(c.kinds[0], Kind.Str)
+    d := line(Lang.Markdown, "~~~~", c.state)
+    assert_eq(d.state, 0)
+    j := line(Lang.Markdown, "```json", 0)
+    assert_eq(line(Lang.Markdown, "\{\"a\": 1}", j.state).kinds[1], Kind.Key)
+    u := line(Lang.Markdown, "```", 0)
+    assert_eq(fence_lang(u.state) else Lang.Ail, Lang.Plain)
+    assert_eq(line(Lang.Markdown, "# no heading", u.state).kinds[0], Kind.Code)
+
+@test fn json_keys_values_constants()
+    l := line(Lang.Json, "\{\"name\": \"ail\", \"n\": -1.5e3, \"ok\": true, \"x\": null}", 0)
+    assert_eq(l.kinds[0], Kind.Punct)
+    assert_eq(l.kinds[1], Kind.Key)
+    assert_eq(l.kinds[6], Kind.Key)
+    assert_eq(l.kinds[7], Kind.Punct)
+    assert_eq(l.kinds[10], Kind.Str)
+    assert_eq(l.kinds[21], Kind.Number)
+    assert_eq(l.kinds[26], Kind.Number)
+    assert_eq(l.kinds[35], Kind.Constant)
+    assert_eq(l.kinds[46], Kind.Constant)
+    assert_eq(l.state, 0)
+
+@test fn json_invalid_characters()
+    l := line(Lang.Json, "[1, nope, @]", 0)
+    assert_eq(l.kinds[1], Kind.Number)
+    assert_eq(l.kinds[4], Kind.Invalid)
+    assert_eq(l.kinds[10], Kind.Invalid)
+    assert_eq(l.kinds[11], Kind.Punct)
+
+@test fn json_keeps_no_state()
+    a := line(Lang.Json, "\"abc", 0)
+    assert_eq(a.kinds[3], Kind.Str)
+    assert_eq(a.state, 0)
+    b := line(Lang.Json, "  \"k\" : [", a.state)
+    assert_eq(b.kinds[2], Kind.Key)
+    assert_eq(b.kinds[8], Kind.Punct)
+
+@test fn toml_tables_keys_comments()
+    t := line(Lang.Toml, "[server.http]  # main", 0)
+    assert_eq(t.kinds[0], Kind.Punct)
+    assert_eq(t.kinds[1], Kind.Heading)
+    assert_eq(t.kinds[12], Kind.Punct)
+    assert_eq(t.kinds[15], Kind.Comment)
+    a := line(Lang.Toml, "[[bin]]", 0)
+    assert_eq(a.kinds[1], Kind.Punct)
+    assert_eq(a.kinds[2], Kind.Heading)
+    k := line(Lang.Toml, "a.b = 'x' # c", 0)
+    assert_eq(k.kinds[0], Kind.Key)
+    assert_eq(k.kinds[1], Kind.Punct)
+    assert_eq(k.kinds[2], Kind.Key)
+    assert_eq(k.kinds[4], Kind.Punct)
+    assert_eq(k.kinds[6], Kind.Str)
+    assert_eq(k.kinds[10], Kind.Comment)
+
+@test fn toml_values()
+    d := line(Lang.Toml, "when = 1979-05-27 07:32:00Z", 0)
+    assert_eq(d.kinds[0], Kind.Key)
+    assert_eq(d.kinds[7], Kind.Number)
+    assert_eq(d.kinds[19], Kind.Number)
+    b := line(Lang.Toml, "on = true", 0)
+    assert_eq(b.kinds[5], Kind.Constant)
+    n := line(Lang.Toml, "port = -8_080", 0)
+    assert_eq(n.kinds[7], Kind.Number)
+    i := line(Lang.Toml, "p = \{ x = 1, \"y\" = [2, 3] }", 0)
+    assert_eq(i.kinds[6], Kind.Key)
+    assert_eq(i.kinds[13], Kind.Key)
+    assert_eq(i.kinds[20], Kind.Number)
+    assert_eq(line(Lang.Toml, "x = bogus", 0).kinds[4], Kind.Invalid)
+
+@test fn toml_multi_line_strings()
+    a := line(Lang.Toml, "s = \"\"\"first", 0)
+    assert_eq(a.kinds[0], Kind.Key)
+    assert_eq(a.kinds[4], Kind.Str)
+    assert_eq(a.state, 1)
+    b := line(Lang.Toml, "x = 1", a.state)
+    assert_eq(b.kinds[0], Kind.Str)
+    assert_eq(b.state, 1)
+    c := line(Lang.Toml, "end\"\"\" # c", b.state)
+    assert_eq(c.kinds[5], Kind.Str)
+    assert_eq(c.kinds[7], Kind.Comment)
+    assert_eq(c.state, 0)
+    l := line(Lang.Toml, "t = '''a", 0)
+    assert_eq(l.state, 2)
+    assert_eq(line(Lang.Toml, "b'''", l.state).state, 0)
+
+@test fn yaml_keys_values_comments()
+    l := line(Lang.Yaml, "name: ail  # c", 0)
+    assert_eq(l.kinds[0], Kind.Key)
+    assert_eq(l.kinds[4], Kind.Punct)
+    assert_eq(l.kinds[6], Kind.Str)
+    assert_eq(l.kinds[11], Kind.Comment)
+    assert_eq(line(Lang.Yaml, "on: true", 0).kinds[4], Kind.Constant)
+    assert_eq(line(Lang.Yaml, "n: ~", 0).kinds[3], Kind.Constant)
+    assert_eq(line(Lang.Yaml, "v: 1.5", 0).kinds[3], Kind.Number)
+    assert_eq(line(Lang.Yaml, "v: 1.2.3", 0).kinds[3], Kind.Str)
+    q := line(Lang.Yaml, "\"k y\": 'it''s'", 0)
+    assert_eq(q.kinds[0], Kind.Key)
+    assert_eq(q.kinds[7], Kind.Str)
+    assert_eq(q.kinds[13], Kind.Str)
+
+@test fn yaml_sequences_anchors_markers()
+    s := line(Lang.Yaml, "- &a 12", 0)
+    assert_eq(s.kinds[0], Kind.Punct)
+    assert_eq(s.kinds[2], Kind.Variable)
+    assert_eq(s.kinds[5], Kind.Number)
+    r := line(Lang.Yaml, "- *a", 0)
+    assert_eq(r.kinds[2], Kind.Variable)
+    t := line(Lang.Yaml, "x: !!str 5", 0)
+    assert_eq(t.kinds[3], Kind.Tag)
+    d := line(Lang.Yaml, "--- # doc", 0)
+    assert_eq(d.kinds[0], Kind.Keyword)
+    assert_eq(d.kinds[4], Kind.Comment)
+    f := line(Lang.Yaml, "xs: [a, 1, \{k: v}]", 0)
+    assert_eq(f.kinds[4], Kind.Punct)
+    assert_eq(f.kinds[5], Kind.Str)
+    assert_eq(f.kinds[8], Kind.Number)
+    assert_eq(f.kinds[12], Kind.Key)
+
+@test fn yaml_block_scalars_carry_over()
+    a := line(Lang.Yaml, "text: |", 0)
+    assert_eq(a.kinds[6], Kind.Punct)
+    assert_eq(a.state % 4, 1)
+    b := line(Lang.Yaml, "  line one: x # y", a.state)
+    assert_eq(b.kinds[2], Kind.Str)
+    assert_eq(b.kinds[15], Kind.Str)
+    assert_eq(b.state, a.state)
+    c := line(Lang.Yaml, "", b.state)
+    assert_eq(c.state, a.state)
+    d := line(Lang.Yaml, "next: 2", c.state)
+    assert_eq(d.kinds[0], Kind.Key)
+    assert_eq(d.state, 0)
+    e := line(Lang.Yaml, "  - k: >-", 0)
+    assert_eq(line(Lang.Yaml, "      folded", e.state).kinds[6], Kind.Str)
+    assert_eq(line(Lang.Yaml, "  - j: 1", e.state).kinds[4], Kind.Key)
+
+@test fn yaml_quoted_strings_carry_over()
+    a := line(Lang.Yaml, "a: \"one", 0)
+    assert_eq(a.kinds[0], Kind.Key)
+    assert_eq(a.kinds[3], Kind.Str)
+    assert_eq(a.state, 2)
+    b := line(Lang.Yaml, "two\" # c", a.state)
+    assert_eq(b.kinds[3], Kind.Str)
+    assert_eq(b.kinds[5], Kind.Comment)
+    assert_eq(b.state, 0)
+
+@test fn shell_keywords_strings_variables()
+    l := line(Lang.Shell, "if [ -n \"$HOME\" ]; then # hi", 0)
+    assert_eq(l.kinds[0], Kind.Keyword)
+    assert_eq(l.kinds[3], Kind.Punct)
+    assert_eq(l.kinds[5], Kind.Plain)
+    assert_eq(l.kinds[8], Kind.Str)
+    assert_eq(l.kinds[9], Kind.Variable)
+    assert_eq(l.kinds[13], Kind.Variable)
+    assert_eq(l.kinds[14], Kind.Str)
+    assert_eq(l.kinds[19], Kind.Keyword)
+    assert_eq(l.kinds[24], Kind.Comment)
+    s := line(Lang.Shell, "echo '$x' a#b", 0)
+    assert_eq(s.kinds[6], Kind.Str)
+    assert_eq(s.kinds[11], Kind.Plain)
+
+@test fn shell_assignments_and_substitutions()
+    l := line(Lang.Shell, "NAME=$(date) x=1 echo 42", 0)
+    assert_eq(l.kinds[0], Kind.Variable)
+    assert_eq(l.kinds[4], Kind.Punct)
+    assert_eq(l.kinds[5], Kind.Variable)
+    assert_eq(l.kinds[6], Kind.Variable)
+    assert_eq(l.kinds[7], Kind.Plain)
+    assert_eq(l.kinds[11], Kind.Punct)
+    assert_eq(l.kinds[13], Kind.Variable)
+    assert_eq(l.kinds[15], Kind.Number)
+    assert_eq(l.kinds[22], Kind.Number)
+    b := line(Lang.Shell, "x=`pwd` $\{y:-1} $1", 0)
+    assert_eq(b.kinds[2], Kind.Variable)
+    assert_eq(b.kinds[8], Kind.Variable)
+    assert_eq(b.kinds[14], Kind.Variable)
+    assert_eq(b.kinds[17], Kind.Variable)
+
+@test fn shell_heredocs_carry_over()
+    a := line(Lang.Shell, "cat <<EOF > out", 0)
+    assert_eq(a.kinds[4], Kind.Punct)
+    assert_eq(a.kinds[6], Kind.Keyword)
+    assert_eq(a.kinds[10], Kind.Punct)
+    assert_eq(a.state % 4, 3)
+    b := line(Lang.Shell, "hi $USER # not a comment", a.state)
+    assert_eq(b.kinds[0], Kind.Str)
+    assert_eq(b.kinds[3], Kind.Variable)
+    assert_eq(b.kinds[9], Kind.Str)
+    assert_eq(b.state, a.state)
+    c := line(Lang.Shell, "EOF", b.state)
+    assert_eq(c.kinds[0], Kind.Keyword)
+    assert_eq(c.state, 0)
+    q := line(Lang.Shell, "cat <<-'END'", 0)
+    assert_eq(q.kinds[7], Kind.Keyword)
+    r := line(Lang.Shell, "$x", q.state)
+    assert_eq(r.kinds[0], Kind.Str)
+    assert_eq(line(Lang.Shell, "END", r.state).state, 0)
+
+@test fn shell_quotes_carry_over()
+    a := line(Lang.Shell, "echo \"a", 0)
+    assert_eq(a.state, 1)
+    b := line(Lang.Shell, "b $x\" done", a.state)
+    assert_eq(b.kinds[0], Kind.Str)
+    assert_eq(b.kinds[2], Kind.Variable)
+    assert_eq(b.kinds[4], Kind.Str)
+    assert_eq(b.kinds[6], Kind.Keyword)
+    assert_eq(b.state, 0)
+    c := line(Lang.Shell, "echo 'it", 0)
+    assert_eq(c.state, 2)
+    d := line(Lang.Shell, "$x' fi", c.state)
+    assert_eq(d.kinds[0], Kind.Str)
+    assert_eq(d.kinds[4], Kind.Keyword)
+    assert_eq(d.state, 0)
+
+@test fn package_files()
+    p := line(Lang.Pkg, "package ail_edit caps fs # c", 0)
+    assert_eq(p.kinds[0], Kind.Keyword)
+    assert_eq(p.kinds[8], Kind.Variable)
+    assert_eq(p.kinds[17], Kind.Key)
+    assert_eq(p.kinds[22], Kind.Plain)
+    assert_eq(p.kinds[25], Kind.Comment)
+    v := line(Lang.Pkg, "ail 0.1", 0)
+    assert_eq(v.kinds[0], Kind.Keyword)
+    assert_eq(v.kinds[4], Kind.Number)
+    d := line(Lang.Pkg, "dep geo git \"https://x/g.git\" tag v1 commit ab12", 0)
+    assert_eq(d.kinds[0], Kind.Keyword)
+    assert_eq(d.kinds[4], Kind.Variable)
+    assert_eq(d.kinds[8], Kind.Key)
+    assert_eq(d.kinds[12], Kind.Str)
+    assert_eq(d.kinds[30], Kind.Key)
+    assert_eq(d.state, 0)
