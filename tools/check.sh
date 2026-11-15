@@ -9,7 +9,16 @@ have="$(git -C "$ail_dir" rev-parse HEAD)"
 [ "$have" = "$want" ] || { echo "check: $ail_dir is at $have, pinned $want" >&2; exit 2; }
 cd "$here"
 # Drift check: the editor's KEYWORDS must equal the lexer's (lex.kw.1).
-kw() { awk '/^KEYWORDS := \{/{f=1;next} f&&/^\}/{exit} f{gsub(/[ ",]/,"");print}' "$1" | sort; }
+# Reads only the KEYWORDS set (lex.ail has more sets after it); POSIX awk, so it runs on macOS too.
+kw() {
+    awk '/^KEYWORDS := [{]/ { f = 1; next }
+        f && /^[}]/ { exit }
+        f { gsub(/[ \t\r",]/, ""); if ($0 != "" && $0 !~ /^#/) print }' "$1" | LC_ALL=C sort
+}
+if [ "$(kw "$ail_dir/compiler/syntax/lex.ail" | wc -l)" -lt 1 ]; then
+    echo "check: no KEYWORDS set found in $ail_dir/compiler/syntax/lex.ail" >&2
+    exit 1
+fi
 if ! diff <(kw "$ail_dir/compiler/syntax/lex.ail") <(kw edit.ail) >/dev/null; then
     echo "check: KEYWORDS in edit.ail differ from compiler/syntax/lex.ail:" >&2
     diff <(kw "$ail_dir/compiler/syntax/lex.ail") <(kw edit.ail) >&2 || true

@@ -363,26 +363,70 @@ fn indent_of(s str) int
         n += 1
     n
 
-BLOCK_WORDS := "fn if elif else while for par with match struct enum trait impl error"
+BLOCK_WORDS := "fn if elif else while for par with match select unsafe struct enum trait impl error unique"
+
+## The words just before an `if` or `match` whose value a line binds, assigns,
+## returns, yields or gives to an arm, so that it opens a block there
+## (expr.if.1, expr.match.1, expr.yield.2).
+VALUE_LEADS := ":= = += -= *= /= %= &= |= ^= <<= >>= => return yield"
+
+## The index of a line's own first word, past its attributes, `pub`, `defer`
+## (own.defer.1) and a loop's label (expr.loop.9).
+fn head_word(words List[str]) int
+    n := words.len()
+    mut k := 0
+    while k + 1 < n
+        w := words[k]
+        label := w.ends_with(":") and (words[k + 1] == "for" or words[k + 1] == "while")
+        if not (w.starts_with("@") or w == "pub" or w == "defer" or label)
+            break
+        k += 1
+    k
+
+## Whether `word` (`if` or `match`) opens a block on the line of `words`: as
+## the line's own first word, or as the value of a binding, an assignment, a
+## `return`, a `yield` or an arm.
+fn opens_with(words List[str], word str) bool
+    # `if c then a else b` is one expression (expr.if.2) and opens nothing.
+    if words.contains("then")
+        return false
+    if words[head_word(words)] == word
+        return true
+    leads := VALUE_LEADS.split(" ")
+    for i in 1..words.len()
+        if words[i] == word and leads.contains(words[i - 1])
+            return true
+    false
+
+## Whether `w` is a plain name: not a keyword, a number or other text.
+fn is_name(w str) bool
+    cs := w.chars()
+    if cs.len() == 0 or cs[0].is_digit() or KEYWORDS.contains(w)
+        return false
+    for c in cs
+        if not is_word(c)
+            return false
+    true
 
 ## Whether a line opens an indented block (lex.block.1): a declaration or a
-## control-flow header, a `match` arm or `if` value, or `else err`.
+## control-flow header, a `match` or `select` arm, an `if` or `match` value,
+## or `else` and `else err` (err.else.2-3).
 fn opens_block(s str) bool
     t := s.trim()
     if t == "" or t.starts_with("#")
         return false
     words := t.split(" ")
     n := words.len()
-    mut first := words[0]
-    if first.starts_with("@") and n > 1
-        first = words[1]
-    # `par for` (conc.par.5) and `with m as mut x` (conc.share.6) open blocks; contract lines do not.
-    if BLOCK_WORDS.split(" ").contains(first) or t.ends_with("=>")
+    if words.contains("then")
+        return false
+    # `par for` (conc.par.5), `with m as mut x` (conc.share.6), `select` (conc.select.2)
+    # and `unsafe` (unsafe.block.1) open blocks; contract lines do not.
+    if t.ends_with("=>") or BLOCK_WORDS.split(" ").contains(words[head_word(words)])
         return true
-    n >= 2
-        and (words[n - 1] == "else" or words[n - 2] == "else" or words[n - 2] == ":=" and (words[n - 1] == "match" or words[n - 1] == "if"))
-        or t.contains(":= if ")
-        or t.contains(":= match ")
+    if opens_with(words, "if") or opens_with(words, "match")
+        return true
+    # `x := f() else 0` is a whole line (err.else.6); `else err` goes on in a block.
+    words[n - 1] == "else" or n >= 2 and words[n - 2] == "else" and is_name(words[n - 1])
 
 fn Editor.newline(mut self)
     head := lines[line].slice(0, col)
@@ -631,7 +675,7 @@ fn word_marks(cs List[char], word str) List[bool]
     out
 
 ## After typing, a line that now reads `else` or `elif` moves back one level
-## to line up with its `if` (lex.block.1).
+## to line up with its `if`, also an `if` that is a value or deferred (lex.block.1).
 fn Editor.dedent_else(mut self)
     t := lines[line].trim()
     if t != "else" and t != "elif"
@@ -645,7 +689,7 @@ fn Editor.dedent_else(mut self)
     if l < 0 or indent_of(lines[l]) != ind - INDENT
         return
     head := lines[l].trim()
-    if head.starts_with("if ") or head.starts_with("elif ") or head.contains(":= if ")
+    if head.starts_with("elif ") or opens_with(head.split(" "), "if")
         c := col
         edit(line, 0, line, INDENT, "")
         set_col(c - INDENT)
@@ -1289,6 +1333,7 @@ KEYWORDS := {
     "ref",
     "requires",
     "return",
+    "select",
     "self",
     "spawn",
     "struct",
@@ -1300,6 +1345,7 @@ KEYWORDS := {
     "use",
     "while",
     "with",
+    "yield",
 }
 
 ## The end of a quoted literal that starts at `q` (the opening quote),
@@ -1313,6 +1359,69 @@ fn quoted_end(cs List[char], q int, raw bool) int
             j += 1
         j += 1
     (j + 1).min(n)
+
+## Just past the `"` that closes the string starting at `q`, skipping escapes
+## and each `{expression}`, whose code may hold strings and chars of its own
+## (lex.str.2), and its format specification (lex.str.7).
+fn string_end(cs List[char], q int) int
+    n := cs.len()
+    mut j := q + 1
+    while j < n and cs[j] != '"'
+        if cs[j] == '\\'
+            j += 1
+        elif cs[j] == '{'
+            j = interp_close(cs, j)
+        j += 1
+    (j + 1).min(n)
+
+## The `}` that closes the interpolation opened at `open`, or the end of the
+## line when it never closes (lex.str.2).
+fn interp_close(cs List[char], open int) int
+    n := cs.len()
+    mut depth := 0
+    mut k := open
+    while k < n
+        c := cs[k]
+        if c == '{'
+            depth += 1
+        elif c == '}'
+            depth -= 1
+            if depth == 0
+                return k
+        elif c == '"'
+            k = string_end(cs, k) - 1
+        elif c == '\''
+            k = quoted_end(cs, k, false) - 1
+        k += 1
+    n
+
+## Just past the number that starts at `i`: digits, letters and `_` (`0x1f`,
+## `1_000`), a fraction, and an exponent's sign (`1e-3`, lex.num.1-2). After
+## `0x`, `0b` or `0o` a sign is an operator: `0x1e-3` is a subtraction.
+fn number_end(cs List[char], i int) int
+    n := cs.len()
+    prefixed := cs[i] == '0' and i + 1 < n and "xbo".contains(cs[i + 1])
+    mut j := i + 1
+    while j < n
+        c := cs[j]
+        digit_next := j + 1 < n and cs[j + 1].is_digit()
+        if is_word(c) or c == '.' and digit_next
+            j += 1
+        elif not prefixed and "+-".contains(c) and "eE".contains(cs[j - 1]) and digit_next
+            j += 1
+        else
+            break
+    j
+
+## Whether a `r"` or `b"` string starts at `i`, not inside a longer name.
+fn prefixed_quote(cs List[char], i int) bool
+    if i + 1 >= cs.len() or cs[i + 1] != '"' or i > 0 and is_word(cs[i - 1])
+        return false
+    cs[i] == 'r' or cs[i] == 'b'
+
+## Whether `"""` starts at `i`.
+fn starts_triple(cs List[char], i int) bool
+    i + 2 < cs.len() and cs[i] == '"' and cs[i + 1] == '"' and cs[i + 2] == '"'
 
 TRIPLE := "\"\"\""
 
@@ -1370,15 +1479,20 @@ fn colors(cs List[char]) List[int]
         elif c == '"' and i + 2 < n and cs[i + 1] == '"' and cs[i + 2] == '"'
             j = triple_end(cs, i + 3)
             fg = STRING_FG
-        elif c == '"' or c == '\''
+        elif c == '"'
+            j = string_end(cs, i)
+            fg = STRING_FG
+        elif c == '\''
             j = quoted_end(cs, i, false)
             fg = STRING_FG
-        elif c == 'r' and i + 1 < n and cs[i + 1] == '"' and (i == 0 or not is_word(cs[i - 1]))
-            j = quoted_end(cs, i + 1, true)
+        elif prefixed_quote(cs, i)
+            # `r"..."` and `r"""` are raw (lex.str.6); `b"..."` is `bytes` (lex.bytes.1)
+            j = quoted_end(cs, i + 1, c == 'r')
+            if c == 'r' and starts_triple(cs, i + 1)
+                j = triple_end(cs, i + 4)
             fg = STRING_FG
         elif c.is_digit()
-            while j < n and (is_word(cs[j]) or cs[j] == '.' and j + 1 < n and cs[j + 1].is_digit())
-                j += 1
+            j = number_end(cs, i)
             fg = NUMBER_FG
         elif is_word(c) or c == '@'
             while j < n and is_word(cs[j])
@@ -3045,6 +3159,79 @@ fn keys(s str) List[Command]
     assert_eq(ed.lines, ["par for i in 0..3", "    x", "    "])
     ed2 := typed("", keys("with m as mut x\nx\n"))
     assert_eq(ed2.lines, ["with m as mut x", "    x", "    "])
+
+@test fn select_and_yield_are_keywords()
+    for w in ["select", "yield"]
+        assert(KEYWORDS.contains(w))
+    assert_eq(KEYWORDS.len(), 43)
+    assert_eq(colors("select".chars())[0], KEYWORD_FG)
+    y := colors("    yield n".chars())
+    assert_eq(y[4], KEYWORD_FG)
+    assert_eq(y[10], FG)
+    mut texts := List[str]()
+    for c in typed("yi", [Go(End)]).candidates()
+        texts.push(c.text)
+    assert(texts.contains("yield"))
+
+@test fn bit_operators_are_highlighted()
+    # expr.bit.3: `&`, `^`, `~`, `<<`, `>>` and their assignments color as operators
+    b := colors("m := (a & 0xff) ^ ~b << 2 >> 1".chars())
+    for k in [8, 16, 18, 21, 22, 26, 27]
+        assert_eq(b[k], OP_FG)
+    for k in [10, 13, 24, 29]
+        assert_eq(b[k], NUMBER_FG)
+    assert_eq(b[19], FG)
+    a := colors("x <<= 1 # c".chars())
+    assert_eq(a[2], OP_FG)
+    assert_eq(a[4], OP_FG)
+    assert_eq(a[6], NUMBER_FG)
+    assert_eq(a[8], COMMENT_FG)
+
+@test fn literal_forms_are_highlighted()
+    # a string inside `\{...}` doesn't end the outer one (lex.str.2), nor a format spec (lex.str.7)
+    s := colors("p(\"\{xs.join(\", \")} \{n:08}\") # c".chars())
+    for k in [2, 13, 14, 17, 22, 25]
+        assert_eq(s[k], STRING_FG)
+    assert_eq(s[28], COMMENT_FG)
+    # `b"..."` is a `bytes` literal with no interpolation (lex.bytes.1)
+    bs := colors("x := b\"a\{\" # c".chars())
+    assert_eq(bs[5], STRING_FG)
+    assert_eq(bs[9], STRING_FG)
+    assert_eq(bs[11], COMMENT_FG)
+    # `r"""` opens a raw multi-line string (lex.str.6)
+    assert_eq(colors("r\"\"\"a\"b".chars())[6], STRING_FG)
+    # an exponent keeps its sign; after `0x` the `-` subtracts (lex.num.1-2)
+    e := colors("1e-3 + 2.5E+8 - 0x1e-3".chars())
+    for k in [2, 3, 11, 12, 19, 21]
+        assert_eq(e[k], NUMBER_FG)
+    for k in [5, 14, 20]
+        assert_eq(e[k], OP_FG)
+    n := colors("0b1010_0101 1_000".chars())
+    assert_eq(n[10], NUMBER_FG)
+    assert_eq(n[16], NUMBER_FG)
+
+@test fn select_unsafe_and_value_blocks_indent()
+    assert(opens_block("select"))
+    assert(opens_block("    v := ch.recv() =>"))
+    assert(opens_block("    after 100 =>"))
+    assert(not opens_block("    closed => break"))
+    assert(opens_block("unsafe"))
+    assert(opens_block("unsafe fn poke(p *int)"))
+    assert(opens_block("pub fn f()"))
+    assert(opens_block("pub unique struct File"))
+    assert(opens_block("defer if done"))
+    assert(opens_block("outer: for x in xs"))
+    assert(opens_block("return match s"))
+    assert(opens_block("total += if big"))
+    assert(opens_block("    Red => if c"))
+    assert(not opens_block("x := if c then 1 else 2"))
+    assert(not opens_block("x := f() else 0"))
+    assert(not opens_block("yield n * 2"))
+    assert(not opens_block("extern c fn abs(x int) int"))
+    ed := typed("", keys("select\nv := ch.recv() =>\nprint(v)\n"))
+    assert_eq(ed.lines, ["select", "    v := ch.recv() =>", "        print(v)", "        "])
+    ed2 := typed("", keys("total += if big\n1\nelse"))
+    assert_eq(ed2.lines, ["total += if big", "    1", "else"])
 
 @test fn horizontal_and_vertical_scroll()
     mut ed := typed("", [])
