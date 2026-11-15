@@ -30,16 +30,24 @@ fi
 # Every file with @test functions is listed (testdata/ holds fixtures, not tests).
 tested=(
     edit.ail
+    features/acp/acp.ail
     features/agent/agent.ail
     features/ask/ask.ail
     features/diff/diff.ail
+    features/find/find.ail
+    features/hunks/hunks.ail
+    features/nav/nav.ail
     features/probes/probes.ail
     features/semantic/semantic.ail
+    features/syntax/syntax.ail
     features/taskpanel/taskpanel.ail
     features/tests/tests.ail
+    features/textops/textops.ail
+    features/vt/vt.ail
     features/workspace/git.ail
     features/workspace/settings.ail
     features/workspace/welcome.ail
+    features/wrap/wrap.ail
     window/window.ail
 )
 have_tests="$(git ls-files '*.ail' | grep -v '^testdata/' | xargs grep -l '@test' | sort)"
