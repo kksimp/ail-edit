@@ -18,6 +18,10 @@ pub fn rows(themes List[str]) List[Row]
         Row(key: "restore", label: "Reopen tabs at start", choices: ["on", "off"]),
         Row(key: "welcome", label: "Welcome screen", choices: ["on", "off"]),
         Row(key: "gitmarks", label: "Git marks in the tree", choices: ["on", "off"]),
+        Row(key: "surround", label: "Surround selection", choices: ["on", "off"]),
+        Row(key: "trim", label: "Trim spaces on save", choices: ["on", "off"]),
+        Row(key: "finalnewline", label: "Final newline on save", choices: ["on", "off"]),
+        Row(key: "wrap", label: "Word wrap", choices: ["off", "on"]),
     ]
 
 ## The value a setting has when the file doesn't set it.
@@ -26,6 +30,8 @@ pub fn default_of(key str) str
         return "dark"
     if key == "font"
         return "20"
+    if key == "wrap"
+        return "off"
     "on"
 
 ## The choice after `cur` in `r`, wrapping; the first when `cur` isn't one.
@@ -105,13 +111,16 @@ pub fn valid_input(s str) bool
 
 @test fn settings_rows_cycle_and_wrap()
     rs := rows(["dark", "light"])
-    assert_eq(rs.len(), 5)
+    assert_eq(rs.len(), 9)
     assert_eq(next_choice(rs[0], "dark"), "light")
     assert_eq(next_choice(rs[0], "light"), "dark")
     assert_eq(next_choice(rs[0], "neon"), "dark")
     assert_eq(next_choice(rs[1], "20"), "24")
     assert_eq(default_of("font"), "20")
     assert_eq(default_of("welcome"), "on")
+    assert_eq(default_of("surround"), "on")
+    assert_eq(default_of("wrap"), "off")
+    assert_eq(next_choice(rs[8], "off"), "on")
     assert_eq(shown(rs[2], "off"), "Reopen tabs at start     off")
 
 @test fn rebinding_reads_and_translates()

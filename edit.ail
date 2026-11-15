@@ -35,6 +35,8 @@ use features.find
 use features.nav
 use features.syntax
 use features.files as fops
+use features.textops
+use features.wrap
 
 # Colors, 0xRRGGBB.
 BG := 0x1e1e1e
@@ -251,13 +253,12 @@ struct Editor
     hl Highlight
     ## The file on disk: changed under unsaved edits, Ctrl-S armed, deleted (P8).
     disk fops.Disk
+    ## Text commands, line endings and word wrap (parity C6, features/textops, features/wrap).
+    tx EditOps
 
 fn Editor.new(path str, text str, cols int, rows int) Editor
-    mut lines := text.split("\n")
-    if lines.len() > 1 and lines[lines.len() - 1] == ""
-        lines.pop()
-    if lines.len() == 0
-        lines.push("")
+    # Lines are held without `\r`; the file's ending comes back on save (C6).
+    lines := textops.split_lines(text)
     Editor(
         path: path,
         lines: lines,
@@ -310,6 +311,7 @@ fn Editor.new(path str, text str, cols int, rows int) Editor
         findbar: FindBar.new(),
         hl: Highlight.new(path),
         disk: fops.new_disk(),
+        tx: EditOps.new(textops.detect_eol(text)),
     )
 
 ## The buffer as file text: lines joined with `\n`, ending with one.
@@ -1297,6 +1299,8 @@ fn Editor.move_to_line(mut self, l int)
     self.col = self.goal.min(self.lines[self.line].len())
 
 fn Editor.go(mut self, d Dir)
+    if self.tx.prefs.wrapping and self.wrap_go(d)
+        return
     n := self.lines[self.line].len()
     match d
         Left =>
@@ -1367,6 +1371,8 @@ fn Editor.scroll(mut self)
         self.left = self.col
     if self.col >= self.left + w
         self.left = self.col - w + 1
+    if self.tx.prefs.wrapping
+        self.wrap_scroll()
 
 fn Editor.gutter_width(self) int
     "{self.lines.len()}".len().max(3) + 1
@@ -1694,6 +1700,8 @@ fn Editor.render_notes(self, mut s Screen, h int, gw int)
             s.put(row, col_at, "=> {note}", GUTTER_FG, BG)
 
 fn Editor.render(self) Screen
+    if self.tx.prefs.wrapping
+        return self.render_wrapped()
     mut s := Screen.new(self.cols, self.rows)
     h := self.text_rows()
     gw := self.gutter_width()
@@ -1867,6 +1875,8 @@ fn Editor.render(self) Screen
     used := left_part.chars().len() + 4 + self.message.chars().len()
     if self.extra.len() > 0
         trail = "{self.extra.len() + 1} carets  {trail}"
+    if self.tx.eol == textops.Eol.Crlf
+        trail = "CRLF  {trail}".trim_end()
     if trail != "" and used + trail.chars().len() + 2 < self.cols
         s.put(status_row, self.cols - trail.chars().len() - 1, trail, STATUS_FG, STATUS_BG)
     self.render_pane(mut s, status_row + 1)
@@ -2214,6 +2224,8 @@ fn Editor.depth(mut self, act str)
         self.select_word()
     elif act == "line"
         self.select_line()
+    else
+        self.text_command(act)
 
 # ---- Commands -----------------------------------------------------------
 
@@ -2276,6 +2288,9 @@ fn Editor.apply(mut self, cmd Command)
         self.scroll()
         return
     if self.extra.len() > 0 and self.multi_key(cmd)
+        self.scroll()
+        return
+    if self.text_key(cmd)
         self.scroll()
         return
     match cmd
@@ -2603,6 +2618,8 @@ fn key_command(key str, ctrl bool, alt bool, shift bool) Command?
     if alt and (key == "r" or key == "R")
         return ToggleRegex
     if ctrl
+        if alt and (key == "up" or key == "down")
+            return Depth("box_{key}")
         return match key
             "s" | "S" => Save
             "q" | "Q" => Quit
@@ -2629,8 +2646,14 @@ fn key_command(key str, ctrl bool, alt bool, shift bool) Command?
             "end" => go_or_select(Bottom, shift)
             "left" => go_or_select(WordLeft, shift)
             "right" => go_or_select(WordRight, shift)
+            "j" | "J" => Depth("join")
+            "l" | "L" => Depth("select_line")
             _ => none
     if alt
+        if shift and key == "right"
+            return Depth("expand")
+        if shift and key == "left"
+            return Depth("shrink")
         return match key
             "up" => alt_vertical(false, shift)
             "down" => alt_vertical(true, shift)
@@ -2638,7 +2661,7 @@ fn key_command(key str, ctrl bool, alt bool, shift bool) Command?
             _ => none
     match key
         "enter" => Newline
-        "tab" => Tab
+        "tab" => if shift then Depth("shift_tab") else Tab
         "backspace" => Backspace
         "delete" => Delete
         "escape" => Escape
@@ -2777,9 +2800,10 @@ fn Editor.save(mut self)
         self.disk.armed = true
         self.message = "{base_name(self.path)} changed on disk: Ctrl-S again overwrites it (palette: Compare with disk, Revert file)"
         return
+    self.tidy_for_save()
     if self.is_ail()
         self.format()
-    fs.write_text(self.path, self.text()) else err
+    fs.write_text(self.path, self.file_text()) else err
         self.message = "can't save {err.path}: {err.kind}"
         return
     self.dirty = false
@@ -4649,6 +4673,8 @@ fn Editor.with_system_clipboard(mut self, cmd Command)
 ## The buffer position under screen cell (`c`, `r`), or `none` outside the
 ## text rows.
 fn Editor.position_at(self, c int, r int) Range?
+    if self.tx.prefs.wrapping
+        return self.wrap_position_at(c, r)
     if r < 0 or r >= self.text_rows() or self.lines.len() == 0
         return none
     mut l := self.row_line(r)
@@ -5537,6 +5563,123 @@ fn key_rows() List[KeyRow]
             "",
             "In the focused tree: delete, pressed twice (three times for a folder that is not empty); open tabs stay, marked deleted",
         ),
+        key_row(
+            "Ctrl-J",
+            "Join lines",
+            "ctrl+j",
+            "Join the selected lines, or this line and the next, with one space",
+        ),
+        key_row(
+            "Ctrl-L",
+            "Select line",
+            "ctrl+l",
+            "Select the line (or the selected lines); again, take in the next line too",
+        ),
+        key_row(
+            "Alt-Shift-Right",
+            "Expand selection",
+            "alt+shift+right",
+            "Grow the selection: the word, the inside of the brackets, the brackets, the indentation block, the block with its header",
+        ),
+        key_row(
+            "Alt-Shift-Left",
+            "Shrink selection",
+            "alt+shift+left",
+            "Go back one expand step; any other command forgets the steps",
+        ),
+        key_row(
+            "Ctrl-Alt-Up",
+            "Box select up",
+            "ctrl+alt+up",
+            "Box (column) selection: a caret at the same column on the line above, one per line",
+        ),
+        key_row(
+            "Ctrl-Alt-Down",
+            "Box select down",
+            "ctrl+alt+down",
+            "Box (column) selection: a caret at the same column on the line below, one per line",
+        ),
+        key_row(
+            "Alt-Shift-drag",
+            "",
+            "",
+            "Box selection with the mouse: one selection per line between the two columns (window)",
+        ),
+        key_row(
+            "Shift-Tab",
+            "",
+            "",
+            "With a selection over several lines, outdent them by 4; Tab indents them",
+        ),
+        key_row(
+            "`(` `[` `\{` `\"` `'` with a selection",
+            "",
+            "",
+            "Surround the selection with the pair, keeping it selected (setting `surround`)",
+        ),
+        key_row(
+            "Alt-Z",
+            "Toggle word wrap",
+            "alt+z",
+            "Wrap long lines at the window's width in every tab (setting `wrap`); Up/Down and Home/End move by screen row",
+        ),
+        key_row(
+            "palette",
+            "Sort lines ascending",
+            "",
+            "Sort the selected lines (all lines without a selection)",
+        ),
+        key_row("palette", "Sort lines descending", "", "Sort the selected lines, largest first"),
+        key_row(
+            "palette",
+            "Sort lines unique",
+            "",
+            "Sort the selected lines, each distinct line once",
+        ),
+        key_row(
+            "palette",
+            "Reverse lines",
+            "",
+            "Reverse the order of the selected lines (all lines without a selection)",
+        ),
+        key_row(
+            "palette",
+            "Upper case",
+            "",
+            "Upper-case the selection, or the word at the caret (every caret)",
+        ),
+        key_row(
+            "palette",
+            "Lower case",
+            "",
+            "Lower-case the selection, or the word at the caret (every caret)",
+        ),
+        key_row(
+            "palette",
+            "Title case",
+            "",
+            "Title-case the selection, or the word at the caret (every caret)",
+        ),
+        key_row("palette", "Delete line", "", "Delete the line or the selected lines"),
+        key_row(
+            "palette",
+            "Transpose characters",
+            "",
+            "Swap the characters around the caret (every caret)",
+        ),
+        key_row("palette", "Indent lines", "", "Indent the line or the selected lines by 4"),
+        key_row(
+            "palette",
+            "Outdent lines",
+            "",
+            "Outdent the line or the selected lines by up to 4",
+        ),
+        key_row(
+            "palette",
+            "Toggle line endings",
+            "",
+            "Switch the file between LF and CRLF line endings, written on the next save; the status row shows `CRLF` for a CRLF file",
+        ),
     ]
 
 ## The README's key table (`--keys`).
@@ -5612,6 +5755,7 @@ enum WsKey
     Diff(kind str)
     SaveAs
     SaveAll
+    WordWrap
 
 fn workspace_key(k str, ctrl bool, alt bool, shift bool) WsKey?
     if alt and shift and not ctrl
@@ -5636,6 +5780,8 @@ fn workspace_key(k str, ctrl bool, alt bool, shift bool) WsKey?
             return AffectedTests
         if k == "f12" and shift
             return References
+        if alt and not shift and (k == "z" or k == "Z")
+            return WordWrap
         return none
     if k == "tab"
         if shift
@@ -5800,6 +5946,18 @@ fn Workspace.run_command(mut self, name str)
         "Revert file" => self.revert_file()
         "Compare with disk" => self.compare_with_disk()
         "Open folder" => self.open_folder_command()
+        "Sort lines ascending" => self.eds[self.active].run(Depth("sort_asc"))
+        "Sort lines descending" => self.eds[self.active].run(Depth("sort_desc"))
+        "Sort lines unique" => self.eds[self.active].run(Depth("sort_unique"))
+        "Reverse lines" => self.eds[self.active].run(Depth("reverse"))
+        "Upper case" => self.eds[self.active].run(Depth("upper"))
+        "Lower case" => self.eds[self.active].run(Depth("lower"))
+        "Title case" => self.eds[self.active].run(Depth("title"))
+        "Delete line" => self.eds[self.active].run(Depth("delete_line"))
+        "Transpose characters" => self.eds[self.active].run(Depth("transpose"))
+        "Indent lines" => self.eds[self.active].run(Depth("indent"))
+        "Outdent lines" => self.eds[self.active].run(Depth("outdent"))
+        "Toggle line endings" => self.eds[self.active].run(Depth("eol"))
         _ => self.message = "no command `{name}`"
 
 ## The "New file" palette row: the file picker, with a hint.
@@ -5893,6 +6051,8 @@ struct Workspace
     nav_state NavState
     ## File commands and hot exit (features/files, parity P8).
     filing fops.State
+    ## Surround, trim and final newline on save, word wrap (parity C6); copied to every tab.
+    tprefs TextPrefs
 
 fn Workspace.new(ed Editor) Workspace
     Workspace(
@@ -5947,6 +6107,7 @@ fn Workspace.new(ed Editor) Workspace
         ptr: pointer.Sizes(treew: 0, paneh: 0),
         nav_state: NavState.new(),
         filing: fops.new_state(),
+        tprefs: TextPrefs.new(),
     )
 
 ## The file name a tab shows: the path after its last `/`.
@@ -5985,6 +6146,7 @@ fn Workspace.open(mut self, path str)
     ed.pane_h = self.ptr.paneh
     self.eds.push(ed)
     self.active = self.eds.len() - 1
+    self.sync_text_prefs()
 
 ## Closes the active tab, asking first if it has unsaved changes. The
 ## workspace quits when the last tab closes.
@@ -6044,6 +6206,7 @@ fn event_spec(ev ui.Event) str?
         Resize(_, _) | Close | Mouse(_, _, _, _) | Scroll(_) => none
 
 fn Workspace.dispatch(mut self, ev ui.Event)
+    self.sync_text_prefs()
     if self.welcome
         if self.welcome_event(ev)
             return
@@ -6129,6 +6292,7 @@ fn Workspace.dispatch(mut self, ev ui.Event)
                             self.eds[self.active].tests = ""
                     SaveAs => self.start_save_as()
                     SaveAll => self.save_all()
+                    WordWrap => self.toggle_wrap()
                 return
             saves := self.eds[self.active].saves
             self.eds[self.active].on_event(ev)
@@ -7457,7 +7621,7 @@ fn Workspace.agent_poll(mut self, now int)
         p := self.watch.poll(self.eds[i].path, self.eds[i].lines, self.eds[i].dirty) else continue
         if p.reload
             mut e := self.eds[i]
-            e.lines = p.lines
+            e.lines = without_cr(p.lines)
             e.line = e.line.min(e.lines.len() - 1)
             e.set_col(e.col.min(e.cur().len()))
             e.indexed = false
@@ -7488,6 +7652,9 @@ fn Workspace.agent_marks(self, mut s Screen)
         return
     ed := self.eds[self.active]
     x0 := self.left()
+    # Off with word wrap: the marks follow buffer rows (parity C6).
+    if ed.tx.prefs.wrapping
+        return
     for r in 0..ed.text_rows()
         l := ed.top + r
         if r + 1 < self.rows and self.watch.marked(ed.path, l)
@@ -8091,6 +8258,7 @@ fn Workspace.cycle_setting(mut self, i int)
         self.refresh_git()
     self.set_pref(r.key, chosen)
     self.message = "{r.label}: {chosen}"
+    self.read_text_prefs()
 
 ## Loads the settings file's text: rebindings, git marks, and the font
 ## unless the start flags gave one.
@@ -8102,6 +8270,7 @@ fn Workspace.load_prefs(mut self)
     self.binds = workspace.binds(self.prefs)
     self.gitmarks = self.value_of("gitmarks") == "on"
     self.load_sizes()
+    self.read_text_prefs()
 
 ## The marks `git status` gives the tree's files; empty when marks are off
 ## or this isn't a git checkout.
@@ -8330,7 +8499,10 @@ fn Workspace.window(mut self) ! ui.UiError
 fn Workspace.on_window_event(mut self, ev ui.Event, m ui.Modifiers)
     shift_click := match ev
         Mouse(c, r, button, kind) =>
-            if m.alt and not self.picking and button == Left and kind == Down and r > 0
+            if m.alt and m.shift and not self.picking and button == Left and kind != Up and r > 0
+                self.box_mouse(c, r, kind == Down)
+                true
+            elif m.alt and not self.picking and button == Left and kind == Down and r > 0
                 self.eds[self.active].add_caret_at(c - self.left(), r - 1)
                 true
             elif m.shift and not self.picking and button == Left and kind == Down and r > 0
@@ -11069,6 +11241,878 @@ fn prompt_enter(mut ws Workspace, s str)
     prompt_enter(mut ws, d)
     assert_eq(ws.tree_root, d)
     fops.remove_tree(d)?
+# ---- Text commands, line endings and word wrap (parity P10) ----
+# Gap row C6: features/textops and features/wrap wired in. The commands are
+# `Depth` acts that `Editor.depth` hands to `Editor.text_command`.
+
+## The text options the settings rows and Alt-Z set (C6); the workspace
+## copies them to every tab.
+struct TextPrefs
+    surround bool
+    trim bool
+    finalnl bool
+    wrapping bool
+
+fn TextPrefs.new() TextPrefs
+    TextPrefs(surround: true, trim: true, finalnl: true, wrapping: false)
+
+## An editor's text-command state: its options, the expand steps and the
+## selection the last step made, the file's line ending, the screen column
+## Up and Down keep under word wrap (and where the caret was when it was
+## set), and the box selection's anchor, head and caret count.
+struct EditOps
+    prefs TextPrefs
+    expand textops.ExpandStack
+    last textops.Sel
+    eol textops.Eol
+    vgoal int
+    vgoal_line int
+    vgoal_col int
+    box_on bool
+    box_line int
+    box_col int
+    box_head_line int
+    box_head_col int
+    box_n int
+
+fn EditOps.new(ending textops.Eol) EditOps
+    EditOps(
+        prefs: TextPrefs.new(),
+        expand: textops.ExpandStack.new(),
+        last: textops.caret(-1, -1),
+        eol: ending,
+        vgoal: -1,
+        vgoal_line: -1,
+        vgoal_col: -1,
+        box_on: false,
+        box_line: 0,
+        box_col: 0,
+        box_head_line: 0,
+        box_head_col: 0,
+        box_n: 0,
+    )
+
+## The buffer as the file is written: each line ended with the file's own
+## line ending.
+fn Editor.file_text(self) str
+    textops.join_with(self.lines, self.tx.eol)
+
+## `ls` without a `\r` at the end of any line (a CRLF file read again).
+fn without_cr(ls List[str]) List[str]
+    mut out := List[str]()
+    for l in ls
+        out.push(l.strip_suffix("\r") else l)
+    out
+
+## The selection, else the caret, as a `textops.Sel`.
+fn Editor.sel_now(self) textops.Sel
+    r := self.selection() else return textops.caret(self.line, self.col)
+    textops.sel(r.line, r.col, r.end_line, r.end_col)
+
+## Makes `s` the selection: the anchor at its start, the caret at its end.
+fn Editor.take_sel(mut self, s textops.Sel)
+    self.selecting = not textops.empty(s)
+    self.anchor_line = s.line
+    self.anchor_col = s.col
+    self.line = s.end_line
+    self.set_col(s.end_col)
+
+## Makes an edit the buffer, as one undo step (none when nothing changed).
+fn Editor.take_edit(mut self, e textops.Edit)
+    if e.lines != self.lines
+        self.snapshot()
+        self.lines = e.lines
+        self.folded = fold.prune(self.lines, self.folded)
+    self.take_sel(textops.clamp(self.lines, e.sel))
+
+## Whether the selection covers more than one line.
+fn Editor.spans_lines(self) bool
+    r := self.selection() else return false
+    r.line != r.end_line
+
+## The opener `cmd` types, when it is one that `textops.surround` takes.
+fn surround_opener(cmd Command) str?
+    for o in "([\{\"'`".chars()
+        if cmd == Insert("{o}")
+            return "{o}"
+    none
+
+## Before `Editor.apply`'s own arms (C6): any command but expand and shrink
+## forgets the expand steps; Tab over a selection of several lines indents
+## them; an opener typed over a selection surrounds it (setting `surround`).
+## True if `cmd` was used here.
+fn Editor.text_key(mut self, cmd Command) bool
+    if self.tx.expand.steps.len() > 0 and cmd != Depth("expand") and cmd != Depth("shrink")
+        self.tx.expand = textops.ExpandStack.new()
+    if cmd == Tab and self.spans_lines()
+        self.take_edit(textops.indent_lines(self.lines, self.sel_now()))
+        return true
+    if not self.tx.prefs.surround or self.selection() == none
+        return false
+    o := surround_opener(cmd) else return false
+    self.take_edit(textops.surround(self.lines, self.sel_now(), o))
+    true
+
+## The edit a line or character command makes on `ls` at `s`; `none` for
+## an act that isn't one.
+fn line_edit(ls List[str], s textops.Sel, act str) textops.Edit?
+    match act
+        "join" => textops.join_lines(ls, s)
+        "sort_asc" => textops.sort_lines(ls, s, textops.Order.Ascending)
+        "sort_desc" => textops.sort_lines(ls, s, textops.Order.Descending)
+        "sort_unique" => textops.sort_lines(ls, s, textops.Order.Unique)
+        "reverse" => textops.reverse_lines(ls, s)
+        "delete_line" => textops.delete_lines(ls, s)
+        "indent" => textops.indent_lines(ls, s)
+        "outdent" => textops.outdent_lines(ls, s)
+        "upper" => textops.change_case(ls, s, textops.Case.Upper)
+        "lower" => textops.change_case(ls, s, textops.Case.Lower)
+        "title" => textops.change_case(ls, s, textops.Case.Title)
+        "transpose" => textops.transpose(ls, s)
+        _ => none
+
+## The text commands (C6) as `Depth` acts: the line and character edits of
+## `line_edit`, select line, expand and shrink, box selection, Shift-Tab and
+## the line ending. Case changes and transpose act at every caret; the other
+## commands drop the extra carets first. Each edit is one undo step.
+fn Editor.text_command(mut self, act str)
+    if act == "box_up" or act == "box_down"
+        self.box_key(if act == "box_up" then -1 else 1)
+        return
+    if act == "shift_tab"
+        if self.extra.len() == 0 and self.spans_lines()
+            self.take_edit(textops.outdent_lines(self.lines, self.sel_now()))
+        else
+            self.apply(Tab)
+        return
+    every := act == "upper" or act == "lower" or act == "title" or act == "transpose"
+    if every and self.extra.len() > 0
+        self.each_caret(act)
+        return
+    self.extra = []
+    s := self.sel_now()
+    if act == "select_line"
+        self.take_sel(textops.select_line(self.lines, s))
+    elif act == "expand"
+        self.expand_step(s)
+    elif act == "shrink"
+        self.shrink_step(s)
+    elif act == "eol"
+        self.switch_eol()
+    else
+        e := line_edit(self.lines, s, act) else
+            self.message = "no command `{act}`"
+            return
+        self.take_edit(e)
+
+## A case change or transpose at every caret, the last caret first so an
+## edit never moves the carets still to come; one undo step.
+fn Editor.each_caret(mut self, act str)
+    all := multi.prepare(self.main_caret(), self.extra)
+    mut ls := self.lines
+    mut out := List[multi.Caret]()
+    mut k := all.len() - 1
+    while k >= 0
+        c := all[k]
+        s := textops.sel(
+            multi.start_line(c),
+            multi.start_col(c),
+            multi.end_line(c),
+            multi.end_col(c),
+        )
+        if e := line_edit(ls, s, act)
+            ls = e.lines
+            out.push(multi.span(e.sel.line, e.sel.col, e.sel.end_line, e.sel.end_col, c.tag))
+        k -= 1
+    if ls == self.lines
+        self.set_carets(out)
+        return
+    self.multi_apply(multi.Edited(lines: ls, carets: out))
+
+## Alt-Shift-Right: the next larger selection (word, bracket inside, pair,
+## block), remembered for shrink.
+fn Editor.expand_step(mut self, s textops.Sel)
+    if self.tx.last != s
+        self.tx.expand = textops.ExpandStack.new()
+    mut st := self.tx.expand
+    grown := st.grow(self.lines, s)
+    self.tx.expand = st
+    self.tx.last = grown
+    self.take_sel(grown)
+
+## Alt-Shift-Left: the selection before the last expand step.
+fn Editor.shrink_step(mut self, s textops.Sel)
+    if self.tx.last != s or self.tx.expand.steps.len() == 0
+        self.message = "nothing to shrink"
+        return
+    mut st := self.tx.expand
+    back := st.shrink(s)
+    self.tx.expand = st
+    self.tx.last = back
+    self.take_sel(back)
+
+fn eol_name(e textops.Eol) str
+    if e == textops.Eol.Crlf then "CRLF" else "LF"
+
+## The palette's "Toggle line endings": LF to CRLF and back, written on the
+## next save.
+fn Editor.switch_eol(mut self)
+    if self.tx.eol == textops.Eol.Crlf
+        self.tx.eol = textops.Eol.Lf
+    else
+        self.tx.eol = textops.Eol.Crlf
+    self.dirty = true
+    self.message = "line endings {eol_name(self.tx.eol)}; Ctrl-S writes them"
+
+## Before a save (C6), as the `trim` and `finalnewline` settings say:
+## trailing whitespace removed and the empty lines at the end dropped (the
+## file still ends with one line ending); one undo step.
+fn Editor.tidy_for_save(mut self)
+    mut out := self.lines
+    if self.tx.prefs.trim
+        out = textops.trim_trailing(out).lines
+    if self.tx.prefs.finalnl
+        out = textops.final_newline(out)
+    if out == self.lines
+        return
+    self.snapshot()
+    self.lines = out
+    self.folded = fold.prune(self.lines, self.folded)
+    self.selecting = false
+    self.line = self.line.min(self.lines.len() - 1)
+    self.set_col(self.col.min(self.cur().len()))
+
+# ---- Box selection (C6) ----
+
+## Box selection from the anchor in `tx` to (`hl`, `hc`): one selection per
+## line between the two columns, as carets of features/multi, the one on
+## line `hl` the main caret. A box with no width keeps short lines (a caret
+## at their end); a wider one leaves out lines shorter than its left edge.
+fn Editor.box_to(mut self, hl int, hc int)
+    short := hc == self.tx.box_col
+    rs := textops.box_ranges(self.lines, self.tx.box_line, self.tx.box_col, hl, hc, short)
+    if rs.len() == 0
+        return
+    mut main_at := rs.len() - 1
+    for i in 0..rs.len()
+        if rs[i].line == hl
+            main_at = i
+    mut cs := List[multi.Caret]()
+    for i in 0..rs.len()
+        b := rs[i]
+        cs.push(multi.span(b.line, b.col, b.end_line, b.end_col, if i == main_at then 1 else 0))
+    self.set_carets(cs)
+    self.tx.box_on = true
+    self.tx.box_head_line = hl
+    self.tx.box_head_col = hc
+    self.tx.box_n = cs.len()
+
+## Ctrl-Alt-Up and Ctrl-Alt-Down (`d` -1 or 1): the box grows or shrinks by
+## a line at its head; a new box starts at the caret.
+fn Editor.box_key(mut self, d int)
+    same_head := self.tx.box_on and self.line == self.tx.box_head_line
+    going := same_head and self.extra.len() + 1 == self.tx.box_n
+    if not going
+        self.tx.box_line = self.line
+        self.tx.box_col = self.col
+        self.tx.box_head_line = self.line
+        self.tx.box_head_col = self.col
+    hl := self.tx.box_head_line + d
+    if hl < 0 or hl >= self.lines.len()
+        self.message = "no line there"
+        return
+    self.box_to(hl, self.tx.box_head_col)
+    self.message = "{self.extra.len() + 1} carets"
+
+## An Alt-Shift press (`start`) or drag at text cell (`c`, `r`): a box from
+## the press to here. Columns past a line's end count.
+fn Editor.box_drag(mut self, c int, r int, start bool)
+    p := self.position_at(c, r) else return
+    vc := (self.left + c - self.gutter_width()).max(0)
+    if start or not self.tx.box_on
+        self.tx.box_line = p.line
+        self.tx.box_col = vc
+    self.box_to(p.line, vc)
+
+## A box-selection press or drag at window cell (`c`, `r`), below the tab
+## row and right of the tree.
+fn Workspace.box_mouse(mut self, c int, r int, start bool)
+    if r < 1 or c < self.left()
+        return
+    self.eds[self.active].box_drag(c - self.left(), r - 1, start)
+
+# ---- Settings and word wrap (C6) ----
+
+## The text options from the settings, given to every tab.
+fn Workspace.read_text_prefs(mut self)
+    self.tprefs = TextPrefs(
+        surround: self.value_of("surround") == "on",
+        trim: self.value_of("trim") == "on",
+        finalnl: self.value_of("finalnewline") == "on",
+        wrapping: self.value_of("wrap") == "on",
+    )
+    self.sync_text_prefs()
+
+## Gives every tab the workspace's text options.
+fn Workspace.sync_text_prefs(mut self)
+    for i in 0..self.eds.len()
+        if self.eds[i].tx.prefs != self.tprefs
+            mut e := self.eds[i]
+            e.tx.prefs = self.tprefs
+            self.eds[i] = e
+
+## Alt-Z: word wrap on or off in every tab for this session; the `wrap`
+## setting gives the start value.
+fn Workspace.toggle_wrap(mut self)
+    self.tprefs.wrapping = not self.tprefs.wrapping
+    self.sync_text_prefs()
+    self.eds[self.active].scroll()
+    self.message = "word wrap {on_off(self.tprefs.wrapping)}"
+
+## The lines on screen laid out for word wrap: the buffer line of each laid
+## out line (folded lines left out) from the top of the view, as many as
+## could fill it, and their `wrap.Layout`.
+struct WrapView
+    ids List[int]
+    lay wrap.Layout
+
+## Where (`l`, `c`) is drawn, when line `l` is laid out.
+fn WrapView.at(self, l int, c int) wrap.VPos?
+    i := self.ids.index_of(l) else return none
+    self.lay.to_visual(i, c)
+
+## The text columns a wrapped row has.
+fn Editor.wrap_width(self) int
+    (self.cols - self.gutter_width()).max(1)
+
+fn Editor.wrap_view(self) WrapView
+    ht := fold.hidden(self.lines, self.folded)
+    first_row := fold.rank(ht, self.top)
+    mut ids := List[int]()
+    mut texts := List[str]()
+    for k in 0..self.text_rows()
+        l := fold.nth(ht, first_row + k)
+        if l < 0
+            break
+        ids.push(l)
+        texts.push(self.lines[l])
+    WrapView(ids: ids, lay: wrap.Layout.build(texts, self.wrap_width()))
+
+## The buffer position under text cell (`c`, `r`) under word wrap
+## (`Layout.to_buffer`), or `none` outside the text rows.
+fn Editor.wrap_position_at(self, c int, r int) Range?
+    if r < 0 or r >= self.text_rows()
+        return none
+    v := self.wrap_view()
+    if v.ids.len() == 0
+        return none
+    p := v.lay.to_buffer(r, c - self.gutter_width())
+    at := v.ids[p.line]
+    Range(line: at, col: p.col, end_line: at, end_col: p.col)
+
+## Up, Down, Home and End under word wrap: Up and Down move one screen row
+## and keep the screen column (`Layout.move_row`; with folds they move by
+## line), Home and End go to the screen row's start and end, and pressed
+## there act as without wrap. False when the plain move applies.
+fn Editor.wrap_go(mut self, d Dir) bool
+    vertical := d == Dir.Up or d == Dir.Down
+    if not vertical and d != Dir.Home and d != Dir.End
+        return false
+    if vertical and self.folded.len() > 0
+        return false
+    a := (self.line - 1).max(0)
+    b := (self.line + 1).min(self.lines.len() - 1)
+    lay := wrap.Layout.build(self.lines[a..b + 1], self.wrap_width())
+    li := self.line - a
+    if vertical
+        mut g := -1
+        if self.tx.vgoal_line == self.line and self.tx.vgoal_col == self.col
+            g = self.tx.vgoal
+        moved := lay.move_row(li, self.col, g, if d == Dir.Down then 1 else -1)
+        self.line = a + moved.line
+        self.col = moved.col
+        self.tx.vgoal = moved.goal
+        self.tx.vgoal_line = self.line
+        self.tx.vgoal_col = self.col
+        return true
+    rr := lay.row_range(lay.to_visual(li, self.col).row)
+    if d == Dir.Home
+        if rr.col == 0 or self.col == rr.col
+            return false
+        self.set_col(rr.col)
+        return true
+    if rr.end_col >= self.lines[self.line].len() or self.col == rr.end_col - 1
+        return false
+    self.set_col((rr.end_col - 1).max(rr.col))
+    true
+
+## Under word wrap the view scrolls by whole buffer lines until the caret's
+## screen row is on screen; the top line may be a wrapped one. `left` stays 0.
+fn Editor.wrap_scroll(mut self)
+    self.left = 0
+    h := self.text_rows()
+    w := self.wrap_width()
+    ht := fold.hidden(self.lines, self.folded)
+    mut count := wrap.Layout.build([self.lines[self.line]], w).to_visual(0, self.col).row
+    for l in self.top..self.line
+        if not ht[l]
+            count += wrap.rows(self.lines[l], w, true).len()
+    while count >= h and self.top < self.line
+        if not ht[self.top]
+            count -= wrap.rows(self.lines[self.top], w, true).len()
+        self.top += 1
+
+## The screen under word wrap (C6). The plain render gives the status row
+## and the pane; the text rows come from `wrap.Layout`, continuation rows
+## hanging, the line number only on a line's first row. The fold count,
+## probe notes and diagnostic messages follow a line's last row. Inlay
+## hints, the code lens, the sticky header and agent marks are off while
+## wrapping.
+fn Editor.render_wrapped(self) Screen
+    mut plain := self
+    plain.tx.prefs.wrapping = false
+    base := plain.render()
+    h := self.text_rows()
+    gw := self.gutter_width()
+    mut s := Screen.new(self.cols, self.rows)
+    for sp in base.spans
+        if sp.row >= h
+            s.spans.push(sp)
+    for r in h..base.text.len()
+        s.text[r] = base.text[r]
+    v := self.wrap_view()
+    mut n_rows := v.lay.visual_rows().min(h)
+    if v.ids.len() == 0
+        n_rows = 0
+    sel := self.selection()
+    here := self.word_here()
+    mut extra_sel := List[Range]()
+    for c in self.extra
+        extra_sel.push(Range(
+            line: multi.start_line(c),
+            col: multi.start_col(c),
+            end_line: multi.end_line(c),
+            end_col: multi.end_col(c),
+        ))
+    mut inside := false
+    for l in 0..self.top.min(self.lines.len())
+        if self.lines[l].contains(TRIPLE)
+            inside = ends_in_triple(self.lines[l].chars(), inside)
+    mut depth := 0
+    mut scanned := 0
+    mut at_line := -1
+    mut cs := List[char]()
+    mut fgs := List[int]()
+    mut bgs := List[int]()
+    mut bg := BG
+    for r in 0..n_rows
+        rr := v.lay.row_range(r)
+        l := v.ids[rr.line]
+        if rr.line != at_line
+            at_line = rr.line
+            cs = self.lines[l].chars()
+            starts_inside := inside
+            if self.lines[l].contains(TRIPLE)
+                inside = ends_in_triple(cs, inside)
+            while scanned < l
+                depth = pairs.scan(self.lines[scanned], depth).depth
+                scanned += 1
+            sc := pairs.scan(self.lines[l], depth)
+            depth = sc.depth
+            scanned = l + 1
+            bg = if l == self.line then LINE_BG else BG
+            fgs = line_colors(cs, starts_inside)
+            if self.layer.level > 0
+                fgs = sem.recolor(cs, fgs, self.layer.kinds, layer_colors())
+            marks := word_marks(cs, here)
+            bgs = List[int]()
+            for k in 0..cs.len()
+                mut cell := bg
+                if marks[k]
+                    cell = OCCUR_BG
+                mut shade := sel_bg(sel, l, k, diag_bg(self.diags, l, k, cell))
+                for xr in extra_sel
+                    shade = sel_bg(xr, l, k, shade)
+                bgs.push(shade)
+                if sc.levels[k] > 0
+                    fgs[k] = PAIR_FGS[(sc.levels[k] - 1) % PAIR_FGS.len()]
+        if l == self.line
+            s.band(r, bg)
+        num := "{l + 1}".pad_left(gw - 1, ' ')
+        if rr.col > 0
+            s.put(r, 0, " ".repeat(gw), GUTTER_FG, bg)
+        elif self.missed.contains(l)
+            s.put(r, 0, "{num}!", ERROR_FG, bg)
+        elif self.folded.contains(l)
+            s.put(r, 0, "{num}>", GUTTER_FG, bg)
+        elif self.git_marks.contains(l)
+            s.put(r, 0, "{num}+", COMMENT_FG, bg)
+        elif self.impact.contains(l)
+            s.put(r, 0, "{num}~", WARN_FG, bg)
+        else
+            s.put(r, 0, "{num} ", GUTTER_FG, bg)
+        x0 := gw + rr.hang
+        end := rr.end_col.min(rr.col + (self.cols - x0).max(0))
+        mut i := rr.col
+        while i < end
+            fg := fgs[i]
+            b := bgs[i]
+            mut j := i + 1
+            while j < end and fgs[j] == fg and bgs[j] == b
+                j += 1
+            s.put(r, x0 + i - rr.col, cs[i..j].join(""), fg, b)
+            i = j
+        if rr.col == 0 and cs.len() > 0 and cs[0] == ' '
+            mut g := 0
+            while g < indent_of(self.lines[l])
+                if gw + g < self.cols
+                    s.mark(r, gw + g, "|", GUIDE_FG, bg)
+                g += INDENT
+        if rr.end_col >= cs.len()
+            self.wrap_tail(mut s, r, l, x0 + cs.len() - rr.col, bg)
+    if bm := self.bracket_match()
+        self.wrap_cell(mut s, v, bm.line, bm.col)
+        self.wrap_cell(mut s, v, bm.end_line, bm.end_col)
+    for c in self.extra
+        if xp := v.at(c.line, c.col)
+            x := gw + xp.col
+            if xp.row < h and x < self.cols
+                n_chars := self.lines[c.line].len()
+                mut ch := self.lines[c.line].slice(c.col.min(n_chars), (c.col + 1).min(n_chars))
+                if ch == ""
+                    ch = " "
+                s.mark(xp.row, x, ch, BG, FG)
+    if cp := v.at(self.line, self.col)
+        if cp.row < h
+            s.cursor_row = cp.row
+            s.cursor_col = gw + cp.col
+    if s.cursor_row >= 0 and (self.completing or self.layer.sig.rows.len() > 0)
+        # The popups place themselves by `top` and `left`: shift a copy so
+        # the caret's screen row and column come out.
+        prow := v.lay.row_range(s.cursor_row)
+        mut pc := self
+        pc.top = self.line - s.cursor_row
+        pc.left = prow.col - prow.hang
+        if self.completing
+            pc.render_popup(mut s)
+        else
+            pc.render_sig(mut s)
+    s
+
+## After a line's last screen row under wrap, from column `tail`: the fold
+## count, a probe's note, and the line's diagnostics (a marked cell past the
+## end, the first one's message), as the plain render shows them.
+fn Editor.wrap_tail(self, mut s Screen, r int, l int, tail int, bg int)
+    if self.folded.contains(l)
+        s.put(r, tail + 1, "... {fold.end_of(self.lines, l) - l} lines", GUTTER_FG, bg)
+    if note := self.notes.get(l)
+        s.put(r, tail + 3, "=> {note}", GUTTER_FG, BG)
+    n := self.lines[l].len()
+    mut first := true
+    for d in self.diags
+        if d.line - 1 != l
+            continue
+        if d.col - 1 >= n
+            s.put(r, tail + d.col - 1 - n, " ", FG, diag_bg([d], l, d.col - 1, BG))
+        if first
+            first = false
+            dfg := if d.severity == "error" then ERROR_FG else WARN_FG
+            s.put(r, tail + 3, "-- {d.message}", dfg, bg)
+
+## Marks the bracket at (`l`, `c`) under wrap, when it is on screen.
+fn Editor.wrap_cell(self, mut s Screen, v WrapView, l int, c int)
+    p := v.at(l, c) else return
+    x := self.gutter_width() + p.col
+    if p.row < self.text_rows() and x < self.cols
+        s.put(p.row, x, "{self.lines[l].chars()[c]}", FG, BRACKET_BG)
+
+# ---- Tests (parity P10) ----
+
+@test fn join_lines_and_select_line_are_one_step_each()
+    assert_eq(key_command("j", true, false, false), Depth("join"))
+    assert_eq(key_command("l", true, false, false), Depth("select_line"))
+    mut ed := typed("a  \n    b\nc\n", [])
+    ed.apply(Depth("join"))
+    assert_eq(ed.lines, ["a b", "c"])
+    assert_eq([ed.line, ed.col], [0, 1])
+    ed.apply(Undo)
+    assert_eq(ed.lines, ["a  ", "    b", "c"])
+    ed.apply(Depth("select_line"))
+    assert_eq(ed.selected_text(), "a  \n")
+    ed.apply(Depth("select_line"))
+    assert_eq(ed.selected_text(), "a  \n    b\n")
+    mut ws := Workspace.new(typed("x\ny\n", []))
+    ws.on_event(key_event("ctrl+j"))
+    assert_eq(ws.eds[0].lines, ["x y"])
+
+@test fn palette_sorts_reverses_and_changes_case()
+    mut ws := Workspace.new(typed("b\na\nc\nb\n", []))
+    ws.run_command("Sort lines ascending")
+    assert_eq(ws.eds[0].lines, ["a", "b", "b", "c"])
+    ws.run_command("Sort lines descending")
+    assert_eq(ws.eds[0].lines, ["c", "b", "b", "a"])
+    ws.run_command("Reverse lines")
+    assert_eq(ws.eds[0].lines, ["a", "b", "b", "c"])
+    ws.run_command("Sort lines unique")
+    assert_eq(ws.eds[0].lines, ["a", "b", "c"])
+    ws.eds[0].apply(Undo)
+    assert_eq(ws.eds[0].lines, ["a", "b", "b", "c"])
+    mut wc := Workspace.new(typed("hello world", []))
+    wc.run_command("Upper case")
+    assert_eq(wc.eds[0].lines, ["HELLO world"])
+    assert_eq(wc.eds[0].selected_text(), "HELLO")
+    wc.run_command("Title case")
+    assert_eq(wc.eds[0].lines, ["Hello world"])
+    wc.run_command("Lower case")
+    assert_eq(wc.eds[0].lines, ["hello world"])
+
+@test fn case_changes_act_at_every_caret()
+    mut ed := typed("ab cd\nef\n", [])
+    ed.apply(Depth("below"))
+    ed.apply(Depth("upper"))
+    assert_eq(ed.lines, ["AB cd", "EF"])
+    assert_eq(ed.extra.len(), 1)
+    ed.apply(Undo)
+    assert_eq(ed.lines, ["ab cd", "ef"])
+
+@test fn delete_line_and_transpose()
+    mut ed := typed("a\nbb\nccc\n", [Go(Down), Go(End)])
+    ed.apply(Depth("delete_line"))
+    assert_eq(ed.lines, ["a", "ccc"])
+    assert_eq([ed.line, ed.col], [1, 2])
+    mut t := typed("abc", [Go(Right)])
+    t.apply(Depth("transpose"))
+    assert_eq(t.lines, ["bac"])
+    assert_eq(t.col, 2)
+    t.apply(Undo)
+    assert_eq(t.lines, ["abc"])
+
+@test fn tab_and_shift_tab_indent_selected_lines()
+    assert_eq(key_command("tab", false, false, true), Depth("shift_tab"))
+    assert_eq(key_command("tab", false, false, false), Tab)
+    mut ed := typed("a\nb\n", [Select(Down), Select(End)])
+    ed.apply(Tab)
+    assert_eq(ed.lines, ["    a", "    b"])
+    assert_eq(ed.selected_text(), "    a\n    b")
+    ed.apply(Depth("shift_tab"))
+    assert_eq(ed.lines, ["a", "b"])
+    ed.apply(Undo)
+    assert_eq(ed.lines, ["    a", "    b"])
+    plain := typed("ab", [Go(Right), Depth("shift_tab")])
+    assert_eq(plain.lines[0], "a   b")
+    one := typed("ab", [Go(Right), Tab])
+    assert_eq(one.lines[0], "a   b")
+
+@test fn expand_and_shrink_selection_retrace_and_forget()
+    assert_eq(key_command("right", false, true, true), Depth("expand"))
+    assert_eq(key_command("left", false, true, true), Depth("shrink"))
+    mut ed := typed("f(a, g(bc))", [])
+    for _ in 0..8
+        ed.apply(Go(Right))
+    ed.apply(Depth("expand"))
+    assert_eq(ed.selected_text(), "bc")
+    ed.apply(Depth("expand"))
+    assert_eq(ed.selected_text(), "(bc)")
+    ed.apply(Depth("shrink"))
+    assert_eq(ed.selected_text(), "bc")
+    ed.apply(Depth("shrink"))
+    assert(ed.selection() == none)
+    assert_eq(ed.col, 8)
+    ed.apply(Depth("expand"))
+    ed.apply(Go(Left))
+    assert_eq(ed.tx.expand.steps.len(), 0)
+    ed.apply(Depth("shrink"))
+    assert_eq(ed.message, "nothing to shrink")
+
+@test fn typing_an_opener_surrounds_the_selection()
+    mut ed := typed("say hi", [Go(End), Select(WordLeft)])
+    ed.apply(Insert("\""))
+    assert_eq(ed.lines, ["say \"hi\""])
+    assert_eq(ed.selected_text(), "hi")
+    ed.apply(Insert("("))
+    assert_eq(ed.lines, ["say \"(hi)\""])
+    ed.apply(Undo)
+    assert_eq(ed.lines, ["say \"hi\""])
+    mut off := typed("say hi", [Go(End), Select(WordLeft)])
+    off.tx.prefs.surround = false
+    off.apply(Insert("("))
+    assert_eq(off.lines, ["say ()"])
+
+@test fn settings_rows_reach_every_tab()
+    mut ws := Workspace.new(typed("x", []))
+    ws.eds.push(typed("y", []))
+    ws.cycle_setting(5)
+    assert(not ws.tprefs.surround)
+    assert(not ws.eds[1].tx.prefs.surround)
+    ws.cycle_setting(8)
+    assert(ws.eds[0].tx.prefs.wrapping and ws.eds[1].tx.prefs.wrapping)
+    assert_eq(setting(ws.prefs, "wrap") else "", "on")
+
+@test fn saving_trims_trailing_spaces_and_blank_end_lines()
+    mut ed := typed("a  \nb\n\n\n", [Go(Bottom)])
+    ed.tidy_for_save()
+    assert_eq(ed.lines, ["a", "b"])
+    assert_eq(ed.line, 1)
+    ed.apply(Undo)
+    assert_eq(ed.lines, ["a  ", "b", "", ""])
+    mut keep := typed("a  \n\n", [])
+    keep.tx.prefs.trim = false
+    keep.tx.prefs.finalnl = false
+    keep.tidy_for_save()
+    assert_eq(keep.lines, ["a  ", ""])
+    assert(not keep.dirty)
+
+@test fn crlf_files_keep_their_line_ending()
+    mut ed := Editor.new("t.ail", "a\r\nb\r\n", 100, 12)
+    assert_eq(ed.lines, ["a", "b"])
+    assert_eq(ed.tx.eol, textops.Eol.Crlf)
+    assert_eq(ed.file_text(), "a\r\nb\r\n")
+    assert(ed.render().text[ed.text_rows()].contains("CRLF"))
+    ed.apply(Depth("eol"))
+    assert_eq(ed.file_text(), "a\nb\n")
+    assert(ed.dirty)
+    assert(not ed.render().text[ed.text_rows()].contains("CRLF"))
+    lf := Editor.new("t.ail", "a\nb\n", 100, 12)
+    assert_eq(lf.file_text(), lf.text())
+    assert(not lf.render().text[lf.text_rows()].contains("CRLF"))
+    assert_eq(without_cr(["a\r", "b"]), ["a", "b"])
+
+@test fn box_selection_by_keys_and_by_drag()
+    assert_eq(key_command("down", true, true, false), Depth("box_down"))
+    assert_eq(key_command("up", true, true, false), Depth("box_up"))
+    mut ed := typed("abcd\nab\nabcd\n", [Go(Right), Go(Right)])
+    ed.apply(Depth("box_down"))
+    ed.apply(Depth("box_down"))
+    assert_eq(ed.extra.len(), 2)
+    ed.apply(Insert("X"))
+    assert_eq(ed.lines, ["abXcd", "abX", "abXcd"])
+    ed.apply(Escape)
+    ed.apply(Depth("box_up"))
+    assert_eq(ed.extra.len(), 1)
+    ed.apply(Depth("box_down"))
+    assert_eq(ed.extra.len(), 0)
+    mut dr := typed("abcd\nab\nabcd\n", [])
+    gw := dr.gutter_width()
+    dr.box_drag(gw + 1, 0, true)
+    dr.box_drag(gw + 3, 2, false)
+    assert_eq(dr.extra.len(), 2)
+    dr.apply(Insert("-"))
+    assert_eq(dr.lines, ["a-d", "a-", "a-d"])
+    mut ws := Workspace.new(typed("abcd\nab\nabcd\n", []))
+    both := ui.Modifiers(ctrl: false, alt: true, shift: true)
+    ws.on_window_event(Mouse(col: gw + 1, row: 1, button: Left, kind: Down), both)
+    ws.on_window_event(Mouse(col: gw + 3, row: 3, button: Left, kind: Drag), both)
+    assert_eq(ws.eds[0].extra.len(), 2)
+
+WRAP_SAMPLE := "aaaa bbbb cccc dddd eeee\nx\n"
+
+fn wrapped(text str) Editor
+    mut ed := Editor.new("t.ail", text, 20, 12)
+    ed.tx.prefs.wrapping = true
+    ed
+
+@test fn word_wrap_draws_continuation_rows_with_a_hang()
+    ed := wrapped(WRAP_SAMPLE)
+    s := ed.render()
+    assert_eq(s.text[0], "  1 aaaa bbbb cccc ")
+    assert_eq(s.text[1], "        dddd eeee")
+    assert_eq(s.text[2], "  2 x")
+    assert_eq([s.cursor_row, s.cursor_col], [0, 4])
+    assert(s.text[ed.text_rows()].contains("Ln 1, Col 1"))
+    mut plain := ed
+    plain.tx.prefs.wrapping = false
+    assert_eq(plain.render().text[0], "  1 aaaa bbbb cccc d")
+
+@test fn word_wrap_moves_by_screen_rows_and_maps_clicks()
+    mut ed := wrapped(WRAP_SAMPLE)
+    ed.apply(Go(Down))
+    assert_eq([ed.line, ed.col], [0, 15])
+    s := ed.render()
+    assert_eq([s.cursor_row, s.cursor_col], [1, 8])
+    ed.apply(Go(Down))
+    assert_eq([ed.line, ed.col], [1, 0])
+    ed.apply(Go(Up))
+    assert_eq([ed.line, ed.col], [0, 15])
+    ed.apply(Go(Up))
+    assert_eq([ed.line, ed.col], [0, 0])
+    ed.apply(Go(End))
+    assert_eq(ed.col, 14)
+    ed.apply(Go(End))
+    assert_eq(ed.col, 24)
+    ed.apply(Go(Home))
+    assert_eq(ed.col, 15)
+    ed.apply(Go(Home))
+    assert_eq(ed.col, 0)
+    gw := ed.gutter_width()
+    ed.on_event(Mouse(col: gw + 6, row: 1, button: Left, kind: Down))
+    assert_eq([ed.line, ed.col], [0, 17])
+    ed.on_event(Mouse(col: gw + 1, row: 1, button: Left, kind: Down))
+    assert_eq([ed.line, ed.col], [0, 15])
+    ed.on_event(Mouse(col: gw + 9, row: 2, button: Left, kind: Down))
+    assert_eq([ed.line, ed.col], [1, 1])
+
+@test fn word_wrap_scrolls_until_the_caret_row_shows()
+    mut text := ""
+    for _ in 0..10
+        text = "{text}aaaa bbbb cccc dddd eeee\n"
+    mut ed := wrapped(text)
+    ed.apply(Go(Bottom))
+    assert_eq(ed.top, 7)
+    assert_eq(ed.left, 0)
+    s := ed.render()
+    assert_eq(s.cursor_row, 5)
+    assert_eq(s.text[0], "  8 aaaa bbbb cccc ")
+
+@test fn word_wrap_keeps_folds_and_inline_messages()
+    mut ed := typed(DEPTH_SAMPLE, [])
+    ed.tx.prefs.wrapping = true
+    ed.apply(Depth("fold"))
+    s := ed.render()
+    assert(s.text[0].starts_with("  1>fn main()"))
+    assert(s.text[0].contains("3 lines"))
+    assert(s.text[1].starts_with("  5 "))
+    assert(s.text[2].starts_with("  6 fn other()"))
+    mut d := typed("total := 1\nprnt(total)", [])
+    d.cols = 60
+    d.tx.prefs.wrapping = true
+    d.diags = parse_diags(DIAG_JSON)
+    assert(d.render().text[1].ends_with("prnt(total)   -- unknown name `prnt`"))
+
+@test fn alt_z_toggles_word_wrap_in_every_tab()
+    assert_eq(workspace_key("z", false, true, false), WordWrap)
+    mut ws := Workspace.new(Editor.new("t.ail", WRAP_SAMPLE, 20, 12))
+    ws.eds.push(typed("y", []))
+    ws.on_event(key_event("alt+z"))
+    assert(ws.eds[0].tx.prefs.wrapping and ws.eds[1].tx.prefs.wrapping)
+    assert_eq(ws.render().text[2], "        dddd eeee")
+    ws.on_event(key_event("alt+z"))
+    assert(not ws.eds[0].tx.prefs.wrapping)
+
+@test fn the_text_palette_rows_all_run()
+    names := [
+        "Sort lines ascending",
+        "Sort lines descending",
+        "Sort lines unique",
+        "Reverse lines",
+        "Upper case",
+        "Lower case",
+        "Title case",
+        "Delete line",
+        "Transpose characters",
+        "Indent lines",
+        "Outdent lines",
+        "Toggle line endings",
+    ]
+    for name in names
+        mut ws := Workspace.new(typed("b\na\n", []))
+        ws.run_command(name)
+        assert(not ws.message.starts_with("no command"))
+        assert(not ws.eds[0].message.starts_with("no command"))
+    mut seen := Set[str]()
+    for r in key_rows()
+        seen.add(r.name)
+    for name in names
+        assert(seen.contains(name))
 
 # ---- Window front end (std.app, S1) --------------------------------------
 
@@ -11097,6 +12141,8 @@ struct Shell
     solid_until int
     ## Drags, context menus and the hover (features/pointer, parity P7).
     pt pointer.Gesture
+    ## An Alt-Shift drag making a box selection (parity C6).
+    boxing bool
 
 fn Shell.new(w Workspace) Shell
     Shell(
@@ -11117,6 +12163,7 @@ fn Shell.new(w Workspace) Shell
         caret_on: true,
         solid_until: 0,
         pt: pointer.gesture(),
+        boxing: false,
     )
 
 ## The code's font size in points: the workspace's cell height, scaled.
@@ -11259,6 +12306,10 @@ fn Shell.pointer_down(mut self, ev app.Event)
     if ev.text == "right"
         self.context_menu(ev, at)
         return
+    if ev.alt and ev.shift and ev.text == "left"
+        self.ws.box_mouse(cell.col, cell.row, true)
+        self.boxing = true
+        return
     if ev.text != "left"
         return
     match at
@@ -11328,6 +12379,9 @@ impl app.App for Shell
                 self.pointer_move(ev)
                 if self.tab_drag >= 0
                     self.tab_drop = win.tab_drop(self.tabs(), win.chrome_size(self.m), ev.x)
+                elif self.boxing
+                    bcell := win.cell_at(self.m, ev.x, ev.y)
+                    self.ws.box_mouse(bcell.col, bcell.row, false)
                 elif self.pt.drag != pointer.Drag.NoDrag
                     self.pointer_drag(ev)
                 elif self.held
@@ -11343,6 +12397,8 @@ impl app.App for Shell
                         self.ws.move_tab(self.tab_drag, self.tab_drop)
                     self.tab_drag = -1
                     self.tab_drop = -1
+                elif self.boxing
+                    self.boxing = false
                 elif self.pt.drag != pointer.Drag.NoDrag
                     self.pointer_up()
                 elif self.held
