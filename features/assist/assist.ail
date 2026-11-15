@@ -1,0 +1,1299 @@
+## Live AIL (parity plan B3, B4, B5, B10; lanes P6 and P13): the pure half
+## of the editor's help while typing. Snippets with tab stops, when the
+## completion popup opens by itself, ranking of candidates, the `use` line
+## added when a candidate from another module is accepted, the parsers for
+## `ail ask std` and `ail card` output and the hover layout, the scheduler
+## of the live check, and the toolchain check (`ail doctor`, `ail --version`
+## against `.ail-version`). Values in, values out: the editor runs the
+## commands and feeds their output here. Positions are 0-based, columns
+## count characters (`line.chars()`).
+
+SQ := "'"
+
+fn is_word(c char) bool
+    c.is_alnum() or c == '_'
+
+# ---- Snippets ----------------------------------------------------------
+
+## A snippet: what is typed to pick it (`trigger`), what the popup shows
+## (`label`) and its lines. In `body`, `$1`, `$2`... are tab stops, `$0` is
+## where the caret ends, `${1:name}` is a stop that starts with `name`
+## selected, and `$$` is a plain `$`. Nested lines carry their own 4-space
+## indent; `expand` adds the indent of the line the snippet goes on.
+pub struct Snippet
+    pub trigger str
+    pub label str
+    pub body List[str]
+
+## A tab stop of an expansion: `len` characters from (`line`, `col`), the
+## placeholder text the first keystroke replaces (0 for an empty stop).
+pub struct Stop
+    pub line int
+    pub col int
+    pub len int
+
+## A snippet ready to insert: its lines (the first goes at the caret, the
+## others start with the indent) and its stops in the order Tab visits
+## them, the `$0` stop last. Stops count from the first line of the
+## expansion and, on that line, from the caret; `at_caret` moves them to
+## buffer positions.
+pub struct Expansion
+    pub lines List[str]
+    pub stops List[Stop]
+
+## A stop while expanding: `key` orders stops (the number, `$0` last).
+struct RawStop
+    key int
+    line int
+    col int
+    len int
+
+impl Ord for RawStop
+
+LAST_STOP := 1000000
+
+fn sn(trigger str, label str, body List[str]) Snippet
+    Snippet(trigger: trigger, label: label, body: body)
+
+## The AIL snippets: one per construct of the language card, every body
+## valid AIL once its placeholders are kept (`todo` is the typed hole).
+pub fn ail_snippets() List[Snippet]
+    [
+        sn("fn", "fn name(params) type", ["fn $\{1:name}($2) $\{3:int}", "    $\{0:todo}"]),
+        sn("pub", "pub fn name(params) type", [
+            "pub fn $\{1:name}($2) $\{3:int}",
+            "    $\{0:todo}",
+        ]),
+        sn("method", "fn Type.name(self) type", [
+            "fn $\{1:Type}.$\{2:name}(self) $\{3:int}",
+            "    $\{0:todo}",
+        ]),
+        sn("test", "@test fn name()", [
+            "@test fn $\{1:name}()",
+            "    assert_eq($\{2:actual}, $\{0:expected})",
+        ]),
+        sn("struct", "struct Name", ["struct $\{1:Name}", "    $\{2:field} $\{0:int}"]),
+        sn("enum", "enum Name", ["enum $\{1:Name}", "    $\{2:First}", "    $\{0:Second}"]),
+        sn("error", "error struct Name", ["error struct $\{1:Name}", "    $\{0:message} str"]),
+        sn("errenum", "error enum Name", [
+            "error enum $\{1:Name}",
+            "    $\{2:Empty} \"$\{0:empty input}\"",
+        ]),
+        sn("trait", "trait Name", ["trait $\{1:Name}", "    fn $\{2:method}(self) $\{0:int}"]),
+        sn("impl", "impl Trait for Type", [
+            "impl $\{1:Trait} for $\{2:Type}",
+            "    fn $\{3:method}(self) $\{4:int}",
+            "        $\{0:todo}",
+        ]),
+        sn("if", "if cond", ["if $\{1:cond}", "    $0"]),
+        sn("elif", "elif cond", ["elif $\{1:cond}", "    $0"]),
+        sn("else", "else", ["else", "    $0"]),
+        sn("ifelse", "if cond / else", ["if $\{1:cond}", "    $2", "else", "    $0"]),
+        sn("match", "match value with arms", [
+            "match $\{1:value}",
+            "    $\{2:A} => $\{3:todo}",
+            "    $\{4:B} => $\{0:todo}",
+        ]),
+        sn("for", "for x in xs", ["for $\{1:x} in $\{2:xs}", "    $0"]),
+        sn("while", "while cond", ["while $\{1:cond}", "    $0"]),
+        sn("elseerr", "x := f() else err", [
+            "$\{1:x} := $\{2:f()} else err",
+            "    print(\"error: \{err}\")",
+            "    $\{0:return}",
+        ]),
+        sn("use", "use module", ["use $\{0:std.csv}"]),
+        sn("main", "fn main()", ["fn main()", "    $0"]),
+        sn("spawn", "spawn in a TaskGroup", [
+            "g := TaskGroup()",
+            "g.add(spawn $\{1:work}($2))",
+            "$0",
+        ]),
+        sn("doc", "## doc comment", ["## $\{0:What it does.}"]),
+        sn("requires", "requires cond", ["requires $\{0:n >= 0}"]),
+        sn("ensures", "ensures cond", ["ensures $\{0:result >= 0}"]),
+        sn("contract", "requires and ensures", [
+            "requires $\{1:n >= 0}",
+            "ensures $\{0:result >= 0}",
+        ]),
+    ]
+
+## The Markdown snippets: a link, a fenced code block and a heading.
+pub fn markdown_snippets() List[Snippet]
+    [
+        sn("link", "[text](url)", ["[$\{1:text}]($\{0:url})"]),
+        sn("code", "fenced code block", ["```$\{1:ail}", "$2", "```", "$0"]),
+        sn("heading", "## heading", ["## $\{0:Title}"]),
+    ]
+
+## The snippets of a language by its name (`ail`, `markdown`, as
+## features/syntax names them in lower case); none for the others.
+pub fn snippets_for(lang str) List[Snippet]
+    l := lang.to_lower()
+    if l == "ail"
+        return ail_snippets()
+    if l == "markdown" or l == "md"
+        return markdown_snippets()
+    List[Snippet]()
+
+## The digits of `cs` from `i`, as a number, and where they end.
+fn read_num(cs List[char], i int) RawStop
+    mut j := i
+    mut n := 0
+    while j < cs.len() and cs[j].is_digit() and n < 100000
+        n = n * 10 + (cs[j].to_digit(10) else 0)
+        j += 1
+    RawStop(key: n, line: 0, col: j, len: 0)
+
+## Expands `s` for a line indented by `indent`: placeholders become their
+## text, stops are collected in Tab order, and a snippet without `$0` gets
+## one at the end of its text.
+pub fn expand(s Snippet, indent str) Expansion
+    mut lines := List[str]()
+    mut raw := List[RawStop]()
+    mut has_last := false
+    for li in 0..s.body.len()
+        cs := s.body[li].chars()
+        pre := if li == 0 then "" else indent
+        base := pre.len()
+        mut text := List[char]()
+        mut i := 0
+        while i < cs.len()
+            c := cs[i]
+            if c == '$' and i + 1 < cs.len()
+                nx := cs[i + 1]
+                if nx == '$'
+                    text.push('$')
+                    i += 2
+                    continue
+                if nx.is_digit()
+                    r := read_num(cs, i + 1)
+                    raw.push(RawStop(key: r.key, line: li, col: base + text.len(), len: 0))
+                    if r.key == 0
+                        has_last = true
+                    i = r.col
+                    continue
+                if nx == '{' and i + 2 < cs.len() and cs[i + 2].is_digit()
+                    r2 := read_num(cs, i + 2)
+                    mut j := r2.col
+                    start := text.len()
+                    if j < cs.len() and cs[j] == ':'
+                        j += 1
+                        while j < cs.len() and cs[j] != '}'
+                            text.push(cs[j])
+                            j += 1
+                    raw.push(RawStop(
+                        key: r2.key,
+                        line: li,
+                        col: base + start,
+                        len: text.len() - start,
+                    ))
+                    if r2.key == 0
+                        has_last = true
+                    i = j + 1
+                    continue
+            text.push(c)
+            i += 1
+        lines.push("{pre}{text.join("")}")
+    mut keyed := List[RawStop]()
+    for rs in raw
+        mut k := rs.key
+        if k == 0
+            k = LAST_STOP
+        keyed.push(RawStop(key: k, line: rs.line, col: rs.col, len: rs.len))
+    if not has_last and lines.len() > 0
+        last := lines.len() - 1
+        keyed.push(RawStop(key: LAST_STOP, line: last, col: lines[last].len(), len: 0))
+    mut stops := List[Stop]()
+    for ks in keyed.sorted()
+        stops.push(Stop(line: ks.line, col: ks.col, len: ks.len))
+    Expansion(lines: lines, stops: stops)
+
+## The expansion's stops as buffer positions, for an expansion inserted at
+## (`line`, `col`): stops on its first line move right by `col`, all move
+## down by `line`.
+pub fn at_caret(e Expansion, line int, col int) Expansion
+    mut out := List[Stop]()
+    for s in e.stops
+        mut c := s.col
+        if s.line == 0
+            c += col
+        out.push(Stop(line: s.line + line, col: c, len: s.len))
+    Expansion(lines: e.lines, stops: out)
+
+## The stop after stop `current` (an index into `stops`), or `none` after
+## the last one, when snippet mode ends.
+pub fn next_stop(e Expansion, current int) int?
+    if current + 1 < e.stops.len()
+        return current + 1
+    none
+
+## The stops after typing in stop `current` changed its length by `delta`
+## characters (negative for a deletion): that stop grows or shrinks, and
+## the stops after it on the same line move with the text. Stops on other
+## lines stay; a line break typed in a stop is the wiring's to handle (it
+## ends snippet mode).
+pub fn shift_stops(e Expansion, current int, delta int) Expansion
+    s := e.stops[current]
+    mut out := List[Stop]()
+    for k in 0..e.stops.len()
+        t := e.stops[k]
+        if k == current
+            out.push(Stop(line: t.line, col: t.col, len: (t.len + delta).max(0)))
+        elif t.line == s.line and (t.col > s.col or t.col == s.col and k > current)
+            out.push(Stop(line: t.line, col: (t.col + delta).max(0), len: t.len))
+        else
+            out.push(t)
+    Expansion(lines: e.lines, stops: out)
+
+# ---- When the popup opens -----------------------------------------------
+
+## Why completion opens by itself after a keystroke: `None`; `Member` after
+## a `.`; `Name` once two characters of a name are typed; `Module` on a
+## `use` line; `Arg` after `(` or `,` (signature help).
+pub enum Trigger
+    None
+    Member
+    Name
+    Module
+    Arg
+
+## Whether column `col` of an AIL line is inside a string, a character
+## literal or a `#` comment (the code inside `{...}` of a string counts as
+## code). It scans the line from its start as features/pairs does; a
+## multi-line `"""` string is the wiring's to know from the line before.
+pub fn in_string_or_comment(line str, col int) bool
+    cs := line.chars()
+    single := SQ.chars()[0]
+    mut quote := ' '
+    mut raw := false
+    mut interp := 0
+    mut i := 0
+    while i < col and i < cs.len()
+        c := cs[i]
+        if quote != ' '
+            if interp > 0
+                if c == '{'
+                    interp += 1
+                elif c == '}'
+                    interp -= 1
+            elif c == '\\' and not raw
+                i += 1
+            elif c == quote
+                quote = ' '
+                raw = false
+            elif c == '{' and quote == '"' and not raw
+                interp = 1
+        elif c == '#'
+            return true
+        elif c == '"' or c == single
+            quote = c
+            raw = c == '"' and i > 0 and cs[i - 1] == 'r' and (i == 1 or not is_word(cs[i - 2]))
+        i += 1
+    quote != ' ' and interp == 0
+
+## Whether `head` (a line without its indent, up to the caret) is the head
+## of a function declaration whose parameter list is still open.
+fn in_signature(head str) bool
+    decl := head.starts_with("fn ") or head.starts_with("pub fn ") or head.starts_with("@test fn ")
+    decl and head.contains("(") and not head.contains(")")
+
+## Whether `head` declares a function and has not reached its `(`: a name
+## typed there (`fn Point.`) is a new name.
+fn naming_fn(head str) bool
+    decl := head.starts_with("fn ") or head.starts_with("pub fn ") or head.starts_with("@test fn ")
+    decl and not head.contains("(")
+
+## Words after which the next word is a new name.
+NAMING := ["fn", "struct", "enum", "trait", "type", "mut", "for"]
+
+## Whether the `.` at `dot` follows a name (not a number such as `1.`).
+fn member_after(cs List[char], dot int) bool
+    if dot < 1 or not is_word(cs[dot - 1])
+        return false
+    mut a := dot - 1
+    while a > 0 and is_word(cs[a - 1])
+        a -= 1
+    not cs[a].is_digit()
+
+## Whether the popup opens by itself after `typed` was typed, the caret
+## now at `col` of `line`. Never in a string or comment, in a number,
+## while naming something new (after `fn `, `struct `, `enum `, `mut `,
+## `for `, a parameter name, a name before `:=`). `worth_showing` then
+## says whether the candidates found are worth a popup.
+pub fn should_open(line str, col int, typed char, in_str bool) Trigger
+    cs := line.chars()
+    if in_str or col < 1 or col > cs.len()
+        return Trigger.None
+    head := cs[..col].join("").trim_start()
+    if rest := head.strip_prefix("use ")
+        for c in rest.chars()
+            if not is_word(c) and c != '.'
+                return Trigger.None
+        return Trigger.Module
+    if typed == '(' or typed == ','
+        if in_signature(head)
+            return Trigger.None
+        return Trigger.Arg
+    if typed == '.'
+        if naming_fn(head) or not member_after(cs, col - 1)
+            return Trigger.None
+        return Trigger.Member
+    if not is_word(typed)
+        return Trigger.None
+    mut a := col
+    while a > 0 and is_word(cs[a - 1])
+        a -= 1
+    if cs[a].is_digit()
+        return Trigger.None
+    if a > 0 and cs[a - 1] == '.'
+        if naming_fn(head) or not member_after(cs, a - 1)
+            return Trigger.None
+        return Trigger.Member
+    if col - a < 2
+        return Trigger.None
+    after := cs[col..].join("").trim_start()
+    if after.starts_with(":=")
+        return Trigger.None
+    mut k := a
+    while k > 0 and cs[k - 1] == ' '
+        k -= 1
+    if k > 0 and (cs[k - 1] == '(' or cs[k - 1] == ',') and in_signature(head)
+        return Trigger.None
+    mut p := k
+    while p > 0 and is_word(cs[p - 1])
+        p -= 1
+    if p < k and NAMING.contains(cs[p..k].join(""))
+        return Trigger.None
+    Trigger.Name
+
+## Whether candidates for `prefix` are worth a popup: not when there are
+## none, nor when the only one is what is typed already.
+pub fn worth_showing(prefix str, cands List[Cand]) bool
+    if cands.len() == 0
+        return false
+    not (cands.len() == 1 and cands[0].text == prefix)
+
+# ---- Ranking -------------------------------------------------------------
+
+## What a candidate is.
+pub enum CandKind
+    Local
+    Param
+    Field
+    Method
+    Function
+    Type
+    Variant
+    Module
+    Keyword
+    Snippet
+    Word
+
+## A completion candidate: its text, kind and detail (a signature, a
+## snippet label), and the module accepting it needs (`std.csv`), or "".
+pub struct Cand
+    pub text str
+    pub kind CandKind
+    pub detail str
+    pub module str
+
+## A candidate's place in the ranked list; fields compare in order.
+struct Scored
+    tier int
+    fresh int
+    group int
+    penalty int
+    idx int
+
+impl Ord for Scored
+
+fn group_of(k CandKind) int
+    if k == CandKind.Local or k == CandKind.Param
+        return 0
+    1
+
+## How far `q` is from being a prefix of `t` as a subsequence, ignoring
+## case: where the first character matches plus the gaps between matches;
+## -1 when `q` is not a subsequence of `t`.
+fn fuzzy_penalty(t List[char], q List[char]) int
+    mut pen := 0
+    mut j := 0
+    mut last := -1
+    for i in 0..t.len()
+        if j < q.len() and t[i].to_lower() == q[j].to_lower()
+            if last < 0
+                pen += i
+            else
+                pen += i - last - 1
+            last = i
+            j += 1
+    if j < q.len()
+        return -1
+    pen
+
+## The candidates that match `prefix`, best first: those that start with it
+## (case sensitive), then those that start with it in any case, then those
+## that hold its characters in order (fuzzy, closest first). Within a tier
+## the recently accepted come first (`recent` newest first), then locals
+## and parameters, then the rest; ties keep their order.
+pub fn rank(candidates List[Cand], prefix str, recent List[str]) List[Cand]
+    low := prefix.to_lower()
+    q := prefix.chars()
+    mut scored := List[Scored]()
+    for i in 0..candidates.len()
+        c := candidates[i]
+        mut tier := 0
+        mut pen := 0
+        if c.text.starts_with(prefix)
+            tier = 0
+        elif c.text.to_lower().starts_with(low)
+            tier = 1
+        else
+            pen = fuzzy_penalty(c.text.chars(), q)
+            if pen < 0
+                continue
+            tier = 2
+        fresh := recent.index_of(c.text) else recent.len()
+        scored.push(Scored(tier: tier, fresh: fresh, group: group_of(c.kind), penalty: pen, idx: i))
+    mut out := List[Cand]()
+    for s in scored.sorted()
+        out.push(candidates[s.idx])
+    out
+
+## The snippets of a language as candidates (kind `Snippet`, the label as
+## the detail).
+pub fn snippet_cands(lang str) List[Cand]
+    mut out := List[Cand]()
+    for s in snippets_for(lang)
+        out.push(Cand(text: s.trigger, kind: CandKind.Snippet, detail: s.label, module: ""))
+    out
+
+# ---- `use` on accept -----------------------------------------------------
+
+## A text to put into the buffer: `text` goes in before line `line` (at the
+## end when `line` is the line count).
+pub struct Insert
+    pub line int
+    pub text List[str]
+
+## The standard modules written in AIL, from v0.1.0's `std/` tree and its
+## index (std.use.1): these need a `use` line.
+pub fn std_modules() List[str]
+    [
+        "std.app",
+        "std.args",
+        "std.attach",
+        "std.audio",
+        "std.bigint",
+        "std.csv",
+        "std.file",
+        "std.gfx",
+        "std.kv",
+        "std.log",
+        "std.mcp",
+        "std.net.http",
+        "std.net.jar",
+        "std.screen",
+        "std.screen.cells",
+        "std.term",
+        "std.test",
+        "std.time.date",
+        "std.toml",
+        "std.ui.widgets",
+        "std.yaml",
+    ]
+
+## The modules built into the compiler (std.use.1); every one is in scope
+## without a `use` (std.use.4).
+pub fn builtin_modules() List[str]
+    [
+        "std.compress",
+        "std.crypto",
+        "std.env",
+        "std.fs",
+        "std.hash",
+        "std.hw",
+        "std.io",
+        "std.mem",
+        "std.net",
+        "std.os",
+        "std.path",
+        "std.proc",
+        "std.random",
+        "std.regex",
+        "std.task",
+        "std.tensor",
+        "std.time",
+        "std.tz",
+        "std.ui",
+    ]
+
+## The name a module is used under: its last part (`std.time.date` is
+## `date`).
+pub fn module_name(module str) str
+    module.split(".").last() else module
+
+## The std modules as candidates for a `use` line: the text is the path
+## after `std.` (`time.date`), the module the full path.
+pub fn module_cands() List[Cand]
+    mut out := List[Cand]()
+    for m in std_modules()
+        rest := m.strip_prefix("std.") else m
+        out.push(Cand(text: rest, kind: CandKind.Module, detail: "use {m}", module: m))
+    for b in builtin_modules()
+        short := b.strip_prefix("std.") else b
+        out.push(Cand(text: short, kind: CandKind.Module, detail: "built in", module: b))
+    out
+
+## Whether accepting a candidate from `module` needs a `use` line: not for
+## "" or a module built into the compiler, nor when the file already has
+## `use MODULE` or `use MODULE as NAME`.
+pub fn needs_use(lines List[str], module str) bool
+    if module == "" or builtin_modules().contains(module)
+        return false
+    for l in lines
+        t := l.trim_end()
+        if t == "use {module}" or t.starts_with("use {module} as ")
+            return false
+    true
+
+## Where the `use` line for `module` goes and its text. After the last `use`
+## (after the last `use std.` one for a std module, keeping std first as
+## edit.ail does); with no `use` yet, after the file's header comment and
+## its blank line, followed by a blank line. A comment with no blank line
+## after it documents a declaration, so then the line goes first.
+pub fn use_insert(lines List[str], module str) Insert
+    line := "use {module}"
+    mut last := -1
+    mut last_std := -1
+    for i in 0..lines.len()
+        if lines[i].starts_with("use ")
+            last = i
+            if lines[i].starts_with("use std.")
+                last_std = i
+    if module.starts_with("std.") and last_std >= 0
+        return Insert(line: last_std + 1, text: [line])
+    if last >= 0
+        if module.starts_with("std.")
+            mut first := 0
+            while not lines[first].starts_with("use ")
+                first += 1
+            return Insert(line: first, text: [line])
+        return Insert(line: last + 1, text: [line])
+    mut h := 0
+    while h < lines.len() and lines[h].starts_with("#")
+        h += 1
+    if h == 0
+        return Insert(line: 0, text: [line, ""])
+    if h == lines.len()
+        return Insert(line: h, text: ["", line])
+    if lines[h].trim() == ""
+        return Insert(line: h + 1, text: [line, ""])
+    Insert(line: 0, text: [line, ""])
+
+# ---- Docs: `ail ask std`, `ail card` and hover ---------------------------
+
+## One std function or built-in method as `ail ask std` and `ail card
+## std.MODULE` print it (api.find.1, tool.card.2): `text` is the whole
+## signature with its module (`fs.read_text(path str) str ! IoError`),
+## `module` the part before the name (`fs`, `List`), `name` the name,
+## `signature` the text after the module, `rule` the spec rule, `doc` a
+## line of documentation ("" when the output has none).
+pub struct StdRow
+    pub text str
+    pub module str
+    pub name str
+    pub signature str
+    pub rule str
+    pub doc str
+
+## Lookup output: the rows, and the other lines (the miss message
+## `nothing in std matches ...` and its hint, or a card section's text).
+pub struct Lookup
+    pub rows List[StdRow]
+    pub notes List[str]
+
+## One line `MODULE.SIGNATURE   (RULE)` as a row, else `none`.
+pub fn parse_row(line str) StdRow?
+    t := line.trim_end()
+    k := t.rfind("   (") else return none
+    if not t.ends_with(")")
+        return none
+    rule := t.slice(k + 4, t.len() - 1)
+    text := t.slice(0, k).trim()
+    paren := text.find("(") else return none
+    head := text.slice(0, paren)
+    if head == "" or head.contains(" ")
+        return none
+    mut module := ""
+    mut name := head
+    mut sig := text
+    if dot := head.rfind(".")
+        module = head.slice(0, dot)
+        name = head.slice(dot + 1, head.len())
+        sig = text.slice(dot + 1, text.len())
+    StdRow(text: text, module: module, name: name, signature: sig, rule: rule, doc: "")
+
+fn parse_lookup(out str) Lookup
+    mut rows := List[StdRow]()
+    mut notes := List[str]()
+    for l in out.split("\n")
+        if r := parse_row(l)
+            rows.push(r)
+        elif l.trim() != "" or notes.len() > 0
+            notes.push(l.trim_end())
+    while notes.len() > 0 and notes[notes.len() - 1] == ""
+        _ := notes.pop()
+    Lookup(rows: rows, notes: notes)
+
+## Parses what `ail ask std WORDS` printed (api.find.1, api.find.4): at
+## most ten rows, best first; on a miss no rows and the message lines.
+pub fn parse_ask(out str) Lookup
+    parse_lookup(out)
+
+## Parses what `ail card TOPIC` printed (tool.card.2): the rows of a std
+## module for `std.MODULE`, else the card section's lines as notes.
+pub fn parse_card(out str) Lookup
+    parse_lookup(out)
+
+## The topics an unknown `ail card TOPIC` lists on its error line
+## (tool.card.3: `...; topics: a, b, core, std.MODULE`), else none.
+pub fn card_topics(err str) List[str]
+    mut out := List[str]()
+    k := err.find("topics: ") else return out
+    rest := err.slice(k + 8, err.len()).trim()
+    for t in rest.split(", ")
+        if t.trim() != ""
+            out.push(t.trim())
+    out
+
+## The arguments of `ail` for a lookup: `ask std --sig SHAPE` when the
+## query starts with `(`, else `ask std` and its words.
+pub fn ask_args(query str) List[str]
+    q := query.trim()
+    if q.starts_with("(")
+        return ["ask", "std", "--sig", q]
+    mut out := ["ask", "std"]
+    for w in q.split(" ")
+        if w != ""
+            out.push(w)
+    out
+
+## The arguments of `ail` for a card: `card` alone for the core card,
+## `card TOPIC` for a section or `std.MODULE`.
+pub fn card_args(topic str) List[str]
+    t := topic.trim()
+    if t == ""
+        return ["card"]
+    ["card", t]
+
+## The row for name `name` (`read_text` or `fs.read_text`) among `rows`.
+pub fn find_row(rows List[StdRow], name str) StdRow?
+    for r in rows
+        if r.name == name or "{r.module}.{r.name}" == name
+            return r
+    none
+
+## Words of `text` in lines of at most `width` characters, lines after the
+## first starting with `ind`; a word longer than a line is cut.
+fn wrap(text str, width int, ind str) List[str]
+    w := width.max(ind.len() + 4)
+    mut out := List[str]()
+    mut cur := ""
+    for piece in text.split(" ")
+        if piece == ""
+            continue
+        mut word := piece
+        if cur != ""
+            mut lead1 := ""
+            if out.len() > 0
+                lead1 = ind
+            if lead1.len() + cur.len() + 1 + word.len() <= w
+                cur = "{cur} {word}"
+                continue
+            out.push("{lead1}{cur}")
+            cur = ""
+        mut room := w
+        if out.len() > 0
+            room = w - ind.len()
+        while word.len() > room
+            mut lead2 := ""
+            if out.len() > 0
+                lead2 = ind
+            out.push("{lead2}{word.slice(0, room)}")
+            word = word.slice(room, word.len())
+            room = w - ind.len()
+        cur = word
+    if cur != ""
+        mut lead3 := ""
+        if out.len() > 0
+            lead3 = ind
+        out.push("{lead3}{cur}")
+    out
+
+## The lines of a hover popup `width` characters wide: the signature (or
+## other detail; continued lines indented 4), a blank line and the doc's
+## paragraphs, then the contracts (`requires n > 0`) and the effects on one
+## line. Empty parts and their blank lines are left out.
+pub fn hover_text(detail str, doc str, contracts List[str], effects List[str], width int) List[str]
+    mut out := wrap(detail, width, "    ")
+    if doc.trim() != ""
+        out.push("")
+        for para in doc.trim().split("\n")
+            if para.trim() == ""
+                out.push("")
+            else
+                out.extend(wrap(para.trim(), width, ""))
+    if contracts.len() > 0 or effects.len() > 0
+        out.push("")
+        for c in contracts
+            out.extend(wrap(c, width, "    "))
+        if effects.len() > 0
+            out.extend(wrap("effects: {effects.join(", ")}", width, "    "))
+    out
+
+## A std row's hover: its signature, its doc and where to read more.
+pub fn row_hover(r StdRow, width int) List[str]
+    mut out := hover_text(r.text, r.doc, List[str](), List[str](), width)
+    if r.rule != ""
+        out.push("")
+        out.extend(wrap("rule {r.rule} (ail explain {r.rule})", width, "    "))
+    out
+
+# ---- The live check --------------------------------------------------------
+
+## When to run `ail check` as you type. `delay` is the wait after the last
+## edit, at least `base` and longer while checks take longer than `base`;
+## `generation` counts edits and `checked` is the generation the last check
+## started on. Times are milliseconds.
+pub struct Live
+    pub enabled bool
+    pub base int
+    pub delay int
+    pub last_edit int
+    pub last_started int
+    pub running bool
+    pub generation int
+    pub checked int
+
+## A scheduler that waits `ms` after the last edit, on, with nothing to
+## check until the first edit.
+pub fn Live.new(ms int) Live
+    Live(
+        enabled: true,
+        base: ms,
+        delay: ms,
+        last_edit: 0,
+        last_started: 0,
+        running: false,
+        generation: 0,
+        checked: 0,
+    )
+
+## Records an edit at `now`.
+pub fn Live.edited(mut self, now int)
+    self.last_edit = now
+    self.generation += 1
+
+## Whether a check should start at `now`: on, the delay passed since the
+## last edit, none running, and the buffer changed since the last start.
+pub fn Live.due(self, now int) bool
+    fresh := self.generation != self.checked
+    self.enabled and not self.running and fresh and now - self.last_edit >= self.delay
+
+## Records a check starting at `now`; gives the generation it checks, for
+## `finished`.
+pub fn Live.started(mut self, now int) int
+    self.running = true
+    self.last_started = now
+    self.checked = self.generation
+    self.generation
+
+## Records the check of generation `gen` ending at `now`. The next delay is
+## at least how long it took (back-off), and never under `base`. True when
+## the result is current; false when an edit came after it started, so the
+## wiring drops it.
+pub fn Live.finished(mut self, gen int, now int) bool
+    self.running = false
+    self.delay = self.base.max(now - self.last_started)
+    gen == self.generation
+
+# ---- The toolchain ----------------------------------------------------------
+
+## One line of `ail doctor` (tool.doctor.1): its name, whether it is `ok`,
+## the status word (`ok`, `warn`, `fail`), what was found and the fix to
+## run ("" when none).
+pub struct DoctorCheck
+    pub name str
+    pub ok bool
+    pub status str
+    pub message str
+    pub fix str
+
+## Every check `ail doctor` printed; `ok` when none failed.
+pub struct Doctor
+    pub checks List[DoctorCheck]
+    pub ok bool
+
+## Parses `ail doctor` text: `ok    NAME: DETAIL` or `warn  NAME: DETAIL;
+## fix: WHAT TO RUN` (the status padded to five). Other lines are skipped.
+pub fn parse_doctor(out str) Doctor
+    mut checks := List[DoctorCheck]()
+    mut ok := true
+    for l in out.split("\n")
+        t := l.trim()
+        sp := t.find(" ") else continue
+        status := t.slice(0, sp)
+        if status != "ok" and status != "warn" and status != "fail"
+            continue
+        rest := t.slice(sp, t.len()).trim_start()
+        colon := rest.find(": ") else continue
+        name := rest.slice(0, colon)
+        body := rest.slice(colon + 2, rest.len())
+        mut msg := body
+        mut fix := ""
+        if k := body.rfind("; fix: ")
+            msg = body.slice(0, k)
+            fix = body.slice(k + 7, body.len())
+        if status == "fail"
+            ok = false
+        checks.push(DoctorCheck(
+            name: name,
+            ok: status == "ok",
+            status: status,
+            message: msg,
+            fix: fix,
+        ))
+    Doctor(checks: checks, ok: ok)
+
+## The checks that are not ok, one line each, for the message line or a
+## notification: `NAME: DETAIL; fix: FIX`.
+pub fn problems(d Doctor) List[str]
+    mut out := List[str]()
+    for c in d.checks
+        if not c.ok
+            if c.fix == ""
+                out.push("{c.name}: {c.message}")
+            else
+                out.push("{c.name}: {c.message}; fix: {c.fix}")
+    out
+
+## The version in what `ail --version` prints (`ail 0.1.0 (v0.1.0-3-gabc1234,
+## native)` gives `0.1.0`), "" when it is not that shape.
+pub fn parse_version(out str) str
+    first := out.trim().split("\n").first() else ""
+    ws := first.trim().split(" ")
+    if ws.len() >= 2 and ws[0] == "ail"
+        return ws[1]
+    ""
+
+## The `git describe` part of `ail --version` (`v0.1.0-3-gabc1234`), without
+## `-dirty`; "" when there is none or it is `unknown`.
+pub fn parse_describe(out str) str
+    first := out.trim().split("\n").first() else ""
+    k := first.find("(") else return ""
+    mut d := first.slice(k + 1, first.len())
+    mut end := d.find(")") else d.len()
+    if c := d.find(",")
+        end = c
+    d = d.slice(0, end).trim()
+    if s := d.strip_suffix("-dirty")
+        d = s
+    if d == "unknown"
+        return ""
+    d
+
+fn is_hex(s str) bool
+    if s == ""
+        return false
+    for c in s.chars()
+        if not "0123456789abcdef".contains(c)
+            return false
+    true
+
+## The commit in a describe: after the last `-g` (`v0.1.0-3-gabc1234`), the
+## whole of a bare hash, else "" (a tag alone names no commit here).
+fn describe_commit(d str) str
+    if k := d.rfind("-g")
+        h := d.slice(k + 2, d.len())
+        if is_hex(h)
+            return h
+    if is_hex(d) and d.len() >= 7
+        return d
+    ""
+
+## A message when `.ail-version` (`pin_file_text`: a commit hash, or a
+## version such as `0.1.0` or `v0.1.0`) names another toolchain than the
+## running `ail --version`; `none` when they agree or when the version
+## output cannot tell (a hash pin against a toolchain at a bare tag).
+pub fn pin_mismatch(pin_file_text str, version_out str) str?
+    pin := (pin_file_text.trim().split("\n").first() else "").trim()
+    if pin == ""
+        return none
+    version := parse_version(version_out)
+    d := parse_describe(version_out)
+    shown := if d == "" then version else "{version} ({d})"
+    if is_hex(pin) and pin.len() >= 7
+        h := describe_commit(d)
+        if h == "" or pin.starts_with(h) or h.starts_with(pin)
+            return none
+        short := pin.slice(0, pin.len().min(12))
+        return ".ail-version pins ail {short}, but `ail --version` is {shown}"
+    want := pin.strip_prefix("v") else pin
+    if want == version or pin == d
+        return none
+    ".ail-version pins ail {pin}, but `ail --version` is {shown}"
+
+## The status bar segment for a toolchain version: `ail 0.1.0`, or `ail ?`
+## when the version is not known.
+pub fn status_segment(version str) str
+    if version.trim() == ""
+        return "ail ?"
+    "ail {version.trim()}"
+
+# ---- Tests ---------------------------------------------------------------
+
+fn indent_ok(line str) bool
+    if line.contains("\t")
+        return false
+    mut n := 0
+    for c in line.chars()
+        if c != ' '
+            break
+        n += 1
+    n % 4 == 0
+
+fn balanced(lines List[str]) bool
+    mut stack := List[char]()
+    for l in lines
+        for c in l.chars()
+            if c == '(' or c == '[' or c == '{'
+                stack.push(c)
+            elif c == ')' or c == ']' or c == '}'
+                top := stack.pop() else return false
+                if c == ')' and top != '(' or c == ']' and top != '[' or c == '}' and top != '{'
+                    return false
+    stack.len() == 0
+
+fn in_order(e Expansion) bool
+    for k in 1..e.stops.len()
+        a := e.stops[k - 1]
+        b := e.stops[k]
+        if b.line < a.line or b.line == a.line and b.col < a.col
+            return false
+    true
+
+@test fn every_ail_snippet_is_balanced_indented_and_in_order()
+    mut seen := Set[str]()
+    for s in ail_snippets()
+        e := expand(s, "")
+        assert(balanced(e.lines), s.trigger)
+        for l in e.lines
+            assert(indent_ok(l), s.trigger)
+        assert(in_order(e), s.trigger)
+        assert(e.stops.len() >= 1, s.trigger)
+        assert(seen.add(s.trigger), "duplicate trigger {s.trigger}")
+    for t in ["fn", "pub", "method", "test", "struct", "enum", "error", "trait", "impl", "if"]
+        assert(seen.contains(t), t)
+    for t2 in ["elif", "else", "match", "for", "while", "elseerr", "use", "main", "spawn", "doc"]
+        assert(seen.contains(t2), t2)
+    assert(seen.contains("requires") and seen.contains("ensures"))
+
+@test fn markdown_snippets_by_language_name()
+    assert_eq(snippets_for("markdown").len(), markdown_snippets().len())
+    assert_eq(snippets_for("AIL").len(), ail_snippets().len())
+    assert_eq(snippets_for("json").len(), 0)
+    link := expand(markdown_snippets()[0], "")
+    assert_eq(link.lines, ["[text](url)"])
+    assert_eq(link.stops, [Stop(line: 0, col: 1, len: 4), Stop(line: 0, col: 7, len: 3)])
+    assert_eq(snippet_cands("markdown")[0].kind, CandKind.Snippet)
+
+@test fn expand_places_stops_and_indents()
+    fnsn := ail_snippets()[0]
+    e := expand(fnsn, "    ")
+    assert_eq(e.lines, ["fn name() int", "        todo"])
+    assert_eq(e.stops, [
+        Stop(line: 0, col: 3, len: 4),
+        Stop(line: 0, col: 8, len: 0),
+        Stop(line: 0, col: 10, len: 3),
+        Stop(line: 1, col: 8, len: 4),
+    ])
+    plain := expand(sn("x", "x", ["a$$b"]), "")
+    assert_eq(plain.lines, ["a$b"])
+    assert_eq(plain.stops, [Stop(line: 0, col: 3, len: 0)])
+    body := ["$\{1:x} := f() else err", "    print(\"\{err}\")", "    $0"]
+    handler := expand(sn("e", "e", body), "")
+    assert_eq(handler.lines[1], "    print(\"\{err}\")")
+    assert_eq(handler.stops[1], Stop(line: 2, col: 4, len: 0))
+
+@test fn at_caret_moves_stops_into_the_buffer()
+    e := at_caret(expand(ail_snippets()[0], "    "), 10, 4)
+    assert_eq(e.stops[0], Stop(line: 10, col: 7, len: 4))
+    assert_eq(e.stops[3], Stop(line: 11, col: 8, len: 4))
+
+@test fn next_stop_walks_then_ends()
+    e := expand(ail_snippets()[0], "")
+    assert_eq(next_stop(e, 0), 1)
+    assert_eq(next_stop(e, 2), 3)
+    assert_eq(next_stop(e, 3), none)
+
+@test fn shift_stops_moves_later_stops_on_the_line()
+    e := expand(ail_snippets()[0], "")
+    # "name" (4) replaced by "average" (7): the stops after it move by 3.
+    s := shift_stops(e, 0, 3)
+    assert_eq(s.stops[0], Stop(line: 0, col: 3, len: 7))
+    assert_eq(s.stops[1], Stop(line: 0, col: 11, len: 0))
+    assert_eq(s.stops[2], Stop(line: 0, col: 13, len: 3))
+    assert_eq(s.stops[3], e.stops[3])
+    back := shift_stops(s, 0, -10)
+    assert_eq(back.stops[0].len, 0)
+
+@test fn strings_chars_and_comments_are_found()
+    assert(in_string_or_comment("x := \"ab", 8))
+    assert(not in_string_or_comment("x := \"ab\" + y", 13))
+    assert(in_string_or_comment("x := 1  # note", 13))
+    assert(not in_string_or_comment("print(\"\{na", 9))
+    assert(in_string_or_comment("c := 'a", 7))
+    assert(in_string_or_comment("s := \"a\\\"b", 10))
+    assert(in_string_or_comment("p := r\"C:\\", 10))
+    assert(not in_string_or_comment("x := \"#\" ", 9))
+
+@test fn should_open_after_a_dot_and_on_names()
+    assert_eq(should_open("p.", 2, '.', false), Trigger.Member)
+    assert_eq(should_open("    p.su", 8, 'u', false), Trigger.Member)
+    assert_eq(should_open("x := 1.", 7, '.', false), Trigger.None)
+    assert_eq(should_open("x := 12", 7, '2', false), Trigger.None)
+    assert_eq(should_open("    pri", 7, 'i', false), Trigger.Name)
+    assert_eq(should_open("    p", 5, 'p', false), Trigger.None)
+    assert_eq(should_open("    pri", 7, 'i', true), Trigger.None)
+
+@test fn should_open_not_while_naming()
+    assert_eq(should_open("fn ave", 6, 'e', false), Trigger.None)
+    assert_eq(should_open("struct Po", 9, 'o', false), Trigger.None)
+    assert_eq(should_open("enum Co", 7, 'o', false), Trigger.None)
+    assert_eq(should_open("    mut to", 10, 'o', false), Trigger.None)
+    assert_eq(should_open("fn Point.su", 11, 'u', false), Trigger.None)
+    assert_eq(should_open("fn f(ab", 7, 'b', false), Trigger.None)
+    assert_eq(should_open("    tot := 0", 7, 't', false), Trigger.None)
+    assert_eq(should_open("fn f(a in", 9, 'n', false), Trigger.Name)
+
+@test fn should_open_modules_and_arguments()
+    assert_eq(should_open("use ", 4, ' ', false), Trigger.Module)
+    assert_eq(should_open("use std.", 8, '.', false), Trigger.Module)
+    assert_eq(should_open("use std.ti", 10, 'i', false), Trigger.Module)
+    assert_eq(should_open("use std.csv as ", 15, ' ', false), Trigger.None)
+    assert_eq(should_open("    add(", 8, '(', false), Trigger.Arg)
+    assert_eq(should_open("    add(1,", 10, ',', false), Trigger.Arg)
+    assert_eq(should_open("fn add(", 7, '(', false), Trigger.None)
+    assert_eq(should_open("    x ", 6, ' ', false), Trigger.None)
+
+fn cand(text str, kind CandKind) Cand
+    Cand(text: text, kind: kind, detail: "", module: "")
+
+@test fn worth_showing_skips_the_typed_word()
+    assert(not worth_showing("ab", List[Cand]()))
+    assert(not worth_showing("total", [cand("total", CandKind.Local)]))
+    assert(worth_showing("tot", [cand("total", CandKind.Local)]))
+    assert(worth_showing("total", [cand("total", CandKind.Local), cand("totals", CandKind.Word)]))
+
+fn texts(cs List[Cand]) List[str]
+    mut out := List[str]()
+    for c in cs
+        out.push(c.text)
+    out
+
+@test fn rank_orders_by_tier_scope_and_recency()
+    cs := [
+        cand("Total", CandKind.Type),
+        cand("tally", CandKind.Function),
+        cand("total", CandKind.Function),
+        cand("to_int", CandKind.Method),
+        cand("totem", CandKind.Local),
+        cand("xyz", CandKind.Word),
+        cand("the_tail", CandKind.Word),
+    ]
+    assert_eq(texts(rank(cs, "to", List[str]())), ["totem", "total", "to_int", "Total"])
+    assert_eq(texts(rank(cs, "to", ["to_int"])), ["to_int", "totem", "total", "Total"])
+    assert_eq(texts(rank(cs, "tl", List[str]())), ["tally", "Total", "total", "the_tail"])
+    assert_eq(rank(cs, "", List[str]()).len(), cs.len())
+    assert_eq(rank(cs, "qq", List[str]()).len(), 0)
+
+@test fn rank_is_stable_on_ties()
+    cs := [cand("bb", CandKind.Word), cand("ba", CandKind.Word), cand("bc", CandKind.Word)]
+    assert_eq(texts(rank(cs, "b", List[str]())), ["bb", "ba", "bc"])
+
+@test fn needs_use_sees_imports_and_builtins()
+    lines := ["use std.csv as c", "use std.time.date", "", "fn main()", "    print(1)"]
+    assert(not needs_use(lines, "std.csv"))
+    assert(not needs_use(lines, "std.time.date"))
+    assert(needs_use(lines, "std.yaml"))
+    assert(not needs_use(lines, "std.fs"))
+    assert(not needs_use(lines, ""))
+    assert(needs_use(["use std.csvx"], "std.csv"))
+    assert(std_modules().contains("std.toml"))
+    assert_eq(module_name("std.time.date"), "date")
+    assert_eq(module_cands().len(), std_modules().len() + builtin_modules().len())
+
+@test fn use_insert_follows_the_files_layout()
+    header := [
+        "## edit: a tool.",
+        "##",
+        "## More.",
+        "",
+        "use std.fs",
+        "use features.multi",
+        "",
+        "fn main()",
+    ]
+    assert_eq(use_insert(header, "std.csv"), Insert(line: 5, text: ["use std.csv"]))
+    assert_eq(use_insert(header, "features.fold"), Insert(line: 6, text: ["use features.fold"]))
+    local := ["use features.multi", "", "fn main()"]
+    assert_eq(use_insert(local, "std.csv"), Insert(line: 0, text: ["use std.csv"]))
+    bare := ["## A tool.", "", "fn main()"]
+    assert_eq(use_insert(bare, "std.csv"), Insert(line: 2, text: ["use std.csv", ""]))
+    documented := ["## Adds.", "fn add(a int) int", "    a"]
+    assert_eq(use_insert(documented, "std.csv"), Insert(line: 0, text: ["use std.csv", ""]))
+    assert_eq(use_insert(["# only"], "std.csv"), Insert(line: 1, text: ["", "use std.csv"]))
+
+@test fn ask_output_parses_into_rows()
+    a := "fs.read_text(path str) str ! IoError   (std.fs.1)"
+    b := "List.sorted(by: |x| key) List[T]   (type.coll.11)"
+    out := "{a}\n{b}\n"
+    l := parse_ask(out)
+    assert_eq(l.rows.len(), 2)
+    assert_eq(l.rows[0].module, "fs")
+    assert_eq(l.rows[0].name, "read_text")
+    assert_eq(l.rows[0].signature, "read_text(path str) str ! IoError")
+    assert_eq(l.rows[0].rule, "std.fs.1")
+    assert_eq(l.rows[1].module, "List")
+    assert_eq(l.notes.len(), 0)
+    miss := parse_ask("nothing in std matches sqlite database\nuse a file\n")
+    assert_eq(miss.rows.len(), 0)
+    assert_eq(miss.notes, ["nothing in std matches sqlite database", "use a file"])
+    assert_eq(find_row(l.rows, "fs.read_text"), l.rows[0])
+    assert_eq(find_row(l.rows, "sorted"), l.rows[1])
+    assert_eq(find_row(l.rows, "nope"), none)
+    assert_eq(parse_row("just text"), none)
+
+@test fn card_output_and_topics()
+    m := parse_card("time.date.utc(ms int) Date   (std.date.1)\n")
+    assert_eq(m.rows[0].module, "time.date")
+    assert_eq(m.rows[0].name, "utc")
+    sec := parse_card("## Absence and errors\n\ntext here\n")
+    assert_eq(sec.rows.len(), 0)
+    assert_eq(sec.notes, ["## Absence and errors", "", "text here"])
+    topics := "Running programs, Layout, core, std.MODULE"
+    err := "error: no card topic `x` (tool.card.3); topics: {topics}"
+    assert_eq(card_topics(err), ["Running programs", "Layout", "core", "std.MODULE"])
+    assert_eq(card_topics("other"), List[str]())
+
+@test fn lookup_arguments()
+    assert_eq(ask_args(" read  a file "), ["ask", "std", "read", "a", "file"])
+    assert_eq(ask_args("(str) int?"), ["ask", "std", "--sig", "(str) int?"])
+    assert_eq(card_args(""), ["card"])
+    assert_eq(card_args("std.fs"), ["card", "std.fs"])
+
+@test fn hover_lays_out_for_a_width()
+    h := hover_text(
+        "fn half(n int) int",
+        "Half of n.\n\nRounds down.",
+        ["requires n >= 0"],
+        ["io", "fs"],
+        40,
+    )
+    assert_eq(h, [
+        "fn half(n int) int",
+        "",
+        "Half of n.",
+        "",
+        "Rounds down.",
+        "",
+        "requires n >= 0",
+        "effects: io, fs",
+    ])
+    w := hover_text("fn long(alpha int, beta int, gamma int) int", "", List[str](), List[str](), 20)
+    assert_eq(w, ["fn long(alpha int,", "    beta int, gamma", "    int) int"])
+    for wl in w
+        assert(wl.len() <= 20)
+    cut := hover_text("abcdefghijklmnopqrstuvwxyz", "", List[str](), List[str](), 10)
+    for cl in cut
+        assert(cl.len() <= 10)
+    r := parse_row("fs.exists(path str) bool   (std.fs.4)") else return
+    rh := row_hover(r, 60)
+    assert_eq(rh, ["fs.exists(path str) bool", "", "rule std.fs.4 (ail explain std.fs.4)"])
+
+@test fn live_check_waits_for_a_pause()
+    mut lv := Live.new(500)
+    assert(not lv.due(10000))
+    lv.edited(1000)
+    assert(not lv.due(1400))
+    assert(lv.due(1500))
+    g := lv.started(1500)
+    assert(not lv.due(5000))
+    assert(lv.finished(g, 1700))
+    assert(not lv.due(9000))
+    lv.enabled = false
+    lv.edited(10000)
+    assert(not lv.due(20000))
+
+@test fn live_check_drops_stale_results()
+    mut lv := Live.new(500)
+    lv.edited(0)
+    g := lv.started(600)
+    lv.edited(700)
+    assert(not lv.finished(g, 900))
+    assert(lv.due(1200))
+
+@test fn live_check_backs_off_on_slow_checks()
+    mut lv := Live.new(500)
+    lv.edited(0)
+    g := lv.started(500)
+    _ := lv.finished(g, 2500)
+    assert_eq(lv.delay, 2000)
+    lv.edited(3000)
+    assert(not lv.due(4000))
+    assert(lv.due(5000))
+    g2 := lv.started(5000)
+    _ := lv.finished(g2, 5100)
+    assert_eq(lv.delay, 500)
+
+@test fn doctor_output_parses()
+    l1 := "ok    toolchain: /opt/ail"
+    l2 := "warn  path: no `ail` on PATH; fix: add this line: export PATH=\"/opt/ail:$PATH\""
+    l3 := "fail  cache: /x is not writable; fix: run chmod"
+    out := "{l1}\n{l2}\n{l3}\n"
+    d := parse_doctor(out)
+    assert_eq(d.checks.len(), 3)
+    assert(not d.ok)
+    first := DoctorCheck(name: "toolchain", ok: true, status: "ok", message: "/opt/ail", fix: "")
+    assert_eq(d.checks[0], first)
+    assert_eq(d.checks[1].fix, "add this line: export PATH=\"/opt/ail:$PATH\"")
+    assert_eq(d.checks[1].message, "no `ail` on PATH")
+    assert_eq(problems(d).len(), 2)
+    assert_eq(problems(d)[1], "cache: /x is not writable; fix: run chmod")
+    good := parse_doctor("ok    version: 0.1.0, seed seed-2026.11.14b\nnoise\n")
+    assert(good.ok)
+    assert_eq(good.checks[0].message, "0.1.0, seed seed-2026.11.14b")
+
+@test fn version_and_status_segment()
+    v := "ail 0.1.0 (v0.1.0-3-g64f5cae, native)\n"
+    assert_eq(parse_version(v), "0.1.0")
+    assert_eq(parse_describe(v), "v0.1.0-3-g64f5cae")
+    assert_eq(parse_describe("ail 0.1.0 (abc1234-dirty, native)"), "abc1234")
+    assert_eq(parse_describe("ail 0.1.0 (unknown, native)"), "")
+    assert_eq(parse_version("bash: ail: not found"), "")
+    assert_eq(status_segment("0.1.0"), "ail 0.1.0")
+    assert_eq(status_segment(""), "ail ?")
+
+@test fn pin_mismatch_compares_commits_and_versions()
+    pin := "64f5caef6e5a44a343e97b3f021c8cc5358f587a\n"
+    assert_eq(pin_mismatch(pin, "ail 0.1.0 (v0.1.0-3-g64f5cae, native)"), none)
+    assert_eq(pin_mismatch(pin, "ail 0.1.0 (64f5caef6e5a, native)"), none)
+    assert_eq(pin_mismatch(pin, "ail 0.1.0 (v0.1.0, native)"), none)
+    wrong := pin_mismatch(pin, "ail 0.1.0 (v0.1.0-9-g1234abc, native)") else ""
+    assert(wrong.starts_with(".ail-version pins ail 64f5caef6e5a"))
+    assert(wrong.contains("0.1.0 (v0.1.0-9-g1234abc)"))
+    assert_eq(pin_mismatch("0.1.0", "ail 0.1.0 (v0.1.0, native)"), none)
+    assert_eq(pin_mismatch("v0.1.0", "ail 0.1.0 (v0.1.0, native)"), none)
+    assert(pin_mismatch("0.2.0", "ail 0.1.0 (v0.1.0, native)") != none)
+    assert_eq(pin_mismatch("", "ail 0.1.0"), none)
