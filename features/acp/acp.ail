@@ -1,0 +1,1088 @@
+## Agent Client Protocol (parity plan D5, lane W1): the editor is the client
+## of a coding agent (Claude Code, Codex, Gemini CLI, ...) that speaks ACP,
+## JSON-RPC 2.0 with one JSON message per line over the agent process's
+## standard input and output. Checked against the published schema of
+## protocol version 1.
+##
+## Pure: the wiring step owns the process (`proc.start`), sends each line
+## this module returns followed by "\n", and feeds every line the agent
+## writes to `Session.take`. The builders return one line of JSON text each,
+## with no line ending. `parse` turns one line into an `Incoming`.
+
+## The protocol version the editor speaks (ACP `protocolVersion`).
+PROTOCOL_VERSION := 1
+
+# ---- What the agent sends ------------------------------------------------
+
+## ACP `ToolKind`: what a tool call does, for its icon. `Rename` is ACP `move`.
+pub enum ToolKind
+    Read
+    Edit
+    Delete
+    Rename
+    Search
+    Execute
+    Think
+    Fetch
+    SwitchMode
+    Other
+
+## ACP `ToolCallStatus`.
+pub enum ToolStatus
+    Pending
+    InProgress
+    Completed
+    Failed
+
+## ACP `PlanEntryStatus`: `pending`, `in_progress`, `completed`.
+pub enum PlanStatus
+    Waiting
+    Working
+    Finished
+
+## ACP `PermissionOptionKind`.
+pub enum PermKind
+    AllowOnce
+    AllowAlways
+    RejectOnce
+    RejectAlways
+
+## A file a tool call touches. `line` is 1-based, as ACP sends it.
+pub struct Location
+    pub path str
+    pub line int?
+
+## A proposed change to one file. `old_text` is `none` for a new file.
+pub struct DiffPart
+    pub path str
+    pub old_text str?
+    pub new_text str
+
+## A tool call as the agent starts it (ACP `tool_call`). `texts` are its
+## content blocks as text, `diffs` its diff blocks.
+pub struct ToolCall
+    pub id str
+    pub title str
+    pub kind ToolKind
+    pub status ToolStatus
+    pub locations List[Location]
+    pub texts List[str]
+    pub diffs List[DiffPart]
+
+## A change to a tool call (ACP `tool_call_update`, also the `toolCall` of a
+## permission request): only the fields the agent sent are set.
+pub struct ToolUpdate
+    pub id str
+    pub title str?
+    pub kind ToolKind?
+    pub status ToolStatus?
+    pub locations List[Location]
+    pub texts List[str]
+    pub diffs List[DiffPart]
+
+## One step of the agent's plan; `priority` is `high`, `medium` or `low`.
+pub struct PlanEntry
+    pub content str
+    pub priority str
+    pub status PlanStatus
+
+## A slash command the agent offers (ACP `AvailableCommand`).
+pub struct Command
+    pub name str
+    pub description str
+
+## One choice of a permission request.
+pub struct PermOption
+    pub id str
+    pub name str
+    pub kind PermKind
+
+## `session/request_permission`: the agent asks before running `tool`.
+## `id` is the request's JSON-RPC id, echoed in the reply.
+pub struct PermissionRequest
+    pub id Json
+    pub session str
+    pub tool ToolUpdate
+    pub options List[PermOption]
+
+## `fs/read_text_file`: `line` (1-based) and `limit` (lines) are optional.
+pub struct ReadRequest
+    pub id Json
+    pub session str
+    pub path str
+    pub line int?
+    pub limit int?
+
+## `fs/write_text_file`: the agent wants `path` to hold `content`.
+pub struct WriteRequest
+    pub id Json
+    pub session str
+    pub path str
+    pub content str
+
+## A `session/update` notification. Content blocks other than text become
+## a bracketed name (`[a.ail]` for a resource link, `[image]`). Any other
+## kind (`usage_update`, `notice`, ...) is `OtherUpdate` with its name.
+pub enum Update
+    AgentText(text str)
+    AgentThought(text str)
+    UserText(text str)
+    ToolStart(call ToolCall)
+    ToolChange(change ToolUpdate)
+    PlanChange(entries List[PlanEntry])
+    Commands(commands List[Command])
+    ModeChange(mode str)
+    OtherUpdate(name str)
+
+## One line from the agent. `Reply` and `Failure` answer the editor's own
+## requests (ids are ints, `-1` when missing). `Unknown` keeps the method and
+## the id (`none` for a notification); a line that is not JSON is
+## `Unknown` with method "".
+pub enum Incoming
+    Reply(id int, result Json)
+    Failure(id int, code int, message str)
+    SessionUpdate(session str, update Update)
+    AskPermission(req PermissionRequest)
+    ReadText(req ReadRequest)
+    WriteText(req WriteRequest)
+    Unknown(method str, id Json?)
+
+# ---- Builders --------------------------------------------------------------
+
+fn jm(key str, value Json) JsonMember
+    JsonMember(key: key, value: value)
+
+fn jnum(n int) Json
+    Json.Num(n.to_float())
+
+fn request(id int, method str, params Json) str
+    Json.Obj([
+        jm("jsonrpc", Json.Str("2.0")),
+        jm("id", jnum(id)),
+        jm("method", Json.Str(method)),
+        jm("params", params),
+    ]).to_text()
+
+fn notify(method str, params Json) str
+    Json.Obj([
+        jm("jsonrpc", Json.Str("2.0")),
+        jm("method", Json.Str(method)),
+        jm("params", params),
+    ]).to_text()
+
+fn reply(id Json, result Json) str
+    Json.Obj([jm("jsonrpc", Json.Str("2.0")), jm("id", id), jm("result", result)]).to_text()
+
+## `initialize`: protocol version 1, file reads and writes served by the
+## editor, no terminal, and the client's `name` and `version`.
+pub fn initialize_line(id int, name str, version str) str
+    files := Json.Obj([jm("readTextFile", Json.Bool(true)), jm("writeTextFile", Json.Bool(true))])
+    caps := Json.Obj([jm("fs", files), jm("terminal", Json.Bool(false))])
+    info := Json.Obj([jm("name", Json.Str(name)), jm("version", Json.Str(version))])
+    params := Json.Obj([
+        jm("protocolVersion", jnum(PROTOCOL_VERSION)),
+        jm("clientCapabilities", caps),
+        jm("clientInfo", info),
+    ])
+    request(id, "initialize", params)
+
+## `session/new` in the absolute directory `cwd`, with no MCP servers.
+pub fn new_session_line(id int, cwd str) str
+    params := Json.Obj([jm("cwd", Json.Str(cwd)), jm("mcpServers", Json.Arr([]))])
+    request(id, "session/new", params)
+
+## A `file://` URI for an absolute path; a Windows path gets forward slashes.
+fn file_uri(path str) str
+    p := path.replace("\\", "/")
+    if p.starts_with("/")
+        return "file://{p}"
+    "file:///{p}"
+
+fn base_name(path str) str
+    parts := path.replace("\\", "/").split("/")
+    parts[parts.len() - 1]
+
+## `session/prompt`: a text block (left out when `text` is empty), then one
+## resource link per mentioned file (absolute paths).
+pub fn prompt_line(id int, session str, text str, files List[str]) str
+    mut blocks := List[Json]()
+    if text != ""
+        blocks.push(Json.Obj([jm("type", Json.Str("text")), jm("text", Json.Str(text))]))
+    for f in files
+        blocks.push(Json.Obj([
+            jm("type", Json.Str("resource_link")),
+            jm("uri", Json.Str(file_uri(f))),
+            jm("name", Json.Str(base_name(f))),
+        ]))
+    params := Json.Obj([jm("sessionId", Json.Str(session)), jm("prompt", Json.Arr(blocks))])
+    request(id, "session/prompt", params)
+
+## The `session/cancel` notification: stop the running turn.
+pub fn cancel_line(session str) str
+    notify("session/cancel", Json.Obj([jm("sessionId", Json.Str(session))]))
+
+## The reply to `fs/read_text_file` request `id`: the text read.
+pub fn read_reply(id Json, content str) str
+    reply(id, Json.Obj([jm("content", Json.Str(content))]))
+
+## The reply to `fs/write_text_file` request `id`: an empty object.
+pub fn write_reply(id Json) str
+    reply(id, Json.Obj([]))
+
+## The reply to `session/request_permission` request `id`: option `option`.
+pub fn permission_reply(id Json, option str) str
+    outcome := Json.Obj([jm("outcome", Json.Str("selected")), jm("optionId", Json.Str(option))])
+    reply(id, Json.Obj([jm("outcome", outcome)]))
+
+## The reply to `session/request_permission` request `id` when the prompt was
+## dismissed or the turn cancelled.
+pub fn permission_cancelled(id Json) str
+    reply(id, Json.Obj([jm("outcome", Json.Obj([jm("outcome", Json.Str("cancelled"))]))]))
+
+## A JSON-RPC error reply to request `id`: -32601 method not found, -32002
+## resource not found, -32603 internal error.
+pub fn error_reply(id Json, code int, message str) str
+    er := Json.Obj([jm("code", jnum(code)), jm("message", Json.Str(message))])
+    Json.Obj([jm("jsonrpc", Json.Str("2.0")), jm("id", id), jm("error", er)]).to_text()
+
+# ---- Parsing ---------------------------------------------------------------
+
+fn tool_kind(s str) ToolKind
+    match s
+        "read" => ToolKind.Read
+        "edit" => ToolKind.Edit
+        "delete" => ToolKind.Delete
+        "move" => ToolKind.Rename
+        "search" => ToolKind.Search
+        "execute" => ToolKind.Execute
+        "think" => ToolKind.Think
+        "fetch" => ToolKind.Fetch
+        "switch_mode" => ToolKind.SwitchMode
+        _ => ToolKind.Other
+
+fn tool_status(s str) ToolStatus
+    match s
+        "in_progress" => ToolStatus.InProgress
+        "completed" => ToolStatus.Completed
+        "failed" => ToolStatus.Failed
+        _ => ToolStatus.Pending
+
+fn status_name(s ToolStatus) str
+    match s
+        ToolStatus.Pending => "pending"
+        ToolStatus.InProgress => "in_progress"
+        ToolStatus.Completed => "completed"
+        ToolStatus.Failed => "failed"
+
+fn plan_status(s str) PlanStatus
+    match s
+        "in_progress" => PlanStatus.Working
+        "completed" => PlanStatus.Finished
+        _ => PlanStatus.Waiting
+
+fn plan_mark(s PlanStatus) str
+    match s
+        PlanStatus.Waiting => "[ ]"
+        PlanStatus.Working => "[>]"
+        PlanStatus.Finished => "[x]"
+
+fn perm_kind(s str) PermKind
+    match s
+        "allow_once" => PermKind.AllowOnce
+        "allow_always" => PermKind.AllowAlways
+        "reject_always" => PermKind.RejectAlways
+        _ => PermKind.RejectOnce
+
+## A content block as text: text as is, anything else as `[name]`.
+fn block_text(b Json) str
+    t := b.text("type", "")
+    if t == "text"
+        return b.text("text", "")
+    if t == "resource_link"
+        uri := b.text("uri", "")
+        return "[{b.text("name", uri)}]"
+    if t == "resource"
+        res := b.get("resource") else Json.Null
+        return "[{res.text("uri", "resource")}]"
+    "[{t}]"
+
+fn chunk_text(u Json) str
+    block_text(u.get("content") else Json.Null)
+
+fn locations_of(u Json) List[Location]
+    mut out := List[Location]()
+    for l in u.arr("locations") else []
+        out.push(Location(path: l.text("path", ""), line: l.int("line")))
+    out
+
+fn texts_of(u Json) List[str]
+    mut out := List[str]()
+    for c in u.arr("content") else []
+        t := c.text("type", "")
+        if t == "content"
+            out.push(block_text(c.get("content") else Json.Null))
+        elif t == "terminal"
+            term := c.text("terminalId", "")
+            out.push("[terminal {term}]")
+    out
+
+fn diffs_of(u Json) List[DiffPart]
+    mut out := List[DiffPart]()
+    for c in u.arr("content") else []
+        if c.text("type", "") == "diff"
+            out.push(DiffPart(
+                path: c.text("path", ""),
+                old_text: c.str("oldText"),
+                new_text: c.text("newText", ""),
+            ))
+    out
+
+fn tool_call_of(u Json) ToolCall
+    ToolCall(
+        id: u.text("toolCallId", ""),
+        title: u.text("title", ""),
+        kind: tool_kind(u.text("kind", "other")),
+        status: tool_status(u.text("status", "pending")),
+        locations: locations_of(u),
+        texts: texts_of(u),
+        diffs: diffs_of(u),
+    )
+
+fn kind_opt(u Json) ToolKind?
+    s := u.str("kind") else return none
+    tool_kind(s)
+
+fn status_opt(u Json) ToolStatus?
+    s := u.str("status") else return none
+    tool_status(s)
+
+fn tool_update_of(u Json) ToolUpdate
+    ToolUpdate(
+        id: u.text("toolCallId", ""),
+        title: u.str("title"),
+        kind: kind_opt(u),
+        status: status_opt(u),
+        locations: locations_of(u),
+        texts: texts_of(u),
+        diffs: diffs_of(u),
+    )
+
+fn plan_of(u Json) List[PlanEntry]
+    mut out := List[PlanEntry]()
+    for e in u.arr("entries") else []
+        out.push(PlanEntry(
+            content: e.text("content", ""),
+            priority: e.text("priority", "medium"),
+            status: plan_status(e.text("status", "pending")),
+        ))
+    out
+
+fn commands_of(u Json) List[Command]
+    mut out := List[Command]()
+    for c in u.arr("availableCommands") else []
+        out.push(Command(name: c.text("name", ""), description: c.text("description", "")))
+    out
+
+fn update_of(u Json) Update
+    kind := u.text("sessionUpdate", "")
+    match kind
+        "agent_message_chunk" => Update.AgentText(text: chunk_text(u))
+        "agent_thought_chunk" => Update.AgentThought(text: chunk_text(u))
+        "user_message_chunk" => Update.UserText(text: chunk_text(u))
+        "tool_call" => Update.ToolStart(call: tool_call_of(u))
+        "tool_call_update" => Update.ToolChange(change: tool_update_of(u))
+        "plan" => Update.PlanChange(entries: plan_of(u))
+        "available_commands_update" => Update.Commands(commands: commands_of(u))
+        "current_mode_update" => Update.ModeChange(mode: u.text("currentModeId", ""))
+        _ => Update.OtherUpdate(name: kind)
+
+fn permission_of(id Json, p Json) PermissionRequest
+    mut options := List[PermOption]()
+    for o in p.arr("options") else []
+        options.push(PermOption(
+            id: o.text("optionId", ""),
+            name: o.text("name", ""),
+            kind: perm_kind(o.text("kind", "")),
+        ))
+    PermissionRequest(
+        id: id,
+        session: p.text("sessionId", ""),
+        tool: tool_update_of(p.get("toolCall") else Json.Obj([])),
+        options: options,
+    )
+
+fn reply_of(j Json) Incoming
+    id := j.int("id") else -1
+    if er := j.get("error")
+        code := er.int("code") else 0
+        return Incoming.Failure(id: id, code: code, message: er.text("message", ""))
+    Incoming.Reply(id: id, result: j.get("result") else Json.Null)
+
+## One line from the agent, decoded.
+pub fn parse(line str) Incoming
+    j := parse_json(line) else return Incoming.Unknown(method: "", id: none)
+    method := j.text("method", "")
+    if method == ""
+        return reply_of(j)
+    p := j.get("params") else Json.Obj([])
+    rid := j.get("id") else Json.Null
+    session := p.text("sessionId", "")
+    up := p.get("update") else Json.Null
+    match method
+        "session/update" => Incoming.SessionUpdate(session: session, update: update_of(up))
+        "session/request_permission" => Incoming.AskPermission(req: permission_of(rid, p))
+        "fs/read_text_file" =>
+            Incoming.ReadText(req: ReadRequest(
+                id: rid,
+                session: session,
+                path: p.text("path", ""),
+                line: p.int("line"),
+                limit: p.int("limit"),
+            ))
+        "fs/write_text_file" =>
+            Incoming.WriteText(req: WriteRequest(
+                id: rid,
+                session: session,
+                path: p.text("path", ""),
+                content: p.text("content", ""),
+            ))
+        _ => Incoming.Unknown(method: method, id: j.get("id"))
+
+## The text a `fs/read_text_file` reply carries from a buffer's `lines`:
+## from 1-based `line` (default 1), at most `limit` lines (default all),
+## joined with "\n".
+pub fn read_slice(lines List[str], line int?, limit int?) str
+    first := ((line else 1) - 1).max(0).min(lines.len())
+    mut last := lines.len()
+    if n := limit
+        last = (first + n.max(0)).min(lines.len())
+    lines[first..last].join("\n")
+
+# ---- Session -----------------------------------------------------------------
+
+## Where the session is: `Starting` until the agent made a session, `Ready`
+## for a prompt, `Running` during a turn, `Stopped` for good.
+pub enum SessionState
+    Starting
+    Ready
+    Running
+    Stopped
+
+## Who a transcript row is from. `Editor` rows are the client's own notes.
+pub enum Who
+    User
+    Agent
+    Editor
+
+## What a transcript row shows, for its colour.
+pub enum RowKind
+    Message
+    Thought
+    Tool
+    Plan
+    Diff
+    Permission
+    Note
+
+## One row of the agent panel. `text` may hold several lines ("\n").
+pub struct Row
+    pub who Who
+    pub kind RowKind
+    pub text str
+    ## A tool row's status (`pending`, `completed`, ...), a diff row's line
+    ## counts (`-1 +2`, `new +3`), a permission row's answer; else "".
+    pub tag str
+    ## The tool call id of a tool, diff or permission row; else "".
+    pub call str
+
+## What the editor must do after `Session.take`: nothing; send these lines;
+## read a file and send `read_reply`; write a file (as a reviewable change)
+## and send `write_reply`; or show a permission prompt and call
+## `Session.answer_permission`.
+pub enum Action
+    Nothing
+    SendLines(lines List[str])
+    ReadFile(req ReadRequest)
+    WriteFile(req WriteRequest)
+    Ask(req PermissionRequest)
+
+## One conversation with one agent process.
+pub struct Session
+    ## The id of the next request the editor sends.
+    pub next_id int
+    pub session_id str
+    pub state SessionState
+    pub rows List[Row]
+    pub cwd str
+    ## The agent's current mode id, "" when it has none.
+    pub mode str
+    ## The stop reason of the last turn (`end_turn`, `cancelled`, ...).
+    pub stop str
+    pub commands List[Command]
+    pub plan List[PlanEntry]
+    ## Every diff the agent proposed, in order, without repeats.
+    pub diffs List[DiffPart]
+    ## The permission request waiting for an answer.
+    pub asking PermissionRequest?
+    init_id int
+    new_id int
+    prompt_id int
+
+## A session for the absolute directory `cwd`; call `start` next.
+pub fn open(cwd str) Session
+    Session(
+        next_id: 0,
+        session_id: "",
+        state: SessionState.Starting,
+        rows: [],
+        cwd: cwd,
+        mode: "",
+        stop: "",
+        commands: [],
+        plan: [],
+        diffs: [],
+        asking: none,
+        init_id: -1,
+        new_id: -1,
+        prompt_id: -1,
+    )
+
+fn row(who Who, kind RowKind, text str) Row
+    Row(who: who, kind: kind, text: text, tag: "", call: "")
+
+fn Session.fresh_id(mut self) int
+    id := self.next_id
+    self.next_id += 1
+    id
+
+fn Session.note(mut self, text str)
+    self.rows.push(row(Who.Editor, RowKind.Note, text))
+
+## The first line to send: `initialize`, naming the client `name` `version`.
+## The `session/new` request follows by itself when the agent answers.
+pub fn Session.start(mut self, name str, version str) str
+    id := self.fresh_id()
+    self.init_id = id
+    initialize_line(id, name, version)
+
+## The agent process ended or failed: the session stops, with `why` as a note.
+pub fn Session.ended(mut self, why str)
+    self.state = SessionState.Stopped
+    self.asking = none
+    self.note(why)
+
+## Sends `text` and the mentioned `files` (absolute paths) as a prompt. The
+## lines to send; none, with a note, unless the session is `Ready`.
+pub fn Session.prompt(mut self, text str, files List[str]) List[str]
+    if self.state != SessionState.Ready
+        self.note("the agent is not ready")
+        return List[str]()
+    id := self.fresh_id()
+    self.prompt_id = id
+    self.state = SessionState.Running
+    self.stop = ""
+    mut shown := text
+    for f in files
+        shown = "{shown}\n@{f}"
+    self.rows.push(row(Who.User, RowKind.Message, shown))
+    [prompt_line(id, self.session_id, text, files)]
+
+## Asks the agent to stop the running turn. A waiting permission request is
+## answered `cancelled`, as ACP requires. The turn ends when the prompt's
+## reply comes (stop reason `cancelled`).
+pub fn Session.cancel(mut self) List[str]
+    if self.state != SessionState.Running
+        return List[str]()
+    mut out := [cancel_line(self.session_id)]
+    if ask := self.asking
+        out.push(permission_cancelled(ask.id))
+        self.mark_permission("cancelled")
+        self.asking = none
+    self.note("cancel sent")
+    out
+
+## Answers the waiting permission request with option id `option`; an id
+## the request does not offer (such as "") answers `cancelled`. The lines
+## to send; none when nothing is waiting.
+pub fn Session.answer_permission(mut self, option str) List[str]
+    ask := self.asking else return List[str]()
+    self.asking = none
+    for o in ask.options
+        if o.id == option
+            self.mark_permission(o.name)
+            return [permission_reply(ask.id, option)]
+    self.mark_permission("cancelled")
+    [permission_cancelled(ask.id)]
+
+fn Session.mark_permission(mut self, answer str)
+    mut k := self.rows.len() - 1
+    while k >= 0
+        if self.rows[k].kind == RowKind.Permission
+            self.rows[k].tag = answer
+            return
+        k -= 1
+
+## The index of the last tool row for tool call `id`, or -1.
+fn Session.tool_row(self, id str) int
+    mut k := self.rows.len() - 1
+    while k >= 0
+        if self.rows[k].kind == RowKind.Tool and self.rows[k].call == id
+            return k
+        k -= 1
+    -1
+
+## Streamed text: appended to the last row when it has the same speaker and
+## kind, else a new row.
+fn Session.stream(mut self, who Who, kind RowKind, text str)
+    n := self.rows.len()
+    if n > 0 and self.rows[n - 1].who == who and self.rows[n - 1].kind == kind
+        last := self.rows[n - 1].text
+        self.rows[n - 1].text = "{last}{text}"
+        return
+    self.rows.push(row(who, kind, text))
+
+fn line_count(s str) int
+    if s == "" then 0 else s.split("\n").len()
+
+fn diff_tag(d DiffPart) str
+    added := line_count(d.new_text)
+    if was := d.old_text
+        return "-{line_count(was)} +{added}"
+    "new +{added}"
+
+fn Session.add_diffs(mut self, id str, parts List[DiffPart])
+    for d in parts
+        if self.diffs.contains(d)
+            continue
+        self.diffs.push(d)
+        self.rows.push(Row(
+            who: Who.Agent,
+            kind: RowKind.Diff,
+            text: d.path,
+            tag: diff_tag(d),
+            call: id,
+        ))
+
+fn Session.tool_started(mut self, call ToolCall)
+    mut parts := [call.title]
+    parts.extend(call.texts)
+    self.rows.push(Row(
+        who: Who.Agent,
+        kind: RowKind.Tool,
+        text: parts.join("\n"),
+        tag: status_name(call.status),
+        call: call.id,
+    ))
+    self.add_diffs(call.id, call.diffs)
+
+## A tool row's text is its title, then its content blocks; an update's
+## content replaces the old content, as ACP says.
+fn Session.tool_changed(mut self, change ToolUpdate)
+    mut i := self.tool_row(change.id)
+    if i < 0
+        mut fresh := row(Who.Agent, RowKind.Tool, change.id)
+        fresh.call = change.id
+        self.rows.push(fresh)
+        i = self.rows.len() - 1
+    was := self.rows[i].text.split("\n")
+    mut parts := [change.title else was[0]]
+    if change.texts.len() > 0
+        parts.extend(change.texts)
+    else
+        parts.extend(was[1..])
+    self.rows[i].text = parts.join("\n")
+    if st := change.status
+        self.rows[i].tag = status_name(st)
+    self.add_diffs(change.id, change.diffs)
+
+## The plan is one row, rewritten in place by each new plan.
+fn Session.plan_changed(mut self, entries List[PlanEntry])
+    self.plan = entries
+    mut lines := List[str]()
+    for e in entries
+        lines.push("{plan_mark(e.status)} {e.content}")
+    text := lines.join("\n")
+    for k in 0..self.rows.len()
+        if self.rows[k].kind == RowKind.Plan
+            self.rows[k].text = text
+            return
+    self.rows.push(row(Who.Agent, RowKind.Plan, text))
+
+fn Session.on_update(mut self, session str, update Update) Action
+    if self.session_id != "" and session != self.session_id
+        return Action.Nothing
+    match update
+        AgentText(t1) => self.stream(Who.Agent, RowKind.Message, t1)
+        AgentThought(t2) => self.stream(Who.Agent, RowKind.Thought, t2)
+        UserText(t3) => self.stream(Who.User, RowKind.Message, t3)
+        ToolStart(call) => self.tool_started(call)
+        ToolChange(change) => self.tool_changed(change)
+        PlanChange(entries) => self.plan_changed(entries)
+        Commands(cmds) => self.commands = cmds
+        ModeChange(mode) => self.mode = mode
+        OtherUpdate(_) => return Action.Nothing
+    Action.Nothing
+
+fn Session.on_reply(mut self, id int, result Json) Action
+    if id < 0
+        return Action.Nothing
+    if id == self.init_id
+        v := result.int("protocolVersion") else 0
+        if v != PROTOCOL_VERSION
+            self.ended("the agent speaks ACP version {v}, the editor {PROTOCOL_VERSION}")
+            return Action.Nothing
+        nid := self.fresh_id()
+        self.new_id = nid
+        return Action.SendLines(lines: [new_session_line(nid, self.cwd)])
+    if id == self.new_id
+        self.session_id = result.text("sessionId", "")
+        modes := result.get("modes") else Json.Null
+        self.mode = modes.text("currentModeId", "")
+        self.state = SessionState.Ready
+        return Action.Nothing
+    if id == self.prompt_id
+        self.stop = result.text("stopReason", "")
+        self.state = SessionState.Ready
+        self.prompt_id = -1
+        self.asking = none
+        if self.stop != "end_turn"
+            self.note("stopped: {self.stop}")
+    Action.Nothing
+
+fn Session.on_failure(mut self, id int, code int, message str) Action
+    if id < 0
+        self.note("agent error: {message} (code {code})")
+    elif id == self.init_id or id == self.new_id
+        self.ended("the agent did not start: {message} (code {code})")
+    elif id == self.prompt_id
+        self.state = SessionState.Ready
+        self.prompt_id = -1
+        self.asking = none
+        self.note("error: {message} (code {code})")
+    Action.Nothing
+
+fn Session.on_permission(mut self, ask PermissionRequest) Action
+    mut title := ask.tool.title else ""
+    if title == ""
+        k := self.tool_row(ask.tool.id)
+        if k >= 0
+            title = self.rows[k].text.split("\n")[0]
+    if title == ""
+        title = ask.tool.id
+    self.asking = ask
+    mut asked := row(Who.Agent, RowKind.Permission, title)
+    asked.call = ask.tool.id
+    self.rows.push(asked)
+    Action.Ask(req: ask)
+
+fn Session.on_write(mut self, wr WriteRequest) Action
+    self.note("agent writes {wr.path}")
+    Action.WriteFile(req: wr)
+
+fn unknown_action(method str, id Json?) Action
+    rid := id else return Action.Nothing
+    Action.SendLines(lines: [error_reply(rid, -32601, "method not found: {method}")])
+
+## Applies one line from the agent and says what the editor must do now.
+## Updates for another session are ignored; an agent request the editor
+## does not serve (`terminal/*`, ...) is answered "method not found".
+pub fn Session.take(mut self, line str) Action
+    match parse(line)
+        Reply(rid, result) => self.on_reply(rid, result)
+        Failure(fid, code, message) => self.on_failure(fid, code, message)
+        SessionUpdate(session, up) => self.on_update(session, up)
+        AskPermission(ask) => self.on_permission(ask)
+        ReadText(rd) => Action.ReadFile(req: rd)
+        WriteText(wr) => self.on_write(wr)
+        Unknown(method, uid) => unknown_action(method, uid)
+
+# ---- Tests -------------------------------------------------------------------
+
+## Test lines are written with ' for " so they stay readable.
+fn q(s str) str
+    s.replace("'", "\"")
+
+fn upd(body str) str
+    p := "\{'sessionId':'s1','update':\{{body}}}"
+    q("\{'jsonrpc':'2.0','method':'session/update','params':{p}}")
+
+fn chunk(kind str, text str) str
+    upd("'sessionUpdate':'{kind}','content':\{'type':'text','text':'{text}'}")
+
+fn agent_req(id int, method str, params str) str
+    q("\{'jsonrpc':'2.0','id':{id},'method':'{method}','params':\{{params}}}")
+
+fn ok(id int, result str) str
+    q("\{'jsonrpc':'2.0','id':{id},'result':\{{result}}}")
+
+fn opt(id str, name str, kind str) str
+    "\{'optionId':'{id}','name':'{name}','kind':'{kind}'}"
+
+fn entry(content str, priority str, status str) str
+    "\{'content':'{content}','priority':'{priority}','status':'{status}'}"
+
+fn update_in(line str) Update
+    match parse(line)
+        SessionUpdate(_, up) => up
+        _ => Update.OtherUpdate(name: "not an update")
+
+fn r(who Who, kind RowKind, text str, tag str, call str) Row
+    Row(who: who, kind: kind, text: text, tag: tag, call: call)
+
+@test fn requests_are_one_line_of_acp()
+    init := initialize_line(0, "ail-edit", "0.1")
+    files := "'fs':\{'readTextFile':true,'writeTextFile':true}"
+    caps := "'clientCapabilities':\{{files},'terminal':false}"
+    info := "'clientInfo':\{'name':'ail-edit','version':'0.1'}"
+    params := "\{'protocolVersion':1,{caps},{info}}"
+    assert_eq(init, q("\{'jsonrpc':'2.0','id':0,'method':'initialize','params':{params}}"))
+    assert(not init.contains("\n"))
+    news := parse_json(new_session_line(1, "/w"))?
+    assert_eq(news.text("method", ""), "session/new")
+    assert_eq(news.int("id") else -1, 1)
+    np := news.get("params") else Json.Null
+    assert_eq(np.text("cwd", ""), "/w")
+    assert_eq(np.arr("mcpServers") else [Json.Null], List[Json]())
+    stop := parse_json(cancel_line("s1"))?
+    assert_eq(stop.text("method", ""), "session/cancel")
+    assert(stop.get("id") == none)
+    assert_eq((stop.get("params") else Json.Null).text("sessionId", ""), "s1")
+
+@test fn prompts_carry_text_and_resource_links()
+    line := prompt_line(2, "s1", "fix", ["/w/a.ail"])
+    text := "\{'type':'text','text':'fix'}"
+    link := "\{'type':'resource_link','uri':'file:///w/a.ail','name':'a.ail'}"
+    params := "\{'sessionId':'s1','prompt':[{text},{link}]}"
+    assert_eq(line, q("\{'jsonrpc':'2.0','id':2,'method':'session/prompt','params':{params}}"))
+    win := parse_json(prompt_line(3, "s1", "", ["C:\\w\\b.ail"]))?
+    blocks := (win.get("params") else Json.Null).arr("prompt") else []
+    assert_eq(blocks.len(), 1)
+    assert_eq(blocks[0].text("uri", ""), "file:///C:/w/b.ail")
+    assert_eq(blocks[0].text("name", ""), "b.ail")
+
+@test fn replies_parse_back()
+    id := Json.Num(6.0)
+    read := Json.Obj([jm("content", Json.Str("a\nb"))])
+    assert_eq(parse(read_reply(id, "a\nb")), Incoming.Reply(id: 6, result: read))
+    assert_eq(parse(write_reply(id)), Incoming.Reply(id: 6, result: Json.Obj([])))
+    picked := Json.Obj([jm("outcome", Json.Str("selected")), jm("optionId", Json.Str("allow"))])
+    want := Json.Obj([jm("outcome", picked)])
+    assert_eq(parse(permission_reply(id, "allow")), Incoming.Reply(id: 6, result: want))
+    gone := Json.Obj([jm("outcome", Json.Obj([jm("outcome", Json.Str("cancelled"))]))])
+    assert_eq(parse(permission_cancelled(id)), Incoming.Reply(id: 6, result: gone))
+    bad := error_reply(id, -32601, "method not found: x")
+    er := "\{'code':-32601,'message':'method not found: x'}"
+    assert_eq(bad, q("\{'jsonrpc':'2.0','id':6,'error':{er}}"))
+    assert_eq(parse(bad), Incoming.Failure(id: 6, code: -32601, message: "method not found: x"))
+    assert_eq(write_reply(Json.Str("w1")), q("\{'jsonrpc':'2.0','id':'w1','result':\{}}"))
+
+@test fn session_updates_are_decoded()
+    assert_eq(update_in(chunk("agent_message_chunk", "hi")), Update.AgentText(text: "hi"))
+    assert_eq(update_in(chunk("agent_thought_chunk", "hm")), Update.AgentThought(text: "hm"))
+    assert_eq(update_in(chunk("user_message_chunk", "yo")), Update.UserText(text: "yo"))
+    res := "\{'type':'resource_link','uri':'file:///a','name':'a'}"
+    link := upd("'sessionUpdate':'agent_message_chunk','content':{res}")
+    assert_eq(update_in(link), Update.AgentText(text: "[a]"))
+    loc := "'locations':[\{'path':'/w/a.ail','line':3},\{'path':'/w/b.ail'}]"
+    head := "'sessionUpdate':'tool_call','toolCallId':'c1','title':'Edit a.ail'"
+    started := upd("{head},'kind':'edit','status':'pending',{loc}")
+    call := ToolCall(
+        id: "c1",
+        title: "Edit a.ail",
+        kind: ToolKind.Edit,
+        status: ToolStatus.Pending,
+        locations: [Location(path: "/w/a.ail", line: 3), Location(path: "/w/b.ail", line: none)],
+        texts: [],
+        diffs: [],
+    )
+    assert_eq(update_in(started), Update.ToolStart(call: call))
+    diff := "\{'type':'diff','path':'/w/n.ail','newText':'x'}"
+    out := "\{'type':'content','content':\{'type':'text','text':'done'}}"
+    head2 := "'sessionUpdate':'tool_call_update','toolCallId':'c1','status':'completed'"
+    changed := upd("{head2},'content':[{out},{diff}]")
+    change := ToolUpdate(
+        id: "c1",
+        title: none,
+        kind: none,
+        status: ToolStatus.Completed,
+        locations: [],
+        texts: ["done"],
+        diffs: [DiffPart(path: "/w/n.ail", old_text: none, new_text: "x")],
+    )
+    assert_eq(update_in(changed), Update.ToolChange(change: change))
+    entries := "[{entry("a", "high", "completed")},{entry("b", "low", "pending")}]"
+    planned := upd("'sessionUpdate':'plan','entries':{entries}")
+    plan := [
+        PlanEntry(content: "a", priority: "high", status: PlanStatus.Finished),
+        PlanEntry(content: "b", priority: "low", status: PlanStatus.Waiting),
+    ]
+    assert_eq(update_in(planned), Update.PlanChange(entries: plan))
+    cmd := "\{'name':'web','description':'Search'}"
+    cmds := upd("'sessionUpdate':'available_commands_update','availableCommands':[{cmd}]")
+    web := Command(name: "web", description: "Search")
+    assert_eq(update_in(cmds), Update.Commands(commands: [web]))
+    mode := upd("'sessionUpdate':'current_mode_update','currentModeId':'plan'")
+    assert_eq(update_in(mode), Update.ModeChange(mode: "plan"))
+    usage := upd("'sessionUpdate':'usage_update','used':1")
+    assert_eq(update_in(usage), Update.OtherUpdate(name: "usage_update"))
+
+@test fn agent_requests_are_decoded()
+    opts := "'options':[{opt("ok", "Allow", "allow_once")},{opt("no", "Reject", "reject_always")}]"
+    tc := "'toolCall':\{'toolCallId':'c1','title':'rm'}"
+    ask := agent_req(5, "session/request_permission", "'sessionId':'s1',{tc},{opts}")
+    tool := ToolUpdate(
+        id: "c1",
+        title: "rm",
+        kind: none,
+        status: none,
+        locations: [],
+        texts: [],
+        diffs: [],
+    )
+    options := [
+        PermOption(id: "ok", name: "Allow", kind: PermKind.AllowOnce),
+        PermOption(id: "no", name: "Reject", kind: PermKind.RejectAlways),
+    ]
+    want := PermissionRequest(id: Json.Num(5.0), session: "s1", tool: tool, options: options)
+    assert_eq(parse(ask), Incoming.AskPermission(req: want))
+    at := "'sessionId':'s1','path':'/w/a.ail'"
+    read := agent_req(6, "fs/read_text_file", "{at},'line':2,'limit':1")
+    rd := ReadRequest(id: Json.Num(6.0), session: "s1", path: "/w/a.ail", line: 2, limit: 1)
+    assert_eq(parse(read), Incoming.ReadText(req: rd))
+    whole := agent_req(7, "fs/read_text_file", at)
+    rw := ReadRequest(id: Json.Num(7.0), session: "s1", path: "/w/a.ail", line: none, limit: none)
+    assert_eq(parse(whole), Incoming.ReadText(req: rw))
+    write := agent_req(8, "fs/write_text_file", "{at},'content':'x'")
+    wr := WriteRequest(id: Json.Num(8.0), session: "s1", path: "/w/a.ail", content: "x")
+    assert_eq(parse(write), Incoming.WriteText(req: wr))
+    term := agent_req(9, "terminal/create", "'sessionId':'s1','command':'ls'")
+    assert_eq(parse(term), Incoming.Unknown(method: "terminal/create", id: Json.Num(9.0)))
+    note := q("\{'jsonrpc':'2.0','method':'x/y'}")
+    assert_eq(parse(note), Incoming.Unknown(method: "x/y", id: none))
+    assert_eq(parse("not json"), Incoming.Unknown(method: "", id: none))
+
+@test fn read_slice_takes_line_and_limit()
+    lines := ["a", "b", "c"]
+    assert_eq(read_slice(lines, none, none), "a\nb\nc")
+    assert_eq(read_slice(lines, 2, none), "b\nc")
+    assert_eq(read_slice(lines, 2, 1), "b")
+    assert_eq(read_slice(lines, 9, 1), "")
+    assert_eq(read_slice(lines, 0, 2), "a\nb")
+
+# A recorded turn: handshake, prompt, thought and message chunks, a plan, a
+# tool call, its permission, a file read, the diff, a file write, the end.
+@test fn a_recorded_session_drives_the_transcript()
+    mut s := open("/w")
+    assert_eq(s.start("ail-edit", "0.1"), initialize_line(0, "ail-edit", "0.1"))
+    assert_eq(s.state, SessionState.Starting)
+    assert_eq(s.prompt("too soon", []), List[str]())
+    s.rows.clear()
+    caps := "'agentCapabilities':\{'loadSession':false}"
+    hello := ok(0, "'protocolVersion':1,{caps},'authMethods':[]")
+    assert_eq(s.take(hello), Action.SendLines(lines: [new_session_line(1, "/w")]))
+    made := ok(1, "'sessionId':'s1','modes':\{'currentModeId':'default','availableModes':[]}")
+    assert_eq(s.take(made), Action.Nothing)
+    assert_eq(s.state, SessionState.Ready)
+    assert_eq(s.mode, "default")
+    sent := s.prompt("fix the bug", ["/w/a.ail"])
+    assert_eq(sent, [prompt_line(2, "s1", "fix the bug", ["/w/a.ail"])])
+    assert_eq(s.state, SessionState.Running)
+    cmd := "\{'name':'review','description':'Review'}"
+    cmds := upd("'sessionUpdate':'available_commands_update','availableCommands':[{cmd}]")
+    assert_eq(s.take(cmds), Action.Nothing)
+    assert_eq(s.take(chunk("agent_thought_chunk", "Looking at a.ail")), Action.Nothing)
+    assert_eq(s.take(chunk("agent_message_chunk", "I will ")), Action.Nothing)
+    assert_eq(s.take(chunk("agent_message_chunk", "fix it.")), Action.Nothing)
+    e1 := entry("Read a.ail", "high", "completed")
+    e2 := entry("Fix the bug", "high", "in_progress")
+    assert_eq(s.take(upd("'sessionUpdate':'plan','entries':[{e1},{e2}]")), Action.Nothing)
+    head := "'sessionUpdate':'tool_call','toolCallId':'call_1','title':'Edit a.ail'"
+    assert_eq(s.take(upd("{head},'kind':'edit','status':'pending'")), Action.Nothing)
+    o1 := opt("allow", "Allow", "allow_once")
+    o2 := opt("reject", "Reject", "reject_once")
+    tc := "'toolCall':\{'toolCallId':'call_1'}"
+    params := "'sessionId':'s1',{tc},'options':[{o1},{o2}]"
+    ask := s.take(agent_req(5, "session/request_permission", params))
+    asked := match ask
+        Ask(req) => req.options.len()
+        _ => 0
+    assert_eq(asked, 2)
+    answer := s.answer_permission("allow")
+    assert_eq(answer, [ok(5, "'outcome':\{'outcome':'selected','optionId':'allow'}")])
+    assert(s.asking == none)
+    at := "'sessionId':'s1','path':'/w/a.ail'"
+    read := s.take(agent_req(6, "fs/read_text_file", "{at},'line':2,'limit':1"))
+    rd := ReadRequest(id: Json.Num(6.0), session: "s1", path: "/w/a.ail", line: 2, limit: 1)
+    assert_eq(read, Action.ReadFile(req: rd))
+    body := read_slice(["x := 1", "y := 2"], rd.line, rd.limit)
+    assert_eq(read_reply(rd.id, body), ok(6, "'content':'y := 2'"))
+    diff := "\{'type':'diff','path':'/w/a.ail','oldText':'y := 2','newText':'y := 3'}"
+    head2 := "'sessionUpdate':'tool_call_update','toolCallId':'call_1','status':'completed'"
+    assert_eq(s.take(upd("{head2},'content':[{diff}]")), Action.Nothing)
+    write := s.take(agent_req(7, "fs/write_text_file", "{at},'content':'y := 3'"))
+    wr := WriteRequest(id: Json.Num(7.0), session: "s1", path: "/w/a.ail", content: "y := 3")
+    assert_eq(write, Action.WriteFile(req: wr))
+    assert_eq(write_reply(wr.id), ok(7, ""))
+    assert_eq(s.take(ok(2, "'stopReason':'end_turn'")), Action.Nothing)
+    assert_eq(s.state, SessionState.Ready)
+    assert_eq(s.stop, "end_turn")
+    want := [
+        r(Who.User, RowKind.Message, "fix the bug\n@/w/a.ail", "", ""),
+        r(Who.Agent, RowKind.Thought, "Looking at a.ail", "", ""),
+        r(Who.Agent, RowKind.Message, "I will fix it.", "", ""),
+        r(Who.Agent, RowKind.Plan, "[x] Read a.ail\n[>] Fix the bug", "", ""),
+        r(Who.Agent, RowKind.Tool, "Edit a.ail", "completed", "call_1"),
+        r(Who.Agent, RowKind.Permission, "Edit a.ail", "Allow", "call_1"),
+        r(Who.Agent, RowKind.Diff, "/w/a.ail", "-1 +1", "call_1"),
+        r(Who.Editor, RowKind.Note, "agent writes /w/a.ail", "", ""),
+    ]
+    assert_eq(s.rows, want)
+    assert_eq(s.diffs, [DiffPart(path: "/w/a.ail", old_text: "y := 2", new_text: "y := 3")])
+    assert_eq(s.commands, [Command(name: "review", description: "Review")])
+    assert_eq(s.plan.len(), 2)
+    assert_eq(s.next_id, 3)
+
+@test fn cancel_answers_a_waiting_permission()
+    mut s := open("/w")
+    _ := s.start("ail-edit", "0.1")
+    assert_eq(s.cancel(), List[str]())
+    _ := s.take(ok(0, "'protocolVersion':1"))
+    _ := s.take(ok(1, "'sessionId':'s1'"))
+    _ := s.prompt("go", [])
+    opts := "'options':[{opt("y", "Yes", "allow_once")}]"
+    tc := "'toolCall':\{'toolCallId':'t9','title':'Run ls'}"
+    _ := s.take(agent_req(4, "session/request_permission", "'sessionId':'s1',{tc},{opts}"))
+    assert_eq(s.cancel(), [cancel_line("s1"), permission_cancelled(Json.Num(4.0))])
+    assert_eq(s.rows[1], r(Who.Agent, RowKind.Permission, "Run ls", "cancelled", "t9"))
+    assert_eq(s.answer_permission("y"), List[str]())
+    assert_eq(s.state, SessionState.Running)
+    assert_eq(s.take(ok(2, "'stopReason':'cancelled'")), Action.Nothing)
+    assert_eq(s.state, SessionState.Ready)
+    assert_eq(s.rows[s.rows.len() - 1], r(Who.Editor, RowKind.Note, "stopped: cancelled", "", ""))
+
+@test fn failures_and_strangers_are_handled()
+    mut s := open("/w")
+    _ := s.start("ail-edit", "0.1")
+    assert_eq(s.take(ok(0, "'protocolVersion':2")), Action.Nothing)
+    assert_eq(s.state, SessionState.Stopped)
+    mut t := open("/w")
+    _ := t.start("ail-edit", "0.1")
+    _ := t.take(q("\{'jsonrpc':'2.0','id':0,'error':\{'code':-32000,'message':'log in first'}}"))
+    assert_eq(t.state, SessionState.Stopped)
+    assert_eq(t.rows[0].text, "the agent did not start: log in first (code -32000)")
+    mut u := open("/w")
+    _ := u.start("ail-edit", "0.1")
+    _ := u.take(ok(0, "'protocolVersion':1"))
+    _ := u.take(ok(1, "'sessionId':'s1'"))
+    term := u.take(agent_req(9, "terminal/create", "'sessionId':'s1','command':'ls'"))
+    nf := error_reply(Json.Num(9.0), -32601, "method not found: terminal/create")
+    assert_eq(term, Action.SendLines(lines: [nf]))
+    other := chunk("agent_message_chunk", "x").replace("s1", "s2")
+    assert_eq(u.take(other), Action.Nothing)
+    assert_eq(u.rows.len(), 0)
+    _ := u.take(q("\{'jsonrpc':'2.0','id':null,'error':\{'code':-32700,'message':'bad'}}"))
+    assert_eq(u.rows[0].text, "agent error: bad (code -32700)")
+    assert_eq(u.state, SessionState.Ready)
+    u.ended("the agent exited (status 1)")
+    assert_eq(u.state, SessionState.Stopped)
+    assert_eq(u.rows[1], r(Who.Editor, RowKind.Note, "the agent exited (status 1)", "", ""))
