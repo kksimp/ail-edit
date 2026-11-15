@@ -34,10 +34,14 @@ tested=(
     features/agent/agent.ail
     features/ask/ask.ail
     features/diff/diff.ail
+    features/files/files.ail
     features/find/find.ail
     features/hunks/hunks.ail
+    features/jobs/jobs.ail
     features/nav/nav.ail
+    features/pointer/pointer.ail
     features/probes/probes.ail
+    features/review/review.ail
     features/semantic/semantic.ail
     features/syntax/syntax.ail
     features/taskpanel/taskpanel.ail
