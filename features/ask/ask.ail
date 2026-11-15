@@ -227,57 +227,57 @@ pub fn Bar.new() Bar
 
 ## Opens the bar for a question (mode 0) or a symbol (mode 1).
 pub fn Bar.start(mut self, how int)
-    open = true
-    mode = how
-    text = ""
+    self.open = true
+    self.mode = how
+    self.text = ""
 
 ## The prompt the bar shows before what is typed.
 pub fn Bar.prompt(self) str
-    if mode == 1
+    if self.mode == 1
         return " go to symbol: "
     " ask: "
 
 ## One key in the bar: `run` for Enter, `close` for Escape, else empty.
 pub fn Bar.key(mut self, k str) str
     if k == "escape"
-        open = false
+        self.open = false
         return "close"
     if k == "enter"
-        open = false
+        self.open = false
         return "run"
     if k == "backspace"
-        cs := text.chars()
+        cs := self.text.chars()
         if cs.len() > 0
-            text = cs[..cs.len() - 1].join("")
+            self.text = cs[..cs.len() - 1].join("")
     elif k.chars().len() == 1
-        text = "{text}{k}"
+        self.text = "{self.text}{k}"
     ""
 
 ## Whether the meter has to count again: another file or a new save.
 pub fn Bar.stale(self, now_path str, now_saves int) bool
-    now_path != path or now_saves != saves
+    now_path != self.path or now_saves != self.saves
 
 ## Records a count of the file `now_path` as of `now_saves` saves.
 pub fn Bar.counted(mut self, now_path str, now_saves int, tokens int)
-    path = now_path
-    saves = now_saves
-    file_tokens = tokens
-    sel_tokens = -1
+    self.path = now_path
+    self.saves = now_saves
+    self.file_tokens = tokens
+    self.sel_tokens = -1
 
 ## Records the count of the selection (-1 for none).
 pub fn Bar.selected(mut self, tokens int)
-    sel_tokens = tokens
+    self.sel_tokens = tokens
 
 ## The meter on the status row: `tok 1234`, with the selection's after it.
 pub fn Bar.toggle(mut self)
-    hidden = not hidden
+    self.hidden = not self.hidden
 
 pub fn Bar.segment(self) str
-    if file_tokens < 0 or hidden
+    if self.file_tokens < 0 or self.hidden
         return ""
-    if sel_tokens >= 0
-        return " tok {file_tokens} (sel {sel_tokens}) "
-    " tok {file_tokens} "
+    if self.sel_tokens >= 0
+        return " tok {self.file_tokens} (sel {self.sel_tokens}) "
+    " tok {self.file_tokens} "
 
 @test fn answers_from_ask_json()
     out := "[\{\"target\":\"field:Cart.total\",\"answers\":[\{\"in\":\"fn:add\",\"target\":\"field:Cart.total\",\"kind\":\"write\",\"file\":\"a.ail.edit-check.ail\",\"line\":5,\"col\":5}]}]"

@@ -26,7 +26,28 @@ if ! diff <(kw "$ail_dir/compiler/syntax/lex.ail") <(kw edit.ail) >/dev/null; th
 fi
 "$ail_dir/ail" check .
 "$ail_dir/ail" fmt --check .
-"$ail_dir/ail" test edit.ail
-"$ail_dir/ail" test features/probes/probes.ail
 # `ail test` takes a file (test.run.1); a module's tests run from its own file.
-"$ail_dir/ail" test features/agent/agent.ail
+# Every file with @test functions is listed (testdata/ holds fixtures, not tests).
+tested=(
+    edit.ail
+    features/agent/agent.ail
+    features/ask/ask.ail
+    features/diff/diff.ail
+    features/probes/probes.ail
+    features/semantic/semantic.ail
+    features/taskpanel/taskpanel.ail
+    features/tests/tests.ail
+    features/workspace/git.ail
+    features/workspace/settings.ail
+    features/workspace/welcome.ail
+    window/window.ail
+)
+have_tests="$(git ls-files '*.ail' | grep -v '^testdata/' | xargs grep -l '@test' | sort)"
+if [ "$have_tests" != "$(printf '%s\n' "${tested[@]}" | sort)" ]; then
+    echo "check: the files with @test functions differ from the list in tools/check.sh:" >&2
+    diff <(printf '%s\n' "${tested[@]}" | sort) <(echo "$have_tests") >&2 || true
+    exit 1
+fi
+for f in "${tested[@]}"; do
+    "$ail_dir/ail" test "$f"
+done
