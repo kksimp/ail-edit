@@ -29,6 +29,7 @@ use features.tests as ttree
 use features.taskpanel as tp
 use features.agent
 use features.ask
+use features.jobs as jb
 
 # Colors, 0xRRGGBB.
 BG := 0x1e1e1e
@@ -1044,7 +1045,10 @@ fn Editor.accept_completion(mut self)
 fn Editor.api_at(mut self, mode str, text str, l int, c int) Json?
     file := "{self.path}.edit-query.ail"
     fs.write_text(file, text) else return none
-    r := proc.run(ail_command(), ["api", mode, file, "{l}", "{c}"]) else return none
+    r := proc.run(ail_command(), ["api", mode, file, "{l}", "{c}"], none, jb.QUERY_MS) else err
+        if err.kind == TimedOut
+            self.message = jb.failure(err, jb.QUERY_MS)
+        return none
     fs.remove(file) else err
         self.message = "can't remove {err.path}: {err.kind}"
     if r.status != 0
@@ -2706,8 +2710,9 @@ fn Editor.ail_on_buffer(mut self, args List[str]) proc.Output?
             return none
     mut all := args
     all.push(file)
-    r := proc.run(ail_command(), all) else err
-        self.message = "can't run {err.cmd}: {err.kind}"
+    ms := jb.timeout_for(args)
+    r := proc.run(ail_command(), all, none, ms) else err
+        self.message = jb.failure(err, ms)
         return none
     if self.dirty
         fs.remove(file) else err
@@ -2738,8 +2743,8 @@ fn Editor.explain(mut self)
     d := self.diag_here() else
         self.message = "no diagnostic here to explain"
         return
-    r := proc.run(ail_command(), ["explain", d.rule]) else err
-        self.message = "can't run {err.cmd}: {err.kind}"
+    r := proc.run(ail_command(), ["explain", d.rule], none, jb.QUERY_MS) else err
+        self.message = jb.failure(err, jb.QUERY_MS)
         return
     self.pane_text = [d.message]
     if d.help != ""
@@ -3009,8 +3014,8 @@ fn Editor.fixed_text(mut self) str?
     fs.write_text(file, self.text()) else err
         self.message = "can't write {err.path}: {err.kind}"
         return none
-    r := proc.run(ail_command(), ["fix", file]) else err
-        self.message = "can't run {err.cmd}: {err.kind}"
+    r := proc.run(ail_command(), ["fix", file], none, jb.CHECK_MS) else err
+        self.message = jb.failure(err, jb.CHECK_MS)
         return none
     mut out := ""
     if r.status < 2
@@ -5345,6 +5350,24 @@ fn key_rows() List[KeyRow]
             "",
             "Click places the caret, drag or Shift-click selects, the wheel scrolls, a click on a diagnostic or an output location jumps to it",
         ),
+        key_row(
+            "palette",
+            "Stop the running job",
+            "",
+            "Stop the newest running job (F5, F6, Shift-F5 or tests on save run in the background); its output so far stays",
+        ),
+        key_row(
+            "palette",
+            "Run again",
+            "",
+            "Run the last run, test, trace or tests-on-save job again on its file",
+        ),
+        key_row(
+            "palette",
+            "Show jobs",
+            "",
+            "List the jobs: state, command, file, seconds; Enter shows that job's output in the pane",
+        ),
     ]
 
 ## The README's key table (`--keys`).
@@ -5587,6 +5610,9 @@ fn Workspace.run_command(mut self, name str)
             self.message = "agent marks {on_off(not self.watch.hidden)}"
         "Count tokens" => self.token_report()
         "Toggle token meter" => self.askbar.toggle()
+        "Stop the running job" => self.stop_job()
+        "Run again" => self.run_again()
+        "Show jobs" => self.show_jobs()
         _ => self.message = "no command `{name}`"
 
 ## The "New file" palette row: the file picker, with a hint.
@@ -5671,6 +5697,8 @@ struct Workspace
     watch agent.State
     ## The ask bar and the token meter (features/ask, plan S8).
     askbar ask.Bar
+    ## Background jobs: F5, F6, Shift-F5 and tests on save (features/jobs, X1).
+    jobs jb.Jobs
 
 fn Workspace.new(ed Editor) Workspace
     Workspace(
@@ -5721,6 +5749,7 @@ fn Workspace.new(ed Editor) Workspace
         zen: false,
         watch: agent.new_state(),
         askbar: ask.Bar.new(),
+        jobs: jb.Jobs.new(),
     )
 
 ## The file name a tab shows: the path after its last `/`.
@@ -5848,6 +5877,8 @@ fn Workspace.dispatch(mut self, ev ui.Event)
         self.message = ""
     match ev
         Key(k, ctrl, alt, shift) =>
+            if self.job_key(k.name(), ctrl, alt, shift)
+                return
             if wk := workspace_key(k.name(), ctrl, alt, shift)
                 n := self.eds.len()
                 match wk
@@ -5887,7 +5918,7 @@ fn Workspace.dispatch(mut self, ev ui.Event)
                     TestOnSave =>
                         self.test_on_save = not self.test_on_save
                         if self.test_on_save
-                            self.eds[self.active].test_quietly()
+                            self.quiet_tests()
                         else
                             self.eds[self.active].tests = ""
                 return
@@ -5903,7 +5934,7 @@ fn Workspace.dispatch(mut self, ev ui.Event)
                 if self.live_problems
                     self.refresh_problems()
                 if self.test_on_save
-                    self.eds[self.active].test_quietly()
+                    self.quiet_tests()
             elif self.live_problems and self.eds[self.active].dirty
                 self.typed_at = time.now_ms()
         Resize(_, _) => self.on_resize(ev)
@@ -6393,6 +6424,10 @@ fn Workspace.hits_key(mut self, k str) bool
     if self.hits_title.starts_with("task") and tp.action_for(k) != ""
         self.task_action(tp.action_for(k))
         return true
+    if self.hits_title.starts_with("jobs: ") and k == "enter"
+        self.browsing = false
+        self.open_job(self.hit_sel)
+        return true
     if k == "up"
         self.hit_sel = (self.hit_sel - 1).max(0)
     elif k == "down"
@@ -6697,13 +6732,7 @@ fn failure_hits(path str, out str) List[Hit]
 ## Shift-F5: runs the buffer with every trace event; the events fill the
 ## pane and take Up/Down and Enter.
 fn Workspace.trace_run(mut self)
-    r := self.eds[self.active].ail_on_buffer([
-        "run",
-        "--trace=all",
-        "--json",
-        "--values",
-    ]) else return
-    self.show_list("trace (exit {r.status})", trace_hits(self.eds[self.active].path, r.err, r.out))
+    self.foreground("trace")
 
 ## Ctrl-Shift-E: the file's failure paths from `ail check --errors`.
 fn Workspace.failure_paths(mut self)
@@ -6740,8 +6769,8 @@ fn Workspace.test_tool(mut self, mode str)
         so = r.out
         se = r.err
     else
-        r := proc.run(ail_command(), p.args) else e
-            self.message = "can't run {e.cmd}: {e.kind}"
+        r := proc.run(ail_command(), p.args, none, jb.timeout_for(p.args)) else e
+            self.message = jb.failure(e, jb.timeout_for(p.args))
             return
         st = r.status
         so = r.out
@@ -6821,7 +6850,7 @@ fn impact_of(file str, rev str) tp.Impact
         "--rev",
         rev,
         "--json",
-    ]) else return tp.parse_impact("")
+    ], none, jb.QUERY_MS) else return tp.parse_impact("")
     tp.parse_impact(r.out)
 
 ## After a save: marks the affected declarations in the gutter. Nothing is
@@ -6851,8 +6880,8 @@ fn Editor.affected_tests(mut self)
     if job.open and job.program == self.path
         args.push("--since")
         args.push(job.rev)
-    r := proc.run(ail_command(), args) else err
-        self.message = "can't run {err.cmd}: {err.kind}"
+    r := proc.run(ail_command(), args, none, jb.CHECK_MS) else err
+        self.message = jb.failure(err, jb.CHECK_MS)
         return
     self.show_output("test --affected", r)
 
@@ -6887,8 +6916,8 @@ fn Workspace.task_action(mut self, sub str)
     mut args := ["task", sub]
     if sub != "abort"
         args.push("--json")
-    r := proc.run(ail_command(), args) else err
-        self.message = "can't run {err.cmd}: {err.kind}"
+    r := proc.run(ail_command(), args, none, jb.CHECK_MS) else err
+        self.message = jb.failure(err, jb.CHECK_MS)
         return
     mut found := List[Hit]()
     for l in tp.answer_rows("{r.out}{r.err}")
@@ -6994,8 +7023,9 @@ fn card_item(mut hits List[Hit], it Json, sources List[Source], depth int, paren
 ## refreshed on save while it shows.
 fn Workspace.card_view(mut self)
     path := self.eds[self.active].path
-    r := proc.run(ail_command(), ["api", "--card", "--json", "--budget", "100000", path]) else err
-        self.message = "can't run {err.cmd}: {err.kind}"
+    card_args := ["api", "--card", "--json", "--budget", "100000", path]
+    r := proc.run(ail_command(), card_args, none, jb.QUERY_MS) else err
+        self.message = jb.failure(err, jb.QUERY_MS)
         return
     if r.status != 0
         self.message = "no program card: the program has errors (Ctrl-K shows them)"
@@ -7035,8 +7065,8 @@ fn Workspace.diff_view(mut self, kind str)
         self.message = "the diff is of the saved file: save with Ctrl-S first"
         return
     if kind == "gutter"
-        g := proc.run("git", ["diff", "-U0", "HEAD", "--", path]) else err
-            self.message = "can't run {err.cmd}: {err.kind}"
+        g := proc.run("git", ["diff", "-U0", "HEAD", "--", path], none, jb.QUERY_MS) else err
+            self.message = jb.failure(err, jb.QUERY_MS)
             return
         self.eds[self.active].git_marks = sdiff.changed_lines(g.out)
         self.message = "{self.eds[self.active].git_marks.len()} lines differ from HEAD; an edit clears the marks"
@@ -7049,8 +7079,8 @@ fn Workspace.diff_view(mut self, kind str)
     elif kind == "verify"
         args = ["verify", "--diff", "--json", "--rev", "HEAD", path]
         title = "verify vs HEAD"
-    r := proc.run(ail_command(), args) else err
-        self.message = "can't run {err.cmd}: {err.kind}"
+    r := proc.run(ail_command(), args, none, jb.timeout_for(args)) else err
+        self.message = jb.failure(err, jb.timeout_for(args))
         return
     if r.status > 1 and r.out.trim() == ""
         why := r.err.trim().lines()
@@ -7506,7 +7536,10 @@ fn Workspace.go_symbols(mut self, q str)
     for f in list_files(self.tree_root, 4, 300)
         if not f.ends_with(".ail") or f.ends_with(".edit-check.ail")
             continue
-        r := proc.run(ail_command(), ["api", "--text", f]) else continue
+        r := proc.run(ail_command(), ["api", "--text", f], none, jb.QUERY_MS) else err
+            if err.kind == TimedOut
+                self.message = jb.failure(err, jb.QUERY_MS)
+            continue
         for s in ask.symbol_rows(r.out, f, q)
             if found.len() < 200
                 found.push(s)
@@ -7601,6 +7634,7 @@ fn Workspace.render_askbar(self, mut s Screen)
 ## 500 ms have passed since the last edit.
 fn Workspace.idle(mut self, now int)
     self.agent_poll(now)
+    self.jobs.tick(now)
     if self.live_problems and self.typed_at > 0 and now - self.typed_at >= 500
         self.refresh_problems()
 
@@ -7840,10 +7874,16 @@ fn Workspace.refresh_git(mut self)
     self.git = Map[str, str]()
     if not self.gitmarks
         return
-    p := proc.run("git", ["rev-parse", "--show-prefix"]) else return
+    p := proc.run("git", ["rev-parse", "--show-prefix"], none, jb.QUERY_MS) else err
+        if err.kind == TimedOut
+            self.message = jb.failure(err, jb.QUERY_MS)
+        return
     if p.status != 0
         return
-    r := proc.run("git", ["status", "--porcelain"]) else return
+    r := proc.run("git", ["status", "--porcelain"], none, jb.QUERY_MS) else err
+        if err.kind == TimedOut
+            self.message = jb.failure(err, jb.QUERY_MS)
+        return
     if r.status != 0
         return
     self.git = workspace.parse(r.out, p.out.trim())
@@ -7853,8 +7893,8 @@ fn Workspace.new_project(mut self, name str)
     if not workspace.valid_name(name)
         self.message = "`{name}` isn't a project name: lowercase letters, digits, _ and -, starting with a letter"
         return
-    r := proc.run(ail_command(), ["new", name]) else err
-        self.message = "can't run {err.cmd}: {err.kind}"
+    r := proc.run(ail_command(), ["new", name], none, jb.QUERY_MS) else err
+        self.message = jb.failure(err, jb.QUERY_MS)
         return
     if r.status != 0
         self.message = "ail new: {r.err.trim()}"
@@ -7959,6 +7999,7 @@ fn Workspace.render(self) Screen
         s.cursor_row = inner.cursor_row + 1
         s.cursor_col = inner.cursor_col + x0
     self.agent_marks(mut s)
+    self.render_jobs(mut s)
     if self.tree_open
         self.render_tree(mut s)
     self.render_search(mut s)
@@ -8202,6 +8243,315 @@ DEPTH_SAMPLE := "fn main()\n    x := 1\n    if x > 0\n        print(x)\n\nfn oth
     assert(s.text[1].contains("alpha"))
     assert(s.text[1].contains("beta"))
 
+# ---- Background jobs (parity X1) ------------------------------------------
+
+## The title a job of `kind` shows in the pane, the status row and the list.
+fn job_title(kind str) str
+    match kind
+        "test" => "ail test"
+        "trace" => "ail run --trace"
+        "quiet" => "ail test (on save)"
+        _ => "ail run"
+
+## The key that starts a job of `kind`, as a message names it.
+fn job_key_name(kind str) str
+    match kind
+        "test" => "F6"
+        "trace" => "Shift-F5"
+        _ => "F5"
+
+## The file a job runs `ail` on: the tab's file when saved, else a copy beside
+## it (as `ail_on_buffer` makes), which the job removes when it ends.
+fn Editor.job_file(mut self) str?
+    if not self.dirty
+        return self.path
+    copy := "{self.path}.edit-check.ail"
+    fs.write_text(copy, self.text()) else err
+        self.message = "can't write {err.path}: {err.kind}"
+        return none
+    copy
+
+## The tab showing `path`.
+fn Workspace.tab_of(self, path str) int?
+    for i in 0..self.eds.len()
+        if self.eds[i].path == path
+            return i
+    none
+
+## F5, F6 and Shift-F5 start jobs instead of blocking runs; any other key
+## disarms the second press `foreground` asks for.
+fn Workspace.job_key(mut self, k str, ctrl bool, alt bool, shift bool) bool
+    mut kind := ""
+    if k == "f5"
+        kind = if shift then "trace" else "run"
+    elif k == "f6" and not shift
+        kind = "test"
+    if ctrl or alt or kind == ""
+        self.jobs.armed = ""
+        return false
+    self.foreground(kind)
+    true
+
+## Runs the active tab as a job of `kind` (`run`, `test` or `trace`). While
+## one of those runs, the first press says so and the second stops it and
+## starts the new one.
+fn Workspace.foreground(mut self, kind str)
+    if busy := self.jobs.live(["run", "test", "trace"])
+        if self.jobs.armed != kind
+            self.jobs.armed = kind
+            j := self.jobs.find(busy) else return
+            self.message = "{j.title} is still running: {job_key_name(kind)} again stops it and starts {job_title(kind)}"
+            return
+        _ := self.jobs.cancel(busy, time.now_ms())
+        self.job_ended(busy)
+    self.jobs.armed = ""
+    words := match kind
+        "trace" => ["run", "--trace=all", "--json", "--values"]
+        "test" => ["test"]
+        _ => ["run"]
+    _ := self.start_ail_job(self.active, kind, words)
+
+## Tests on save (ADR 0354) as a quiet job: the counts reach the status row
+## when it ends; an older one still running is stopped first.
+fn Workspace.quiet_tests(mut self)
+    if busy := self.jobs.live(["quiet"])
+        _ := self.jobs.cancel(busy, time.now_ms())
+        self.job_ended(busy)
+    _ := self.start_ail_job(self.active, "quiet", ["test", "--json"])
+
+## Starts `ail WORDS FILE` for tab `tab` as a job of `kind`: in the
+## background in the std.app window, else run to completion now. A run or a
+## test shows its pane at once. Returns the job's id, or -1.
+fn Workspace.start_ail_job(mut self, tab int, kind str, words List[str]) int
+    target := self.eds[tab].job_file() else return -1
+    mut args := words
+    args.push(target)
+    mut sp := jb.spec(job_title(kind), kind, ail_command(), args)
+    sp.path = self.eds[tab].path
+    sp.words = words
+    if target != sp.path
+        sp.copy = target
+    if kind == "trace"
+        sp.limit = 50000
+    id := self.jobs.start(sp, time.now_ms())
+    if kind == "run" or kind == "test"
+        self.show_job(tab, id)
+    if self.jobs.submit(id)
+        return id
+    self.run_job_now(id)
+    id
+
+## Runs job `id` to completion (no window runner: `--print`, tests, the
+## std.ui window) through the same state changes the runner's events make.
+fn Workspace.run_job_now(mut self, id int)
+    j := self.jobs.find(id) else return
+    ms := if j.timeout_ms > 0 then j.timeout_ms else jb.RUN_MS
+    r := proc.run(j.command, j.args, none, ms) else err
+        _ := self.jobs.failed(id, jb.failure(err, ms), time.now_ms())
+        self.job_ended(id)
+        return
+    for l in r.out.lines()
+        self.jobs.line(id, "out", l)
+    for l in r.err.lines()
+        self.jobs.line(id, "err", l)
+    _ := self.jobs.exited(id, r.status, time.now_ms())
+    self.job_ended(id)
+
+## Shows job `id`'s output in tab `tab`'s pane, its end in view.
+fn Workspace.show_job(mut self, tab int, id int)
+    i := self.jobs.at(id)
+    if i < 0
+        return
+    self.eds[tab].pane = Text
+    room := (self.eds[tab].pane_rows() - 1).max(1)
+    self.eds[tab].pane_text = self.jobs.list[i].pane_rows(room)
+
+## An inbox event from the runner (the std.app window).
+fn Workspace.job_event(mut self, text str)
+    step := self.jobs.apply(text, time.now_ms())
+    if step.id < 0
+        return
+    if step.ended
+        self.job_ended(step.id)
+        return
+    i := self.jobs.at(step.id)
+    tab := self.tab_of(self.jobs.list[i].path) else return
+    if self.following(tab, step.id)
+        self.show_job(tab, step.id)
+
+## Whether tab `tab`'s pane shows running job `id` (Escape hides it, and
+## another pane replaces it; then new lines stay in the job).
+fn Workspace.following(self, tab int, id int) bool
+    i := self.jobs.at(id)
+    if i < 0 or self.eds[tab].pane != Text or self.eds[tab].pane_text.len() == 0
+        return false
+    self.jobs.list[i].follows(self.eds[tab].pane_text[0])
+
+## What a job leaves when it ends: the pane and message of a run or test, the
+## trace list, or the test counts of tests on save; the buffer copy goes.
+fn Workspace.job_ended(mut self, id int)
+    j := self.jobs.find(id) else return
+    if j.copy != "" and fs.exists(j.copy)
+        fs.remove(j.copy) else err
+            self.message = "can't remove {err.path}: {err.kind}"
+    tab := self.tab_of(j.path) else return
+    if j.kind == "quiet"
+        if j.state != Cancelled
+            self.eds[tab].tests = test_counts(j.out_text())
+        return
+    if j.kind == "trace"
+        if j.state == Cancelled or j.note != "" or tab != self.active
+            self.message = j.header()
+            return
+        self.show_list("trace (exit {j.status})", trace_hits(j.path, j.err_text(), j.out_text()))
+        return
+    what := j.words.first() else "run"
+    if not self.following(tab, id)
+        self.message = "{j.header()}; Show jobs (palette) has its output"
+        return
+    mut outcome := "exit {j.status}"
+    if j.state == Cancelled
+        outcome = "cancelled"
+    elif j.note != ""
+        outcome = j.note
+    self.show_job(tab, id)
+    self.eds[tab].message = "{what}: {outcome}; click a location to jump, Esc closes"
+
+## "Stop the running job": stops the newest one; its output so far stays.
+fn Workspace.stop_job(mut self)
+    ids := self.jobs.running()
+    id := ids.last() else
+        self.message = "no job is running"
+        return
+    _ := self.jobs.cancel(id, time.now_ms())
+    self.job_ended(id)
+    j := self.jobs.find(id) else return
+    self.message = "stopped {j.title}"
+
+## "Run again": the last run, test, trace or tests-on-save job, on its file.
+fn Workspace.run_again(mut self)
+    j := self.jobs.last(["run", "test", "trace", "quiet"]) else
+        self.message = "nothing has run yet: F5 runs the file"
+        return
+    tab := self.tab_of(j.path) else
+        self.message = "{j.path} is no longer open"
+        return
+    self.active = tab
+    if j.kind == "quiet"
+        self.quiet_tests()
+    else
+        self.foreground(j.kind)
+
+## "Show jobs": one row per job, newest first; Enter shows its output.
+fn Workspace.show_jobs(mut self)
+    shown_rows := self.jobs.rows()
+    if shown_rows.len() == 0
+        self.message = "no jobs yet: F5 runs the file, F6 its tests"
+        return
+    mut found := List[Hit]()
+    for t in shown_rows
+        found.push(Hit(loc: Loc(path: "", line: 0, col: 0), text: t))
+    self.show_list("jobs: {found.len()}", found)
+
+## Enter on row `n` of the jobs list: that job's output in its file's tab.
+fn Workspace.open_job(mut self, n int)
+    ids := self.jobs.ids()
+    if n < 0 or n >= ids.len()
+        return
+    j := self.jobs.find(ids[n]) else return
+    tab := self.tab_of(j.path) else self.active
+    self.active = tab
+    self.show_job(tab, ids[n])
+    self.message = "{j.title}: Esc closes"
+
+## The running jobs' summary at the right of the active tab's status row.
+fn Workspace.render_jobs(self, mut s Screen)
+    note := self.jobs.summary()
+    if note == ""
+        return
+    at_row := 1 + self.eds[self.active].text_rows()
+    width := note.chars().len() + 2
+    at_col := (self.cols - width).max(self.left())
+    s.put(at_row, at_col, " {note} ", STATUS_FG, STATUS_BG)
+
+@test fn f5_while_a_run_is_live_asks_then_the_palette_stops_it()
+    mut ws := Workspace.new(typed("fn main()\n", []))
+    mut sp := jb.spec("ail run", "run", "ail", ["run", "t.ail"])
+    sp.path = "t.ail"
+    sp.words = ["run"]
+    id := ws.jobs.start(sp, 1000)
+    ws.show_job(0, id)
+    assert(ws.following(0, id))
+    # Lines from the runner stream into the pane, the end in view.
+    ws.job_event("lines|{id}|out|one\ntwo")
+    assert_eq(ws.eds[0].pane_text[ws.eds[0].pane_text.len() - 1], "two")
+    ws.jobs.tick(13500)
+    assert(ws.render().text[1 + ws.eds[0].text_rows()].contains("running: ail run (12 s)"))
+    ws.on_event(key_event("f5"))
+    assert(ws.message.contains("F5 again stops it"))
+    assert_eq(ws.jobs.armed, "run")
+    assert_eq(ws.jobs.list.len(), 1)
+    ws.on_event(press("left"))
+    assert_eq(ws.jobs.armed, "")
+    ws.run_command("Stop the running job")
+    assert(ws.jobs.find(id)?.state == Cancelled)
+    assert_eq(ws.eds[0].pane_text[0], "ail run: cancelled")
+    assert_eq(ws.eds[0].pane_text[1], "one")
+    assert_eq(ws.jobs.summary(), "")
+    ws.run_command("Stop the running job")
+    assert_eq(ws.message, "no job is running")
+    ws.run_command("Show jobs")
+    assert(ws.hits_title.starts_with("jobs: 1"))
+    assert(ws.eds[0].pane_text[1].starts_with("cancelled ail run  t.ail"))
+    ws.on_event(press("enter"))
+    assert_eq(ws.eds[0].pane_text[0], "ail run: cancelled")
+
+@test fn escape_leaves_a_job_running_and_its_pane_hidden()
+    mut ws := Workspace.new(typed("fn main()\n", []))
+    mut sp := jb.spec("ail test", "test", "ail", ["test", "t.ail"])
+    sp.path = "t.ail"
+    sp.words = ["test"]
+    id := ws.jobs.start(sp, 0)
+    ws.show_job(0, id)
+    ws.on_event(press("escape"))
+    assert(not ws.following(0, id))
+    ws.job_event("lines|{id}|out|ok a")
+    assert(ws.eds[0].pane != Text)
+    assert_eq(ws.jobs.find(id)?.lines.len(), 1)
+    ws.job_event("exit|{id}|0")
+    assert(ws.jobs.find(id)?.state == Done)
+    assert(ws.message.contains("Show jobs"))
+    # Tests on save end in the status counts, not the pane.
+    mut q := jb.spec("ail test (on save)", "quiet", "ail", ["test", "--json", "t.ail"])
+    q.path = "t.ail"
+    qid := ws.jobs.start(q, 0)
+    ws.job_event("lines|{qid}|out|\{\"summary\":true,\"passed\":2,\"failed\":0}")
+    ws.job_event("exit|{qid}|0")
+    assert_eq(ws.eds[0].tests, "tests 2/2 pass")
+
+# test.sandbox.2: it writes a program beside the editor and runs `ail run` on it.
+@needs(fs, proc) @test fn f5_in_a_headless_workspace_runs_to_the_end_and_shows_output()
+    d := "edit-jobs-test.tmp"
+    fs.make_dir(d) else err
+        assert(false)
+    path := "{d}/hello.ail"
+    src := "fn main()\n    print(\"hi from a job\")\n"
+    fs.write_text(path, src) else err
+        assert(false)
+    mut ws := Workspace.new(Editor.new(path, src, 60, 20))
+    ws.on_event(key_event("f5"))
+    assert_eq(ws.eds[0].pane, Text)
+    assert_eq(ws.eds[0].pane_text[0], "ail run: exit 0")
+    assert(ws.eds[0].pane_text.contains("hi from a job"))
+    assert(ws.eds[0].message.starts_with("run: exit 0"))
+    assert_eq(ws.jobs.list.len(), 1)
+    assert(ws.jobs.list[0].state == Done)
+    assert_eq(ws.jobs.summary(), "")
+    fs.remove(path) else err
+        assert(false)
+    fs.remove(d) else err
+        assert(false)
+
 # ---- Window front end (std.app, S1) --------------------------------------
 
 ## The `std.app` window: the workspace drawn on a canvas (`window/`), pixel
@@ -8420,6 +8770,9 @@ fn blinker(inbox app.Inbox, stop Mutex[int])
         inbox.post(app.external("blink", ""))
 
 impl app.App for Shell
+    fn attach(mut self, inbox app.Inbox)
+        self.ws.jobs.attach(inbox)
+
     fn update(mut self, ev app.Event)
         match ev.kind
             Resize =>
@@ -8431,6 +8784,8 @@ impl app.App for Shell
             External =>
                 if ev.id == "blink"
                     self.caret_on = self.caret_on_now()
+                elif ev.id == jb.SOURCE
+                    self.ws.job_event(ev.text)
             Key =>
                 self.solid_until = time.now_ms() + 500
                 self.caret_on = true
@@ -8559,14 +8914,21 @@ fn app_main(mut ed Editor, flags List[str])
         return
     inbox := app.new_inbox()
     stop := Mutex(0)
+    reqs := Channel[jb.Request](16)
+    sh.ws.jobs.serve_with(reqs)
     g := TaskGroup()
     g.add(spawn blinker(inbox, stop))
+    g.add(spawn jb.serve(reqs))
     app.run_with(mut sh, host, [], inbox) else err
         print("edit: no window ({err.kind}: {err.message}); printing the screen instead")
         stop.set(1)
+        sh.ws.jobs.cancel_all(time.now_ms())
+        reqs.close()
         print_screen(ed, flags)
         return
     stop.set(1)
+    sh.ws.jobs.cancel_all(time.now_ms())
+    reqs.close()
 
 ## Opens the window, or prints one screen when there's no display.
 fn window_main(mut ed Editor, flags List[str])

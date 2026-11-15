@@ -288,9 +288,12 @@ pub fn apply_buffer(ail str, path str, text str, hunks str, dry bool) Outcome
         args.push("--dry-run")
     else
         args.push("--if-clean")
-    r := proc.run(ail, args, hunks) else err
+    # A time limit, so an edit that hangs can't freeze the window (parity B1).
+    r := proc.run(ail, args, hunks, 60000) else err
         fs.remove(copy) else gone
             return Outcome(ok: false, text: text, report: "can't remove {gone.path}")
+        if err.kind == TimedOut
+            return Outcome(ok: false, text: text, report: "`ail edit` timed out after 60 s and was stopped")
         return Outcome(ok: false, text: text, report: "can't run {err.cmd}: {err.kind}")
     mut result := text
     if not dry and r.status == 0

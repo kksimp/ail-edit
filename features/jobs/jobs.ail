@@ -1,0 +1,725 @@
+## Background jobs (parity plan B1, B2, C10, D9; lane X1): a command the
+## editor runs without blocking the window, its output as it arrives, a stop,
+## a time limit, and a list of what ran.
+##
+## Two halves. The pure half is `Jobs`: `start` adds a running job; `line`,
+## `exited`, `failed`, `timed_out` and `cancel` change it; `apply` reads the
+## text of one inbox event into those; `Job.pane_rows`, `summary` and `rows`
+## draw it. Tests drive it with no process.
+##
+## The impure half is `serve` and `run`. In the std.app window the program
+## spawns `serve(reqs)` into its own task group before `app.run_with`, hands
+## `Jobs` the request channel (`serve_with`) and the inbox (`attach`, from
+## `App.attach`). Then `background()` is true and `submit(id)` sends the job
+## as a `Request`; `serve` spawns `run` for it, which starts the child with
+## `proc.start`, posts its output lines and its end as
+## `app.external(SOURCE, TEXT)` events, and kills the child (`proc.kill`)
+## when the job is cancelled (its stop flag, a `Mutex`) or its time limit
+## passes. Cancel is immediate in the state: `cancel` marks the job
+## `Cancelled` and later lines are not read into it.
+## Without a server (`--print`, tests, the std.ui grid window) the caller runs
+## the job to completion with `proc.run(cmd, args, none, ms)` and feeds the
+## same `line` and `exited` (or `failed`) calls, so both paths end in one state.
+##
+## Long-lived jobs with standard input (the agent panel): give the `Spec`
+## `keep_stdin: true`, `timeout_ms: 0` (no limit) and a large `limit`. Then
+## `send(id, text)` queues `text` for the child's standard input as it is (add
+## the "\n" a line protocol needs) and `close_input(id)` ends the input; the
+## runner forwards queued text within `TICK` ms. Output arrives through
+## `apply` as for any job; each `Step` carries the lines that event added
+## (`fresh`), in order, so a protocol module (features/acp) can take each
+## one. `lines` keeps only the last `limit` lines.
+##
+## Event text (an `external` event whose `id` is `SOURCE`):
+## `lines|ID|STREAM|L1\nL2...` (STREAM `out` or `err`), `exit|ID|STATUS`,
+## `fail|ID|WHY` (it could not start), `timeout|ID|STATUS` (killed at its
+## limit) and `stopped|ID|STATUS` (killed after `cancel`).
+use std.proc
+use std.app
+use std.time
+
+## The `id` of the inbox events a job posts.
+pub SOURCE := "job"
+## The lines a job keeps by default; older ones are dropped and counted.
+pub LIMIT := 5000
+## Time limits (ms): `ail` queries, and check, fix, verify and other runs.
+pub QUERY_MS := 10000
+pub CHECK_MS := 60000
+## The limit for a job run to completion with no limit of its own.
+pub RUN_MS := 300000
+## How often the runner looks at the stop flag, the clock and the input (ms).
+TICK := 50
+## At most this many lines go in one event.
+BATCH := 200
+## The stop flag: running, stop now, close the child's input.
+GO := 0
+STOP := 1
+CLOSE_INPUT := 2
+
+pub enum State
+    Running
+    Done
+    Failed
+    Cancelled
+
+## One line of output and the stream it came on: `out` or `err`.
+pub struct Line
+    pub stream str
+    pub text str
+
+## What to run: shown as `title`, a `kind` the caller reads at the end (the
+## editor uses `run`, `test`, `trace` and `quiet`), the file it is about
+## (`path`) and the `ail` words before the file (`words`, for a rerun), the
+## command, a copy of the buffer to remove when it ends (`copy`, or ""),
+## its time limit (0: none), whether it keeps its input open, and how many
+## lines it keeps.
+pub struct Spec
+    pub title str
+    pub kind str
+    pub path str
+    pub words List[str]
+    pub command str
+    pub args List[str]
+    pub copy str
+    pub timeout_ms int
+    pub keep_stdin bool
+    pub limit int
+
+## A `Spec` with no file, no copy, no time limit, input closed, `LIMIT` lines.
+pub fn spec(title str, kind str, command str, args List[str]) Spec
+    Spec(
+        title: title,
+        kind: kind,
+        path: "",
+        words: [],
+        command: command,
+        args: args,
+        copy: "",
+        timeout_ms: 0,
+        keep_stdin: false,
+        limit: LIMIT,
+    )
+
+## One job: what it runs, its state, its exit status (-1 until known), why it
+## failed or stopped (`note`), the last `limit` lines and how many were
+## dropped before them, and when it started and ended (ms; `ended` 0 while
+## it runs).
+pub struct Job
+    pub id int
+    pub title str
+    pub kind str
+    pub path str
+    pub words List[str]
+    pub command str
+    pub args List[str]
+    pub copy str
+    pub timeout_ms int
+    pub keep_stdin bool
+    pub state State
+    pub status int
+    pub note str
+    pub lines Deque[Line]
+    pub dropped int
+    pub limit int
+    pub started int
+    pub ended int
+    stop Mutex[int]
+    input Channel[str]
+
+## A job as the runner task gets it.
+pub struct Request
+    pub id int
+    pub command str
+    pub args List[str]
+    pub timeout_ms int
+    pub keep_stdin bool
+    pub inbox app.Inbox
+    pub stop Mutex[int]
+    pub input Channel[str]
+
+## What one event changed: the job (-1 when the text is no job event),
+## whether the job ended with it, and the lines it added.
+pub struct Step
+    pub id int
+    pub ended bool
+    pub fresh List[Line]
+
+## Every job, newest last; the next id; the time last seen (ms); the job kind
+## a second key press restarts (`armed`, "" for none); and, in the window,
+## the inbox and the runner's request channel.
+pub struct Jobs
+    pub list List[Job]
+    pub next int
+    pub now int
+    pub armed str
+    has_inbox bool
+    has_server bool
+    inbox app.Inbox?
+    server Channel[Request]?
+
+pub fn Jobs.new() Jobs
+    Jobs(
+        list: [],
+        next: 1,
+        now: 0,
+        armed: "",
+        has_inbox: false,
+        has_server: false,
+        inbox: none,
+        server: none,
+    )
+
+## The inbox the runner posts to (from `App.attach`).
+pub fn Jobs.attach(mut self, box app.Inbox)
+    self.inbox = box
+    self.has_inbox = true
+
+## The channel `serve` reads requests from.
+pub fn Jobs.serve_with(mut self, reqs Channel[Request])
+    self.server = reqs
+    self.has_server = true
+
+## Whether jobs run in the background (a window with a runner); otherwise
+## the caller runs each one to completion.
+pub fn Jobs.background(self) bool
+    self.has_inbox and self.has_server
+
+pub fn Jobs.tick(mut self, at_ms int)
+    self.now = at_ms
+
+## Adds a running job for `s`, started at `at_ms`, and returns its id.
+pub fn Jobs.start(mut self, s Spec, at_ms int) int
+    id := self.next
+    self.next += 1
+    self.now = at_ms
+    self.list.push(Job(
+        id: id,
+        title: s.title,
+        kind: s.kind,
+        path: s.path,
+        words: s.words,
+        command: s.command,
+        args: s.args,
+        copy: s.copy,
+        timeout_ms: s.timeout_ms,
+        keep_stdin: s.keep_stdin,
+        state: State.Running,
+        status: -1,
+        note: "",
+        lines: Deque[Line](),
+        dropped: 0,
+        limit: s.limit.max(1),
+        started: at_ms,
+        ended: 0,
+        stop: Mutex(GO),
+        input: Channel[str](64),
+    ))
+    id
+
+## The place of job `id` in `list`, or -1.
+pub fn Jobs.at(self, id int) int
+    for i in 0..self.list.len()
+        if self.list[i].id == id
+            return i
+    -1
+
+pub fn Jobs.find(self, id int) Job?
+    i := self.at(id)
+    if i < 0
+        return none
+    self.list[i]
+
+## Keeps `l`, dropping the oldest line past the limit.
+fn Job.add_line(mut self, l Line)
+    self.lines.push_back(l)
+    while self.lines.len() > self.limit
+        _ := self.lines.pop_front()
+        self.dropped += 1
+
+## A line of job `id`'s output; ignored once the job is no longer running.
+pub fn Jobs.line(mut self, id int, stream str, text str)
+    i := self.at(id)
+    if i < 0 or self.list[i].state != Running
+        return
+    self.list[i].add_line(Line(stream: stream, text: text))
+
+## Ends job `id` in `state` with `status` and `note`; true when it was running.
+## A job already ended keeps its state but takes a status it lacked.
+fn Jobs.finish(mut self, id int, state State, status int, note str, at_ms int) bool
+    i := self.at(id)
+    if i < 0
+        return false
+    self.now = at_ms
+    if self.list[i].state != Running
+        if self.list[i].status < 0
+            self.list[i].status = status
+        return false
+    self.list[i].state = state
+    self.list[i].status = status
+    self.list[i].note = note
+    self.list[i].ended = at_ms
+    true
+
+## The child exited with `status`: done when 0, failed otherwise.
+pub fn Jobs.exited(mut self, id int, status int, at_ms int) bool
+    state := if status == 0 then State.Done else State.Failed
+    self.finish(id, state, status, "", at_ms)
+
+## The job could not run: `why` says so.
+pub fn Jobs.failed(mut self, id int, why str, at_ms int) bool
+    self.finish(id, State.Failed, -1, why, at_ms)
+
+## The child was killed at the job's time limit.
+pub fn Jobs.timed_out(mut self, id int, status int, at_ms int) bool
+    i := self.at(id)
+    if i < 0
+        return false
+    ms := self.list[i].timeout_ms
+    self.finish(id, State.Failed, status, "timed out after {ms / 1000} s", at_ms)
+
+## Stops job `id`: the runner kills the child, and no more lines are read.
+pub fn Jobs.cancel(mut self, id int, at_ms int) bool
+    i := self.at(id)
+    if i < 0 or self.list[i].state != Running
+        return false
+    self.list[i].stop.set(STOP)
+    self.finish(id, State.Cancelled, -1, "cancelled", at_ms)
+
+## Stops every running job (the window is closing).
+pub fn Jobs.cancel_all(mut self, at_ms int)
+    for id in self.running()
+        _ := self.cancel(id, at_ms)
+
+## Queues `text` for the standard input of running job `id`, which must keep
+## its input open; false otherwise.
+pub fn Jobs.send(self, id int, text str) bool
+    i := self.at(id)
+    if i < 0 or self.list[i].state != Running or not self.list[i].keep_stdin
+        return false
+    self.list[i].input.send(text)
+    true
+
+## Ends the standard input of running job `id` once what was sent is written.
+pub fn Jobs.close_input(self, id int) bool
+    i := self.at(id)
+    if i < 0 or self.list[i].state != Running or not self.list[i].keep_stdin
+        return false
+    self.list[i].stop.set(CLOSE_INPUT)
+    true
+
+## The ids of the running jobs, oldest first.
+pub fn Jobs.running(self) List[int]
+    mut out := List[int]()
+    for j in self.list
+        if j.state == Running
+            out.push(j.id)
+    out
+
+## The newest running job of one of `kinds`.
+pub fn Jobs.live(self, kinds List[str]) int?
+    mut found := -1
+    for j in self.list
+        if j.state == Running and kinds.contains(j.kind)
+            found = j.id
+    if found < 0
+        return none
+    found
+
+## The newest job of one of `kinds`, running or not.
+pub fn Jobs.last(self, kinds List[str]) Job?
+    mut i := self.list.len() - 1
+    while i >= 0
+        if kinds.contains(self.list[i].kind)
+            return self.list[i]
+        i -= 1
+    none
+
+## Whole seconds in `ms`.
+pub fn seconds(ms int) int
+    ms.max(0) / 1000
+
+## How long job `j` ran, or has run by `now`, in seconds.
+fn ran(j Job, now int) int
+    if j.state == Running
+        return seconds(now - j.started)
+    seconds(j.ended - j.started)
+
+## The status-bar text while jobs run: the newest one and how long it has
+## run, then how many others run; "" when none does.
+pub fn Jobs.summary(self) str
+    ids := self.running()
+    newest := ids.last() else return ""
+    j := self.find(newest) else return ""
+    mut more := ""
+    if ids.len() > 1
+        more = " +{ids.len() - 1}"
+    "running: {j.title} ({ran(j, self.now)} s){more}"
+
+pub fn state_word(s State) str
+    match s
+        Running => "running"
+        Done => "done"
+        Failed => "failed"
+        Cancelled => "cancelled"
+
+fn file_name(path str) str
+    parts := path.split("/")
+    parts[parts.len() - 1]
+
+## One row per job, newest first: state, title, file, seconds, and the exit
+## status or why it failed. `ids` gives the same order.
+pub fn Jobs.rows(self) List[str]
+    mut out := List[str]()
+    mut i := self.list.len() - 1
+    while i >= 0
+        j := self.list[i]
+        mut tail := ""
+        if j.note != "" and j.state != Cancelled
+            tail = "  {j.note}"
+        elif j.state == Failed
+            tail = "  exit {j.status}"
+        word := state_word(j.state).pad_right(9, ' ')
+        out.push("{word} {j.title}  {file_name(j.path)}  {ran(j, self.now)} s{tail}")
+        i -= 1
+    out
+
+pub fn Jobs.ids(self) List[int]
+    mut out := List[int]()
+    mut i := self.list.len() - 1
+    while i >= 0
+        out.push(self.list[i].id)
+        i -= 1
+    out
+
+## The first row of the job's output pane.
+pub fn Job.header(self) str
+    match self.state
+        Running => "{self.title}: running, job {self.id} ({self.lines.len() + self.dropped} lines); Esc hides it, palette: Stop the running job"
+        Done | Failed =>
+            if self.note != ""
+                return "{self.title}: {self.note}"
+            "{self.title}: exit {self.status}"
+        Cancelled => "{self.title}: cancelled"
+
+## Whether a pane whose first row is `first` shows this running job.
+pub fn Job.follows(self, first str) bool
+    first.starts_with("{self.title}: running, job {self.id} (")
+
+## The output pane: the header, then the end of the output in `room` rows
+## (a `... N lines above` row first when it doesn't fit), so the pane follows
+## the end as lines arrive.
+pub fn Job.pane_rows(self, room int) List[str]
+    mut out := [self.header()]
+    n := self.lines.len()
+    total := n + self.dropped
+    mut from_at := 0
+    if total > room.max(1) or self.dropped > 0
+        from_at = (n - room.max(1) + 1).max(0)
+        out.push("... {total - (n - from_at)} lines above")
+    for i in from_at..n
+        out.push(self.lines[i].text)
+    out
+
+## The lines of one stream, joined with "\n".
+fn Job.stream_text(self, stream str) str
+    mut parts := List[str]()
+    for l in self.lines
+        if l.stream == stream
+            parts.push(l.text)
+    parts.join("\n")
+
+pub fn Job.out_text(self) str
+    self.stream_text("out")
+
+pub fn Job.err_text(self) str
+    self.stream_text("err")
+
+fn no_step() Step
+    Step(id: -1, ended: false, fresh: [])
+
+## Reads the text of one inbox event from the runner into the jobs.
+pub fn Jobs.apply(mut self, text str, at_ms int) Step
+    parts := text.split("|", 4)
+    if parts.len() < 3
+        return no_step()
+    id := parts[1].to_int() else return no_step()
+    if self.at(id) < 0
+        return no_step()
+    self.now = at_ms
+    code := parts[2].to_int() else -1
+    match parts[0]
+        "lines" =>
+            if parts.len() < 4
+                return no_step()
+            i := self.at(id)
+            mut fresh := List[Line]()
+            if self.list[i].state == Running
+                for t in parts[3].split("\n")
+                    l := Line(stream: parts[2], text: t)
+                    fresh.push(l)
+                    self.list[i].add_line(l)
+            Step(id: id, ended: false, fresh: fresh)
+        "exit" => Step(id: id, ended: self.exited(id, code, at_ms), fresh: [])
+        "fail" => Step(id: id, ended: self.failed(id, parts[2..].join("|"), at_ms), fresh: [])
+        "timeout" => Step(id: id, ended: self.timed_out(id, code, at_ms), fresh: [])
+        "stopped" =>
+            ended := self.finish(id, State.Cancelled, code, "cancelled", at_ms)
+            Step(id: id, ended: ended, fresh: [])
+        _ => no_step()
+
+## Sends job `id` to the runner; false without one.
+pub fn Jobs.submit(self, id int) bool
+    reqs := self.server else return false
+    box := self.inbox else return false
+    i := self.at(id)
+    if i < 0
+        return false
+    j := self.list[i]
+    reqs.send(Request(
+        id: id,
+        command: j.command,
+        args: j.args,
+        timeout_ms: j.timeout_ms,
+        keep_stdin: j.keep_stdin,
+        inbox: box,
+        stop: j.stop,
+        input: j.input,
+    ))
+    true
+
+# ---- The runner (impure) ---------------------------------------------------
+
+## Runs each request in its own task until `reqs` is closed; the tasks are
+## waited when it returns.
+pub fn serve(reqs Channel[Request])
+    g := TaskGroup()
+    for r in reqs
+        g.add(spawn run(r))
+
+fn post_lines(req Request, stream str, lines List[str])
+    req.inbox.post(app.external(SOURCE, "lines|{req.id}|{stream}|{lines.join("\n")}"))
+
+## Starts the child, posts its lines (batched per stream, at most every
+## `TICK` ms) and its end, writes queued input, and kills the child when the
+## stop flag is set or the time limit passes.
+pub fn run(req Request)
+    mut child := proc.start(req.command, req.args) else err
+        req.inbox.post(app.external(SOURCE, "fail|{req.id}|can't run {err.cmd}: {err.kind}"))
+        return
+    if not req.keep_stdin
+        child.stdin.close()
+    began := time.now_ms()
+    mut stream := "out"
+    mut pending := List[str]()
+    mut flushed := began
+    mut why := ""
+    mut input_open := req.keep_stdin
+    mut open := true
+    while open
+        flag := req.stop.get()
+        if flag == STOP
+            why = "stopped"
+            break
+        if req.timeout_ms > 0 and time.now_ms() - began >= req.timeout_ms
+            why = "timeout"
+            break
+        if input_open
+            while t := req.input.try_recv()
+                child.stdin.send(t)
+            if flag == CLOSE_INPUT
+                child.stdin.close()
+                input_open = false
+        mut got := ""
+        mut from_stream := ""
+        select
+            o := child.out.recv() =>
+                got = o
+                from_stream = "out"
+            e := child.err.recv() =>
+                got = e
+                from_stream = "err"
+            after TICK => from_stream = ""
+            closed => open = false
+        if from_stream != "" and from_stream != stream and pending.len() > 0
+            post_lines(req, stream, pending)
+            pending = []
+            flushed = time.now_ms()
+        if from_stream != ""
+            stream = from_stream
+            pending.push(got)
+        now := time.now_ms()
+        due := from_stream == "" or not open or pending.len() >= BATCH or now - flushed >= TICK
+        if pending.len() > 0 and due
+            post_lines(req, stream, pending)
+            pending = []
+            flushed = now
+    if pending.len() > 0
+        post_lines(req, stream, pending)
+    if why == ""
+        code := proc.wait(move child) else bad
+            req.inbox.post(app.external(SOURCE, "fail|{req.id}|{bad.kind}"))
+            return
+        req.inbox.post(app.external(SOURCE, "exit|{req.id}|{code}"))
+    else
+        killed := proc.kill(move child)
+        req.inbox.post(app.external(SOURCE, "{why}|{req.id}|{killed}"))
+
+# ---- Time limits for blocking runs (B1) -------------------------------------
+
+## The time limit for a blocking `ail ARGS` run: `QUERY_MS` for the queries
+## (`api`, `explain`, `ask`, `fmt`, `new`), `CHECK_MS` for check, fix,
+## verify and everything that runs the program.
+pub fn timeout_for(args List[str]) int
+    first := args.first() else return CHECK_MS
+    if ["api", "explain", "ask", "fmt", "new"].contains(first)
+        return QUERY_MS
+    CHECK_MS
+
+## The message for a `proc.run` that failed with limit `ms`.
+pub fn failure(err proc.ProcError, ms int) str
+    if err.kind == TimedOut
+        return "`{file_name(err.cmd)}` timed out after {ms / 1000} s and was stopped"
+    "can't run {err.cmd}: {err.kind}"
+
+# ---- Tests -------------------------------------------------------------------
+
+fn test_jobs() Jobs
+    mut js := Jobs.new()
+    mut s := spec("ail test", "test", "ail", ["test", "t.ail"])
+    s.path = "src/t.ail"
+    _ := js.start(s, 1000)
+    js
+
+@test fn a_job_runs_takes_lines_and_ends()
+    mut js := test_jobs()
+    assert(not js.background())
+    assert_eq(js.running(), [1])
+    js.line(1, "out", "ok a")
+    js.line(1, "err", "warn")
+    assert_eq(js.find(1)?.lines.len(), 2)
+    assert(js.exited(1, 0, 3500))
+    j := js.find(1)?
+    assert(j.state == Done)
+    assert_eq(j.status, 0)
+    assert_eq(j.ended, 3500)
+    assert_eq(j.out_text(), "ok a")
+    assert_eq(j.err_text(), "warn")
+    assert_eq(j.header(), "ail test: exit 0")
+    # A second end changes nothing; lines after the end are not read.
+    assert(not js.exited(1, 1, 4000))
+    js.line(1, "out", "late")
+    assert_eq(js.find(1)?.lines.len(), 2)
+    assert(js.running().is_empty())
+    assert_eq(js.rows(), ["done      ail test  t.ail  2 s"])
+
+@test fn failures_timeouts_and_cancels_are_states()
+    mut js := test_jobs()
+    s := spec("ail run", "run", "ail", ["run", "t.ail"])
+    _ := js.start(s, 1000)
+    mut slow := spec("ail check", "check", "ail", ["check"])
+    slow.timeout_ms = 60000
+    _ := js.start(slow, 1000)
+    assert(js.exited(1, 1, 2000))
+    assert(js.find(1)?.state == Failed)
+    assert(js.failed(2, "can't run ail: NotFound", 2000))
+    assert_eq(js.find(2)?.header(), "ail run: can't run ail: NotFound")
+    assert(js.timed_out(3, 137, 61000))
+    assert_eq(js.find(3)?.header(), "ail check: timed out after 60 s")
+    mut s4 := spec("ail run", "run", "ail", ["run", "t.ail"])
+    s4.path = "t.ail"
+    id := js.start(s4, 5000)
+    assert_eq((js.live(["run", "trace"]) else 0), id)
+    assert(js.cancel(id, 6000))
+    assert(js.find(id)?.state == Cancelled)
+    assert(js.live(["run"]) == none)
+    # The runner's later report keeps the state and records the status.
+    st := js.apply("stopped|{id}|137", 6100)
+    assert(not st.ended)
+    assert_eq(js.find(id)?.status, 137)
+    assert_eq(js.find(id)?.header(), "ail run: cancelled")
+    assert(not js.cancel(id, 7000))
+    assert_eq(js.rows()[0], "cancelled ail run  t.ail  1 s")
+    assert_eq(js.rows()[1], "failed    ail check    60 s  timed out after 60 s")
+    assert_eq(js.ids(), [4, 3, 2, 1])
+    assert_eq(js.last(["run"])?.id, 4)
+
+@test fn events_from_the_runner_apply_in_order()
+    mut js := test_jobs()
+    a := js.apply("lines|1|out|one\n\ntwo", 1200)
+    assert_eq(a.id, 1)
+    assert_eq(a.fresh.len(), 3)
+    assert_eq(a.fresh[1].text, "")
+    b := js.apply("lines|1|err|a|b", 1300)
+    assert_eq(b.fresh[0].text, "a|b")
+    assert_eq(js.find(1)?.err_text(), "a|b")
+    assert_eq(js.apply("nonsense", 1400).id, -1)
+    assert_eq(js.apply("exit|9|0", 1400).id, -1)
+    e := js.apply("exit|1|3", 1500)
+    assert(e.ended)
+    assert_eq(js.find(1)?.header(), "ail test: exit 3")
+    mut js2 := test_jobs()
+    f := js2.apply("fail|1|can't run x: NotFound", 1100)
+    assert(f.ended)
+    assert_eq(js2.find(1)?.note, "can't run x: NotFound")
+
+@test fn output_is_capped_and_the_pane_follows_the_end()
+    mut js := Jobs.new()
+    mut s := spec("ail run", "run", "ail", ["run", "t.ail"])
+    s.limit = 3
+    _ := js.start(s, 0)
+    for i in 0..5
+        js.line(1, "out", "line {i}")
+    j := js.find(1)?
+    assert_eq(j.lines.len(), 3)
+    assert_eq(j.dropped, 2)
+    assert_eq(j.lines[0].text, "line 2")
+    assert(j.follows(j.header()))
+    assert(not j.follows("ail run: exit 0"))
+    assert_eq(
+        j.pane_rows(2),
+        [
+            "ail run: running, job 1 (5 lines); Esc hides it, palette: Stop the running job",
+            "... 4 lines above",
+            "line 4",
+        ],
+    )
+    assert_eq(j.pane_rows(10).len(), 5)
+    assert_eq(j.pane_rows(10)[1], "... 2 lines above")
+    mut few := Jobs.new()
+    _ := few.start(spec("ail run", "run", "ail", []), 0)
+    few.line(1, "out", "a")
+    assert_eq(few.find(1)?.pane_rows(5).len(), 2)
+
+@test fn the_summary_names_the_newest_running_job()
+    mut js := test_jobs()
+    assert_eq(js.summary(), "running: ail test (0 s)")
+    js.tick(13500)
+    assert_eq(js.summary(), "running: ail test (12 s)")
+    _ := js.start(spec("ail run", "run", "ail", []), 13000)
+    js.tick(15000)
+    assert_eq(js.summary(), "running: ail run (2 s) +1")
+    js.cancel_all(16000)
+    assert_eq(js.summary(), "")
+
+@test fn input_goes_only_to_a_live_job_that_keeps_it()
+    mut js := test_jobs()
+    assert(not js.send(1, "x\n"))
+    mut s := spec("agent", "agent", "agent", [])
+    s.keep_stdin = true
+    id := js.start(s, 0)
+    assert(js.send(id, "hello\n"))
+    assert(js.close_input(id))
+    _ := js.exited(id, 0, 10)
+    assert(not js.send(id, "late\n"))
+    assert(not js.submit(id))
+
+@test fn blocking_runs_get_a_time_limit()
+    assert_eq(timeout_for(["api", "--text", "a.ail"]), QUERY_MS)
+    assert_eq(timeout_for(["explain", "x.y.1"]), 10000)
+    assert_eq(timeout_for(["check", "--json"]), CHECK_MS)
+    assert_eq(timeout_for(["fix", "a.ail"]), 60000)
+    assert_eq(timeout_for([]), CHECK_MS)
+    late := proc.ProcError(cmd: "/usr/bin/git", kind: TimedOut)
+    assert_eq(failure(late, 10000), "`git` timed out after 10 s and was stopped")
+    gone := proc.ProcError(cmd: "ail", kind: NotFound)
+    assert_eq(failure(gone, 10000), "can't run ail: NotFound")

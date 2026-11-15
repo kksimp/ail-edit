@@ -82,7 +82,10 @@ fn error_line(stderr str) str
 ## api.ask.1). `real` is the file as the editor knows it, when `file` is a
 ## copy of an unsaved buffer.
 pub fn query(ail str, file str, real str, question str) Asked
-    r := proc.run(ail, ["ask", file, question, "--json"]) else err
+    # A time limit, so a query that hangs can't freeze the window (parity B1).
+    r := proc.run(ail, ["ask", file, question, "--json"], none, 10000) else err
+        if err.kind == TimedOut
+            return Asked(rows: [], problem: "`ail ask` timed out after 10 s and was stopped")
         return Asked(rows: [], problem: "can't run {err.cmd}: {err.kind}")
     if r.status == 2
         return Asked(rows: [], problem: error_line(r.err))
@@ -191,7 +194,7 @@ pub fn count_tokens(text str) int
 
 ## The token count of the file `file`, or `none` when `ail` can't be run.
 pub fn tokens_of(ail str, file str) int?
-    r := proc.run(ail, ["api", "--tokens", file]) else return none
+    r := proc.run(ail, ["api", "--tokens", file], none, 10000) else return none
     if r.out.trim() == ""
         return none
     count_tokens(r.out)
