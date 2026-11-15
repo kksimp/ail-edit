@@ -102,20 +102,20 @@ pub fn problem(query str, opts Options) str
 ## stepping through matches always moves.
 pub fn Matcher.in_line(self, l int, text str) List[Match]
     mut out := List[Match]()
-    if re := self.re
-        for m in regex.find_all(re, text)
+    if rx := self.re
+        for m in regex.find_all(rx, text)
             if m.end > m.start
                 out.push(Match(line: l, col: m.start, len: m.end - m.start))
         return out
-    q := self.q
-    if q.len() == 0
+    pat := self.q
+    if pat.len() == 0
         return out
     cs := fold_chars(text.chars(), self.opts.case)
     mut i := 0
-    while i + q.len() <= cs.len()
-        if cs[i..i + q.len()] == q and (not self.opts.word or whole(cs, i, q.len()))
-            out.push(Match(line: l, col: i, len: q.len()))
-            i += q.len()
+    while i + pat.len() <= cs.len()
+        if cs[i..i + pat.len()] == pat and (not self.opts.word or whole(cs, i, pat.len()))
+            out.push(Match(line: l, col: i, len: pat.len()))
+            i += pat.len()
         else
             i += 1
     out
@@ -219,8 +219,8 @@ pub fn replace_text(found str, repl str, preserve_case bool) str
 ## as `replace_text` does.
 pub fn Matcher.replacement(self, found str, repl str, preserve_case bool) str
     mut out := repl
-    if re := self.re
-        out = regex.replace_first(re, found, repl)
+    if rx := self.re
+        out = regex.replace_first(rx, found, repl)
     replace_text(found, out, preserve_case)
 
 # ---- History ----------------------------------------------------------------
