@@ -1986,7 +1986,7 @@ fn Editor.multi_key(mut self, cmd Command) bool
             extra = []
             selecting = false
         Depth(_) | Resize(_, _) | Quit => return false
-        _ =>
+        SelectAll | Copy | Cut | Undo | Redo | Find | FindNext | ToggleRegex | Fix | Replace | ReplaceAll | GoToLine | ToggleComment | DuplicateLine | MoveLine | Complete | GoToDefinition | Hover | Format | Rename | Save | Check | Explain | Outline =>
             extra = []
             return false
     true
@@ -8374,7 +8374,7 @@ impl app.App for Shell
                     ws.on_event(key_event(k))
             Close =>
                 ws.on_event(Close)
-            _ => held = held
+            Start | Press | Edit | Submit | Toggle | Click | KeyUp | Appearance | Picked | PickError | Pad | Vsync | Measured | Exited | Other => held = held
         ws.idle(time.now_ms())
         relayout()
         if ws.quit
