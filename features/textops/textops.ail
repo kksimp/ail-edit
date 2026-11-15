@@ -796,7 +796,6 @@ pub fn join_with(lines List[str], eol Eol) str
     assert_eq(box_ranges(ls, 0, 2, 0, 2, false), [caret(0, 2)])
     assert_eq(box_ranges(List[str](), 0, 0, 1, 1, true).len(), 0)
 
-
 @test fn expand_to_word_and_brackets()
     ls := ["f(a, g(bc))"]
     w := expand_to_word(ls, caret(0, 8))
