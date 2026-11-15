@@ -246,7 +246,7 @@ pub fn diff(old List[str], new List[str]) List[Hunk]
     hunks_of(old, new, rem, ins)
 
 ## How many lines the hunks add and remove, as (added, removed).
-pub fn counts(hunks List[Hunk]) (int, int)
+pub fn counts(hunks List[Hunk])(int, int)
     mut added := 0
     mut removed := 0
     for h in hunks
@@ -641,25 +641,25 @@ fn file_change(path str, kind FileKind, before List[str], after List[str]) FileC
 ## A held file missing from `current` was deleted; a file in `current` that
 ## the checkpoint did not hold, or held as absent, was created.
 pub fn Checkpoint.changes(self, current List[Current]) Changes
-    mut files := List[FileChange]()
+    mut out := List[FileChange]()
     mut created := List[str]()
     mut deleted := List[str]()
     for h in self.files
         now := find_current(current, h.path) else
             if h.existed
                 deleted.push(h.path)
-                files.push(file_change(h.path, FileKind.Deleted, h.lines, List[str]()))
+                out.push(file_change(h.path, FileKind.Deleted, h.lines, List[str]()))
             continue
         if not h.existed
             created.push(h.path)
-            files.push(file_change(h.path, FileKind.Created, List[str](), now.lines))
+            out.push(file_change(h.path, FileKind.Created, List[str](), now.lines))
         elif now.lines != h.lines
-            files.push(file_change(h.path, FileKind.Modified, h.lines, now.lines))
+            out.push(file_change(h.path, FileKind.Modified, h.lines, now.lines))
     for c in current
         if not self.holds(c.path)
             created.push(c.path)
-            files.push(file_change(c.path, FileKind.Created, List[str](), c.lines))
-    Changes(files: files, created: created, deleted: deleted)
+            out.push(file_change(c.path, FileKind.Created, List[str](), c.lines))
+    Changes(files: out, created: created, deleted: deleted)
 
 ## What each held file must be set back to, to return to the checkpoint. A
 ## file created without a hold is in `changes(...).created`; remove it too.
