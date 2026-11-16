@@ -1,0 +1,520 @@
+## The settings model (parity plan C8, lane P12): every setting with its
+## kind, default, description and scope, and the settings files' text. The
+## user's file is `~/.ail-edit`; a project may hold `.ail-edit` in its root,
+## which wins for project-scope settings only. Both are lines of
+## `KEY VALUE`; a line starting with `#` is a comment. Lines this model
+## doesn't know (`bind.KEY`, `open:DIR`, `agent.NAME`, a key from a newer
+## editor) are kept in order, so a rewrite never loses them. Booleans are
+## written `on` and `off`, as the file always has.
+
+use themes
+
+## What values a setting takes: one of `choices`; a whole number from
+## `min` to `max`, both included; any text, spaces included; `on` or `off`.
+pub enum Kind
+    Choice(choices List[str])
+    Int(min int, max int)
+    Text
+    Bool
+
+## Which file may set it: `User` only `~/.ail-edit`; `Project` also the
+## project's `.ail-edit`, which wins.
+pub enum Scope
+    User
+    Project
+
+## One setting.
+pub struct Setting
+    pub key str
+    pub label str
+    pub kind Kind
+    pub default str
+    pub description str
+    pub scope Scope
+
+## A mistake on one line of a settings file. `line` is 0-based.
+pub struct Problem
+    pub line int
+    pub message str
+
+## One `KEY VALUE` line.
+struct Entry
+    key str
+    value str
+
+## Font sizes the Settings list offers (as `workspace.FONTS`).
+FONTS := ["14", "16", "18", "20", "24", "28", "32"]
+
+## Key prefixes whose lines pass through unchecked: rebound keys, the
+## remembered tabs of a directory, and agent commands.
+PASS := ["bind.", "open:", "agent."]
+
+## The key of the agent command rows: `agent.` and any name.
+AGENT_ROW := "agent.NAME"
+
+fn row(key str, label str, kind Kind, dflt str, scope Scope, does str) Setting
+    Setting(key: key, label: label, kind: kind, default: dflt, description: does, scope: scope)
+
+fn onoff(key str, label str, dflt str, scope Scope, does str) Setting
+    row(key, label, Kind.Bool, dflt, scope, does)
+
+## Every setting, in the order the Settings list shows them.
+pub fn all() List[Setting]
+    [
+        row(
+            "theme",
+            "Theme",
+            Kind.Choice(choices: themes.NAMES),
+            "dark",
+            Scope.User,
+            "The color theme; Ctrl-Shift-T cycles through them",
+        ),
+        row(
+            "font",
+            "Font size",
+            Kind.Choice(choices: FONTS),
+            "20",
+            Scope.User,
+            "The font size in points (also Ctrl-+, Ctrl--, Ctrl-0)",
+        ),
+        row(
+            "fontfamily",
+            "Font family",
+            Kind.Text,
+            "mono",
+            Scope.User,
+            "The font's family name; `mono` is the system's monospace font",
+        ),
+        onoff(
+            "restore",
+            "Reopen tabs at start",
+            "on",
+            Scope.User,
+            "Reopen the folder's tabs and carets",
+        ),
+        onoff("welcome", "Welcome screen", "on", Scope.User, "Show the welcome screen at start"),
+        onoff(
+            "gitmarks",
+            "Git marks in the tree",
+            "on",
+            Scope.User,
+            "Mark changed files in the tree",
+        ),
+        onoff(
+            "surround",
+            "Surround selection",
+            "on",
+            Scope.User,
+            "Typing a bracket or quote over a selection surrounds it",
+        ),
+        onoff(
+            "trim",
+            "Trim spaces on save",
+            "on",
+            Scope.Project,
+            "Remove spaces at line ends on save",
+        ),
+        onoff(
+            "finalnewline",
+            "Final newline on save",
+            "on",
+            Scope.Project,
+            "End the file with one newline on save",
+        ),
+        onoff("wrap", "Word wrap", "off", Scope.User, "Wrap long lines at the window's width"),
+        row(
+            "treew",
+            "Tree width",
+            Kind.Int(min: 0, max: 200),
+            "0",
+            Scope.User,
+            "The file tree's width in cells; 0 is automatic (set by dragging its edge)",
+        ),
+        row(
+            "paneh",
+            "Pane height",
+            Kind.Int(min: 0, max: 200),
+            "0",
+            Scope.User,
+            "The pane's height in rows; 0 is automatic (set by dragging the status bar)",
+        ),
+        row(
+            "keymap",
+            "Keymap",
+            Kind.Choice(choices: ["classic", "vscode"]),
+            "classic",
+            Scope.User,
+            "Which keys run which commands: `classic` (this editor's) or `vscode`",
+        ),
+        row(
+            "autosave",
+            "Auto save",
+            Kind.Choice(choices: ["off", "afterdelay", "onfocuschange"]),
+            "off",
+            Scope.User,
+            "Save changed tabs by themselves: never, after a pause in typing, or when the window loses focus",
+        ),
+        onoff(
+            "formatonsave",
+            "Format on save",
+            "on",
+            Scope.Project,
+            "Format with `ail fmt` on save, when the program has no errors",
+        ),
+        onoff(
+            "checkontype",
+            "Check as you type",
+            "on",
+            Scope.Project,
+            "Run `ail check` on the buffer after typing stops",
+        ),
+        row(
+            "checkdelay",
+            "Check delay (ms)",
+            Kind.Int(min: 100, max: 5000),
+            "500",
+            Scope.Project,
+            "How long typing must stop before a check, in milliseconds",
+        ),
+        onoff("minimap", "Minimap", "off", Scope.User, "Show the minimap beside the text"),
+        row(
+            "whitespace",
+            "Show whitespace",
+            Kind.Choice(choices: ["none", "selection", "all"]),
+            "selection",
+            Scope.User,
+            "Draw spaces as dots: never, inside the selection, or everywhere",
+        ),
+        row(
+            "ruler",
+            "Ruler column",
+            Kind.Int(min: 0, max: 200),
+            "100",
+            Scope.Project,
+            "Draw a line after this column; 0 draws none",
+        ),
+        onoff("cursorblink", "Caret blinks", "on", Scope.User, "Blink the caret"),
+        row(
+            "agent",
+            "Default agent",
+            Kind.Text,
+            "",
+            Scope.Project,
+            "The agent the agent panel starts: the NAME of an `agent.NAME` line",
+        ),
+        row(
+            AGENT_ROW,
+            "Agent command",
+            Kind.Text,
+            "",
+            Scope.Project,
+            "The command line that starts the agent NAME, passed through as written",
+        ),
+        onoff(
+            "confirmdelete",
+            "Confirm deletes",
+            "on",
+            Scope.User,
+            "Deleting in the tree takes a second press",
+        ),
+        row(
+            "exclude",
+            "Exclude",
+            Kind.Text,
+            "",
+            Scope.Project,
+            "Globs that search and the tree leave out, split by commas or spaces (`build, *.min.js`)",
+        ),
+    ]
+
+## The setting `key` names: a row of `all()`, `agent.NAME` for any
+## `agent.` key; `none` for an unknown key.
+pub fn find(key str) Setting?
+    lookup := if key.starts_with("agent.") then AGENT_ROW else key
+    for s in all()
+        if s.key == lookup
+            return s
+    none
+
+fn passes(key str) bool
+    for p in PASS
+        if key.starts_with(p)
+            return true
+    false
+
+## A line's key and value: the first word and the rest, trimmed. `none`
+## for a blank line or a comment.
+fn split_line(line str) Entry?
+    t := line.trim()
+    if t == "" or t.starts_with("#")
+        return none
+    at := t.find(" ") else return Entry(key: t, value: "")
+    Entry(key: t.slice(0, at), value: t.slice(at + 1, t.len()).trim())
+
+## The file's settings, key to value, in the file's order. Unknown keys are
+## kept; a key set twice keeps its first value, as the editor reads it.
+pub fn parse(text str) Map[str, str]
+    mut out := Map[str, str]()
+    for line in text.split("\n")
+        kv := split_line(line) else continue
+        if out.get(kv.key) == none
+            out[kv.key] = kv.value
+    out
+
+## The values a setting allows, for messages and completion.
+fn allowed(s Setting) str
+    match s.kind
+        Kind.Choice(cs) => cs.join(", ")
+        Kind.Int(lo, hi) => "{lo} to {hi}"
+        Kind.Text => "any text"
+        Kind.Bool => "on, off"
+
+## Whether `v` is a value of `s`.
+fn fits(s Setting, v str) bool
+    match s.kind
+        Kind.Choice(cs) => cs.contains(v)
+        Kind.Int(lo, hi) =>
+            n := v.to_int() else return false
+            n >= lo and n <= hi
+        Kind.Text => true
+        Kind.Bool => v == "on" or v == "off"
+
+## The edit distance between `a` and `b` (insert, delete, change one
+## character).
+fn distance(a str, b str) int
+    xs := a.chars()
+    ys := b.chars()
+    mut prev := List[int]()
+    for j in 0..=ys.len()
+        prev.push(j)
+    for i in 1..=xs.len()
+        mut cur := [i]
+        for j in 1..=ys.len()
+            cost := if xs[i - 1] == ys[j - 1] then 0 else 1
+            cur.push((prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost))
+        prev = cur
+    prev[ys.len()]
+
+## The known key closest to `key`, when it is at most 3 edits away.
+fn closest(key str) str?
+    mut best := ""
+    mut best_d := 4
+    for s in all()
+        if s.key == AGENT_ROW
+            continue
+        d := distance(key, s.key)
+        if d < best_d
+            best = s.key
+            best_d = d
+    if best == ""
+        return none
+    best
+
+## The mistakes in a settings file: an unknown key (with the closest known
+## key), a value the setting doesn't allow (with the values it does), and a
+## key set again (the first line wins).
+pub fn problems(text str) List[Problem]
+    mut out := List[Problem]()
+    mut seen := Map[str, int]()
+    lines := text.split("\n")
+    for i in 0..lines.len()
+        kv := split_line(lines[i]) else continue
+        k := kv.key
+        if first := seen.get(k)
+            out.push(Problem(line: i, message: "`{k}` is set again; line {first + 1} wins"))
+            continue
+        seen[k] = i
+        if s := find(k)
+            if not fits(s, kv.value)
+                bad := "`{kv.value}` is not a value of `{k}`; allowed: {allowed(s)}"
+                out.push(Problem(line: i, message: bad))
+            continue
+        if passes(k)
+            continue
+        if near := closest(k)
+            hint := "unknown setting `{k}`; did you mean `{near}`?"
+            out.push(Problem(line: i, message: hint))
+        else
+            out.push(Problem(line: i, message: "unknown setting `{k}`"))
+    out
+
+## The problems of a project's `.ail-edit`: those of `problems`, and a
+## user-scope setting, which a project file can't change.
+pub fn project_problems(text str) List[Problem]
+    mut out := problems(text)
+    lines := text.split("\n")
+    for i in 0..lines.len()
+        kv := split_line(lines[i]) else continue
+        s := find(kv.key) else continue
+        if s.scope == Scope.User
+            msg := "`{kv.key}` is a user setting; set it in ~/.ail-edit"
+            out.push(Problem(line: i, message: msg))
+    out
+
+## The value of `key`: the project file's for a project-scope setting it
+## sets, else the user file's, else the default. A value the setting
+## doesn't allow reads as the default. An unknown key reads as the user
+## file has it, else "".
+pub fn value(user_text str, project_text str, key str) str
+    user := parse(user_text)
+    s := find(key) else return user.get_or(key, "")
+    if s.scope == Scope.Project
+        if pv := parse(project_text).get(key)
+            if fits(s, pv)
+                return pv
+    if uv := user.get(key)
+        if fits(s, uv)
+            return uv
+    s.default
+
+## The text with `key` set to `value`: the key's first line rewritten in
+## place, any later lines of the key dropped, every other line (comments
+## and unknown keys included) kept in order; a key not in the text is
+## appended. The result ends with a newline.
+pub fn set(text str, key str, value str) str
+    mut out := List[str]()
+    mut done := false
+    for line in text.split("\n")
+        if kv := split_line(line)
+            if kv.key == key
+                if not done
+                    out.push("{key} {value}")
+                    done = true
+                continue
+        out.push(line)
+    while out.len() > 0 and out[out.len() - 1] == ""
+        _ := out.pop()
+    if not done
+        out.push("{key} {value}")
+    body := out.join("\n")
+    "{body}\n"
+
+## The values completion offers for a setting.
+fn values_of(s Setting) List[str]
+    match s.kind
+        Kind.Choice(cs) => cs
+        Kind.Int(_, _) => [s.default]
+        Kind.Text => if s.default == "" then List[str]() else [s.default]
+        Kind.Bool => ["on", "off"]
+
+## Completions for a settings-file line typed up to the caret: before the
+## first space, the keys starting with what is typed (`agent.` for the
+## agent command rows); after it, the setting's values starting with what
+## is typed after the key.
+pub fn complete(line_prefix str) List[str]
+    t := line_prefix.trim_start()
+    mut out := List[str]()
+    if at := t.find(" ")
+        st := find(t.slice(0, at)) else return out
+        typed := t.slice(at + 1, t.len()).trim_start()
+        for v in values_of(st)
+            if v.starts_with(typed)
+                out.push(v)
+        return out
+    for s in all()
+        k := if s.key == AGENT_ROW then "agent." else s.key
+        if k.starts_with(t)
+            out.push(k)
+    out
+
+## One line about a setting for the Settings list and hovering in the
+## settings file: label, description, allowed values, default and scope.
+## "" for an unknown key.
+pub fn describe(key str) str
+    s := find(key) else return ""
+    dflt := if s.default == "" then "none" else s.default
+    where := if s.scope == Scope.Project then "; a project's .ail-edit can set it" else ""
+    "{s.label}: {s.description}. Values: {allowed(s)}; default {dflt}{where}"
+
+# ---- Tests --------------------------------------------------------------
+
+@test fn every_setting_is_listed_once_with_a_valid_default()
+    mut keys := List[str]()
+    for s in all()
+        assert(not keys.contains(s.key), s.key)
+        keys.push(s.key)
+        assert(fits(s, s.default), s.key)
+        assert(s.label != "" and s.description != "", s.key)
+    for k in ["theme", "font", "restore", "welcome", "gitmarks", "surround", "trim"]
+        assert(keys.contains(k), k)
+    for k in ["finalnewline", "wrap", "treew", "paneh", "fontfamily", "keymap", "autosave"]
+        assert(keys.contains(k), k)
+    for k in ["formatonsave", "checkontype", "checkdelay", "minimap", "whitespace", "ruler"]
+        assert(keys.contains(k), k)
+    for k in ["cursorblink", "agent", "confirmdelete", "exclude"]
+        assert(keys.contains(k), k)
+    assert_eq((find("agent.claude") else unreachable("agent rows")).key, AGENT_ROW)
+    assert(find("nope") == none)
+
+@test fn parse_keeps_unknown_keys_in_order()
+    text := "# mine\ntheme light\nbind.f9 f5\n\nzzz 1 2\ntheme dark\nminimap\n"
+    m := parse(text)
+    mut keys := List[str]()
+    for k in m.keys()
+        keys.push(k)
+    assert_eq(keys, ["theme", "bind.f9", "zzz", "minimap"])
+    assert_eq(m["theme"], "light")
+    assert_eq(m["zzz"], "1 2")
+    assert_eq(m["minimap"], "")
+
+@test fn problems_name_the_line_and_the_fix()
+    text := [
+        "thme dark",
+        "minimap maybe",
+        "checkdelay 9000",
+        "bind.f9 f5",
+        "agent.x run x",
+        "# c",
+        "wrap on",
+        "wrap off",
+        "qqqqqqqq 1",
+    ].join("\n")
+    ps := problems(text)
+    assert_eq(ps.len(), 5)
+    assert_eq(ps[0], Problem(line: 0, message: "unknown setting `thme`; did you mean `theme`?"))
+    assert_eq(ps[1].line, 1)
+    assert_eq(ps[1].message, "`maybe` is not a value of `minimap`; allowed: on, off")
+    assert_eq(ps[2].message, "`9000` is not a value of `checkdelay`; allowed: 100 to 5000")
+    assert_eq(ps[3], Problem(line: 7, message: "`wrap` is set again; line 7 wins"))
+    assert_eq(ps[4].message, "unknown setting `qqqqqqqq`")
+    assert_eq(problems("keymap vscode\nautosave afterdelay\nruler 0\n").len(), 0)
+    assert_eq(project_problems("ruler 80\ntheme light\n").len(), 1)
+    assert_eq(distance("kitten", "sitting"), 3)
+
+@test fn project_file_wins_for_project_settings_only()
+    user := "ruler 80\ntheme light\nagent.x run-x\nmystery 7\n"
+    project := "ruler 120\ntheme solarized\nagent.x other\n"
+    assert_eq(value(user, project, "ruler"), "120")
+    assert_eq(value(user, project, "theme"), "light")
+    assert_eq(value(user, project, "agent.x"), "other")
+    assert_eq(value(user, "", "ruler"), "80")
+    assert_eq(value("", "", "ruler"), "100")
+    assert_eq(value("ruler 999\n", "ruler wide\n", "ruler"), "100")
+    assert_eq(value(user, project, "mystery"), "7")
+    assert_eq(value(user, project, "unset"), "")
+
+@test fn set_rewrites_one_line_and_keeps_the_rest()
+    text := "# settings\ntheme dark\nbind.f9 f5\ntheme light\nfont 20"
+    assert_eq(set(text, "theme", "solarized"), "# settings\ntheme solarized\nbind.f9 f5\nfont 20\n")
+    assert_eq(set(text, "minimap", "on"), "{text}\nminimap on\n")
+    assert_eq(set("", "wrap", "on"), "wrap on\n")
+    assert_eq(set("a 1\n\n", "b", "2"), "a 1\nb 2\n")
+
+@test fn complete_offers_keys_then_values()
+    assert_eq(complete("che"), ["checkontype", "checkdelay"])
+    assert_eq(complete("ag"), ["agent", "agent."])
+    assert_eq(complete("autosave a"), ["afterdelay"])
+    assert_eq(complete("minimap "), ["on", "off"])
+    assert_eq(complete("ruler "), ["100"])
+    assert_eq(complete("nope x"), List[str]())
+
+@test fn describe_says_values_default_and_scope()
+    assert_eq(
+        describe("minimap"),
+        "Minimap: Show the minimap beside the text. Values: on, off; default off",
+    )
+    assert_eq(
+        describe("ruler"),
+        "Ruler column: Draw a line after this column; 0 draws none. Values: 0 to 200; default 100; a project's .ail-edit can set it",
+    )
+    assert_eq(describe("nope"), "")
