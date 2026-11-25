@@ -2,7 +2,7 @@
 
 License: AGPL-3.0 (see `LICENSE`). Moved from kksimp/ail (`tools/edit`) with its history.
 
-Needs the AIL toolchain: clone [kksimp/ail](https://github.com/kksimp/ail) next to this repo at the commit in `.ail-version` (v0.1.0) and put its `ail` on `PATH` (ADR 1058: `ail doctor --path` prints the line to add; on Windows the clone's directory, for `ail.cmd`). Commands below use `ail`; `tools/check.sh` runs check, fmt and the tests against the pinned clone in `../ail` (or `AIL_DIR`). Builds and tests run on a dev machine, not in a container.
+Needs the AIL toolchain: clone [kksimp/ail](https://github.com/kksimp/ail) next to this repo at the commit in `.ail-version` (v0.2.0) and put its `ail` on `PATH` (ADR 1058: `ail doctor --path` prints the line to add; on Windows the clone's directory, for `ail.cmd`). Commands below use `ail`; `tools/check.sh` runs check, fmt and the tests against the pinned clone in `../ail` (or `AIL_DIR`). Builds and tests run on a dev machine, not in a container.
 
 `edit.ail` is a code editor for AIL programs, written in AIL
 ([ADR 0180](https://github.com/kksimp/ail/blob/main/docs/decisions/0180-editor-written-in-ail.md)). Its core
@@ -196,11 +196,11 @@ runs), else `./ail` when started from the root of an ail clone, else `ail` on
 `FILE.edit-check.ail` beside the file and removes it afterwards, so relative
 imports resolve as they will on save.
 
-## Status (2026-11-15)
+## Status (2026-11-25)
 
-- Pinned to ail v0.1.0 (`64f5caef`) (`.ail-version`); `tools/check.sh` checks, formats and tests against it, and fails when the editor's `KEYWORDS` differ from the lexer's (lex.kw.1).
-- Every `ail` command the editor runs, and the JSON it reads back, follows the v0.1.0 command line (`check`, `api`, `ask`, `task`, `diff`, `verify`, `test`, `run`, `replay`, `sanitize`, `leak`, `fix`, `edit`, `new`, `explain`, `fmt`). `ail test` runs each test in a sandbox (test.sandbox.1); the editor's tests that write files say `@needs(fs)`.
+- Pinned to ail v0.2.0 (`8db7cc76`, seed `seed-2026.11.21a`) (`.ail-version`); `tools/check.sh` checks, formats and tests against it, and fails when the editor's `KEYWORDS` differ from the lexer's (lex.kw.1).
+- Every `ail` command the editor runs, and the JSON it reads back, follows the v0.2.0 command line (`check`, `api`, `ask`, `task`, `diff`, `verify`, `test`, `run`, `replay`, `sanitize`, `leak`, `fix`, `edit`, `new`, `explain`, `fmt`). `ail test` runs each test in a sandbox (test.sandbox.1); the editor's tests that write files say `@needs(fs)`.
 - Front ends: the `std.app` window (default), the old `std.ui` cell grid (`--grid`), and `--print` / `--print --json` for tests and agents. The headless core is tested by `@test`s run with `ail test` (not `ail selftest`).
-- The repo is a package (`ail.pkg`, language `ail 0.1`) with the agent kit `ail new` writes (`AGENTS.md`, `.mcp.json`).
+- The repo is a package (`ail.pkg`, language `ail 0.2`) with the agent kit `ail new` writes (`AGENTS.md`, `.mcp.json`).
 - Highlighting and auto-indent know every reserved word of the lexer, including `requires`, `ensures`, `invariant`, `par` and `with`; the contract words `then`, `result` and `old(` and the hole `uhwhatnow?` are marked too.
 - Feature plan against current AIL: the X0 to X11 lanes in the AIL project's `lanes/ail-edit-features-2026-11-10.md`. The look is planned in `docs/plan-2026-11.md` and the beauty slices.
